@@ -16,7 +16,10 @@ async function launchDesktop(options: { fakeHost?: boolean; failures?: number } 
   const events = path.join(root, 'events.jsonl')
   const app = await electron.launch({
     executablePath: await packagedExecutable(),
-    args: [],
+    // GitHub-hosted Linux runners cannot make an unpacked package's
+    // chrome-sandbox root-owned/setuid. Keep this exception at the test
+    // launcher boundary; the packaged renderer sandbox remains enabled.
+    args: process.platform === 'linux' ? ['--no-sandbox'] : [],
     env: {
       ...process.env,
       ...(options.fakeHost ? { DSH_DESKTOP_TEST_HOST: 'fake' } : {}),
@@ -76,8 +79,8 @@ test('a second launch activates the existing window without creating another Hos
       window.minimize()
     })
     await expect.poll(() => desktop.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.isMinimized())).toBe(true)
-    const executable = desktop.app.process().spawnfile
-    await runCommandWithTimeout(executable, [], {
+    const executable = await packagedExecutable()
+    await runCommandWithTimeout(executable, process.platform === 'linux' ? ['--no-sandbox'] : [], {
       DSH_DESKTOP_TEST_HOST: 'fake',
       DSH_DESKTOP_TEST_USER_DATA: path.join(desktop.root, 'User Data With Spaces'),
       DSH_DESKTOP_TEST_EVENTS: desktop.events
