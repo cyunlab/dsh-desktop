@@ -1,0 +1,47 @@
+# DeepSeek Harness Desktop domain
+
+## Purpose
+
+DeepSeek Harness Desktop is a native application shell that owns one local Harness Host and displays the Host-provided Web Client. The first milestone proves this path on Windows, macOS, and Linux without modifying the upstream Harness submodule.
+
+## Glossary
+
+### Desktop
+
+The versioned Electron application: main process, preload bridge, local startup page, packaging, and lifecycle automation. Avoid using this term for the upstream Web Client alone.
+
+### Host
+
+The in-process DeepSeek Harness Cordis runtime that exposes the loopback HTTP/API surface. One Desktop instance owns exactly one Host in the first milestone.
+
+### Web Client
+
+The upstream browser UI served by the Host. It owns the normal product experience, including Workspace management; Desktop does not fork or recreate it.
+
+### Web composition
+
+The ordered upstream profile bundles `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app`, plus only the launcher/runtime packages needed to boot them. The bundles transitively supply the standard Host and Client plugin roster.
+
+### Harness Home
+
+The persistent root selected by `DSH_HOME` for Harness settings, credentials, profiles, sessions, storage, and related state. Desktop uses an isolated Harness Home under its application data; it does not share the CLI default `~/.dsh` in the first milestone.
+
+### Workspace
+
+A durable Harness entity representing a user-selected project directory and its grouped Sessions. The Web Client manages Workspaces. A Workspace is not the Harness Home and is not necessarily the Host working directory.
+
+### Fallback workspace
+
+The deterministic empty Desktop-owned directory used as the Host process working directory. It becomes a Session cwd only when creation supplies neither a Workspace nor an explicit cwd.
+
+### Startup page
+
+The packaged, sandboxed Desktop renderer shown while the Host starts or when startup fails. It is not the Web Client and exposes only the narrow lifecycle/diagnostic preload API.
+
+### Runtime closure
+
+The complete set of published JavaScript, bundle patches, frontend assets, native modules, and peer/runtime packages required for the pinned Web composition to boot from a packaged application without a system Node or Harness installation.
+
+### Development artifact
+
+An unsigned NSIS, DMG, or AppImage produced for this milestone. It is labelled as unsigned and is not automatically published as a public release.
