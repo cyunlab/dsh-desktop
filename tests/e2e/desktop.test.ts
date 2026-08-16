@@ -50,6 +50,11 @@ test('a second launch activates the existing window without creating another Hos
   const desktop = await launchDesktop({ fakeHost: true })
   try {
     await expect(desktop.page.getByRole('heading', { name: 'DeepSeek Harness Web Client' })).toBeVisible()
+    await desktop.app.evaluate(({ BrowserWindow }) => {
+      const [window] = BrowserWindow.getAllWindows()
+      window.minimize()
+    })
+    await expect.poll(() => desktop.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.isMinimized())).toBe(true)
     const executable = desktop.app.process().spawnfile
     const second = spawn(executable, ['.'], {
       cwd: process.cwd(),
@@ -65,7 +70,10 @@ test('a second launch activates the existing window without creating another Hos
       second.once('error', reject)
       second.once('exit', code => code === 0 ? resolve() : reject(new Error(`second instance exited ${code}`)))
     })
-    await expect.poll(() => eventNames(desktop.events)).toContain('second-instance')
+    await expect.poll(async () => {
+      const names = await eventNames(desktop.events)
+      return names.slice(names.lastIndexOf('second-instance'))
+    }).toEqual(['second-instance', 'window-restored', 'window-shown', 'window-focused'])
     expect(desktop.app.windows()).toHaveLength(1)
   } finally { await desktop.app.close() }
 })

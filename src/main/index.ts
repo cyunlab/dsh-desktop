@@ -19,7 +19,7 @@ import { recordE2EEvent, shouldSuppressExternalOpen } from './e2e-observer.js'
 app.setName('DeepSeek Harness Desktop')
 if (process.env.DSH_DESKTOP_TEST_USER_DATA) app.setPath('userData', process.env.DSH_DESKTOP_TEST_USER_DATA)
 assertSupportedNodeVersion(process.versions.node)
-const focusCoordinator = new SingleInstanceFocusCoordinator()
+const focusCoordinator = new SingleInstanceFocusCoordinator(action => recordE2EEvent(`window-${action}`))
 if (process.env.DSH_PACKAGED_HOST_PROBE === '1') {
   void runPackagedHostProbe()
 } else if (!app.requestSingleInstanceLock()) {
