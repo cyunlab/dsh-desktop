@@ -20,12 +20,18 @@ describe('Harness Host launcher', () => {
     const profileDir = path.join(paths.harnessHome, 'profiles', 'web')
     const initProfile = vi.fn(() => mkdirSync(profileDir, { recursive: true }))
     const provideCmdline = vi.fn()
+    const boot = vi.fn(async (_name, _config, _patches, prepare) => {
+      const hostCtx = { provide: vi.fn() }
+      await prepare?.(hostCtx as never)
+      return { webServer: { host: '127.0.0.1', port: 43210 }, fiber: { dispose } } as never
+    })
     const launchEnvironment = Object.freeze({ get: vi.fn(), getFrom: vi.fn() })
     const loadHarness = vi.fn(async () => {
       expect(process.env.DSH_HOME).toBe(paths.harnessHome)
       expect(process.cwd()).toBe(await realpath(paths.fallbackWorkspace))
       return {
         initProfile,
+        composeEntries: vi.fn(() => [{ id: 'agent-presets', name: '@deepseek-ai/dsh-agent-presets', config: { default: 'standard' } }]),
         healProfilesModuleFallback: vi.fn(),
         loadProfile: vi.fn(() => ({
           name: 'web',
@@ -40,11 +46,7 @@ describe('Harness Host launcher', () => {
         loadLayeredEnv: vi.fn(() => launchEnvironment),
         provideCmdline,
         launchEnvironmentKey: 'launchEnvironment' as const,
-        boot: vi.fn(async (_name, _config, _patches, prepare) => {
-          const hostCtx = { provide: vi.fn() }
-          await prepare?.(hostCtx as never)
-          return { webServer: { port: 43210 }, fiber: { dispose } } as never
-        })
+        boot
       }
     })
     const launcher = new HarnessHostLauncher({
@@ -62,6 +64,15 @@ describe('Harness Host launcher', () => {
       args: ['--host', '127.0.0.1', '--port', '0'],
       exit: expect.any(Function)
     })
+    expect(boot.mock.calls[0]?.[2]).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'agent-presets',
+        config: expect.objectContaining({
+          default: 'standard',
+          roots: [expect.objectContaining({ trust: 'system' })]
+        })
+      })
+    ]))
     await Promise.all([handle.dispose(), handle.dispose()])
     expect(dispose).toHaveBeenCalledOnce()
     expect(process.cwd()).toBe(originalCwd)

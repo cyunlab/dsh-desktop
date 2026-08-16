@@ -2,12 +2,13 @@ import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { ApplicationLifecycle } from './application.js'
+import { wireFinalWindowShutdown, wireLifecycleToWindow } from './application-wiring.js'
 import { HarnessHostLauncher } from './harness-host-launcher.js'
 import { NavigationPolicy } from './navigation-policy.js'
 import { selectDesktopPaths } from './paths.js'
 import { SingleInstanceFocusCoordinator } from './single-instance-focus.js'
 import { assertSupportedNodeVersion } from './version-guard.js'
-import { navigateToHostSafely, openExternalSafely } from './window-effects.js'
+import { openExternalSafely } from './window-effects.js'
 import { startupChannels } from '../shared/startup-contract.js'
 
 app.setName('DeepSeek Harness Desktop')
@@ -30,7 +31,6 @@ async function run(): Promise<void> {
   const lifecycle = new ApplicationLifecycle(new HarnessHostLauncher(), paths)
   const policy = new NavigationPolicy(startupUrl)
   let window: BrowserWindow | null = null
-  let quitting = false
 
   const createWindow = (): BrowserWindow => {
     const created = new BrowserWindow({
@@ -68,32 +68,14 @@ async function run(): Promise<void> {
 
   window = createWindow()
   await window.loadFile(startupPath)
-  lifecycle.subscribe(snapshot => {
-    if (!window || window.isDestroyed()) return
-    window.webContents.send(startupChannels.snapshot, snapshot)
-    if (snapshot.state === 'ready' && snapshot.origin) {
-      policy.setHostOrigin(snapshot.origin)
-      const targetWindow = window
-      void navigateToHostSafely(
-        () => targetWindow.loadURL(snapshot.origin!),
-        () => targetWindow.loadFile(startupPath),
-        error => { void lifecycle.reportHostNavigationFailure(error) }
-      )
-    }
-  })
+  wireLifecycleToWindow(lifecycle, () => window, startupPath, startupChannels.snapshot, policy)
 
   ipcMain.handle(startupChannels.snapshot, () => lifecycle.snapshot)
   ipcMain.handle(startupChannels.retry, () => lifecycle.retry())
   ipcMain.handle(startupChannels.copyDiagnostics, () => clipboard.writeText(`DeepSeek Harness Desktop\nState: ${lifecycle.snapshot.state}\nMessage: ${lifecycle.snapshot.message}`))
   ipcMain.handle(startupChannels.revealLogs, () => shell.openPath(paths.logs))
 
-  app.on('window-all-closed', () => { if (!quitting) app.quit() })
-  app.on('before-quit', event => {
-    if (quitting) return
-    event.preventDefault()
-    quitting = true
-    void lifecycle.stop().finally(() => app.quit())
-  })
+  wireFinalWindowShutdown(app, lifecycle)
 
   await lifecycle.start()
 }

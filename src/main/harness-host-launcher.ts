@@ -15,6 +15,7 @@ const ROOT_CONFIG = '# Desktop profile root; official bundle patches are applied
 
 interface HarnessModules {
   boot: typeof import('@deepseek-ai/dsh-app-boot').boot
+  composeEntries: typeof import('@deepseek-ai/dsh-app-boot').composeEntries
   healProfilesModuleFallback: typeof import('@deepseek-ai/dsh-app-boot').healProfilesModuleFallback
   initProfile: typeof import('@deepseek-ai/dsh-app-boot').initProfile
   loadLayeredEnv: typeof import('@deepseek-ai/dsh-app-boot').loadLayeredEnv
@@ -64,6 +65,16 @@ export class HarnessHostLauncher implements HostLauncher {
       const rootConfig = path.join(profile.dir, 'cordis.yml')
       await writeFile(rootConfig, ROOT_CONFIG, 'utf8')
       const patches: PatchOptions[] = profile.layers.flatMap(layer => layer.patches).concat(profile.patches)
+      const agentPresets = harness.composeEntries([patches]).find(entry => entry.id === 'agent-presets')
+      if (agentPresets !== undefined) {
+        patches.push({
+          id: 'agent-presets',
+          config: {
+            ...agentPresets.config as Record<string, unknown>,
+            roots: [{ path: path.join(path.dirname(installAnchor), 'config', 'agent-presets'), trust: 'system' }]
+          }
+        })
+      }
       const environment = harness.loadLayeredEnv('deepseek-harness-desktop', paths.fallbackWorkspace)
       ctx = await harness.boot(
         'deepseek-harness-desktop',
@@ -79,13 +90,16 @@ export class HarnessHostLauncher implements HostLauncher {
         pathToFileURL(installAnchor).href
       )
       const port = ctx.webServer.port
+      const host = ctx.webServer.host
       if (!Number.isInteger(port) || port <= 0) throw new Error('Harness Web server did not expose an assigned port')
+      if (host !== '127.0.0.1') throw new Error(`Harness Web server bound an unexpected host: ${host}`)
       const origin = `http://127.0.0.1:${port}`
       await waitForHttpReady(origin, this.#readiness)
 
       let disposed = false
       return {
         origin,
+        binding: Object.freeze({ host, port }),
         async dispose() {
           if (disposed) return
           disposed = true
