@@ -4,6 +4,15 @@ import { describe, expect, it } from 'vitest'
 const workflow = await readFile(new URL('../../.github/workflows/build.yml', import.meta.url), 'utf8')
 
 describe('native build workflow contract', () => {
+  it('pins every third-party action to a reviewed commit', () => {
+    const actions = [...workflow.matchAll(/uses:\s+([^\s#]+)(?:\s+#\s+(v\S+))?/g)]
+    expect(actions).toHaveLength(6)
+    for (const [, action, version] of actions) {
+      expect(action).toMatch(/^[\w-]+\/[\w-]+@[0-9a-f]{40}$/)
+      expect(version).toMatch(/^v\d+\.\d+\.\d+$/)
+    }
+  })
+
   it('only has manual and version-candidate tag entry points', () => {
     expect(workflow).toMatch(/^on:\n  workflow_dispatch:\n  push:\n    tags:/m)
     expect(workflow).not.toMatch(/^\s+pull_request:/m)
@@ -32,8 +41,7 @@ describe('native build workflow contract', () => {
   it('gates a draft-only tag release on all build jobs', () => {
     expect(workflow).toMatch(/draft-release:[\s\S]*if: github\.event_name == 'push'[\s\S]*needs: build/)
     expect(workflow).toContain('node scripts/verify-release-version.mjs')
-    expect(workflow).toContain('gh release create')
-    expect(workflow).toContain('--draft --verify-tag')
+    expect(workflow).toContain('node scripts/reconcile-draft-release.mjs')
     expect(workflow).not.toMatch(/gh release (?:edit|create)[^\n]*--draft=false/)
     expect(workflow).not.toContain('gh release publish')
   })
