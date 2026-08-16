@@ -44,7 +44,7 @@ describe('application lifecycle', () => {
     await lifecycle.stop()
   })
 
-  it('disposes a launch that resolves after shutdown without leaving stopped', async () => {
+  it('waits for and disposes a launch that resolves during shutdown without leaving stopped', async () => {
     let resolveLaunch!: (handle: { origin: string, dispose(): Promise<void> }) => void
     const dispose = vi.fn(async () => undefined)
     const launch = new Promise<{ origin: string, dispose(): Promise<void> }>(resolve => { resolveLaunch = resolve })
@@ -54,13 +54,25 @@ describe('application lifecycle', () => {
 
     const starting = lifecycle.start()
     await vi.waitFor(() => expect(lifecycle.snapshot.state).toBe('booting'))
-    await lifecycle.stop()
-    expect(lifecycle.snapshot.state).toBe('stopped')
+    const stopping = lifecycle.stop()
+    await vi.waitFor(() => expect(lifecycle.snapshot.state).toBe('stopping'))
+    let stopSettled = false
+    void stopping.then(() => { stopSettled = true })
+    await Promise.resolve()
+    expect(stopSettled).toBe(false)
 
     resolveLaunch({ origin: 'http://127.0.0.1:7654', dispose })
-    await starting
+    await Promise.all([starting, stopping])
     expect(dispose).toHaveBeenCalledOnce()
     expect(lifecycle.snapshot.state).toBe('stopped')
     expect(states.slice(states.lastIndexOf('stopped') + 1)).toEqual([])
+  })
+
+  it('bounds shutdown when a launch never settles', async () => {
+    const lifecycle = new ApplicationLifecycle({ launch: () => new Promise(() => {}) }, await fixturePaths(), 10)
+    void lifecycle.start()
+    await vi.waitFor(() => expect(lifecycle.snapshot.state).toBe('booting'))
+    await expect(lifecycle.stop()).resolves.toBeUndefined()
+    expect(lifecycle.snapshot.state).toBe('stopped')
   })
 })

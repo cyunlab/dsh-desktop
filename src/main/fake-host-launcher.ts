@@ -15,6 +15,7 @@ export class FakeHostLauncher implements HostLauncher {
     let disposed = false
     return {
       origin: `http://127.0.0.1:${address.port}`,
+      binding: Object.freeze({ host: '127.0.0.1', port: address.port }),
       async dispose() {
         if (disposed) return
         disposed = true
