@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -56,6 +56,24 @@ describe('CI artifact sanitizer', () => {
       .rejects.toThrow('escapes workspace')
     await expect(sanitizeArtifactDirectory({ workspace: root, outputDirectory: '..' }))
       .rejects.toThrow('inside the workspace')
+  })
+
+  it('never follows an allowlisted symlink to a file outside the workspace', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'ci-artifact-sanitizer-'))
+    const outside = await mkdtemp(path.join(tmpdir(), 'ci-artifact-secret-'))
+    await mkdir(path.join(root, 'artifacts'))
+    await writeFile(path.join(outside, 'secret.log'), 'outside-secret-value')
+    await symlink(path.join(outside, 'secret.log'), path.join(root, 'artifacts', 'unit.log'))
+    await expect(sanitizeArtifactDirectory({ workspace: root, candidates: ['artifacts/unit.log'] }))
+      .rejects.toThrow('must not be a symbolic link')
+    await expect(readFile(path.join(root, 'sanitized-artifacts', '01-unit.log'))).rejects.toThrow()
+  })
+
+  it('rejects a directory at an allowlisted filename without attempting to read it', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'ci-artifact-sanitizer-'))
+    await mkdir(path.join(root, 'artifacts', 'unit.log'), { recursive: true })
+    await expect(sanitizeArtifactDirectory({ workspace: root, candidates: ['artifacts/unit.log'] }))
+      .rejects.toThrow('must be a regular file')
   })
 
   it('caps the number and total size of emitted files', async () => {

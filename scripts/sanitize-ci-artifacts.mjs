@@ -1,4 +1,5 @@
-import { mkdir, open, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, open, realpath, rm, writeFile } from 'node:fs/promises'
+import { constants as fsConstants } from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -44,8 +45,9 @@ function redactHttpUrl(value) {
 
 export async function sanitizeArtifactDirectory(options = {}) {
   const workspace = path.resolve(options.workspace ?? '.')
-  const outputDirectory = path.resolve(workspace, options.outputDirectory ?? 'sanitized-artifacts')
-  if (!outputDirectory.startsWith(`${workspace}${path.sep}`)) throw new Error('output directory must be inside the workspace')
+  const canonicalWorkspace = await realpath(workspace)
+  const outputDirectory = path.resolve(canonicalWorkspace, options.outputDirectory ?? 'sanitized-artifacts')
+  if (!isInside(canonicalWorkspace, outputDirectory)) throw new Error('output directory must be inside the workspace')
   const candidates = options.candidates ?? DEFAULT_CANDIDATES
   const maxFiles = options.maxFiles ?? DEFAULT_MAX_FILES
   const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES
@@ -54,17 +56,22 @@ export async function sanitizeArtifactDirectory(options = {}) {
 
   await rm(outputDirectory, { recursive: true, force: true })
   await mkdir(outputDirectory, { recursive: true })
+  if (!isInside(canonicalWorkspace, await realpath(outputDirectory))) throw new Error('output directory escaped the workspace')
   const files = []
   const omitted = []
   let totalBytes = 0
 
   for (const candidate of candidates) {
     if (files.length >= maxFiles) { omitted.push(candidate); continue }
-    const source = safeCandidate(workspace, candidate)
+    const source = await safeCandidate(canonicalWorkspace, candidate).catch(error => {
+      if (error?.code === 'ENOENT') return undefined
+      throw error
+    })
+    if (!source) continue
     const available = maxTotalBytes - totalBytes
     if (available <= 0) { omitted.push(candidate); continue }
     const limit = Math.min(maxFileBytes, available)
-    const raw = await readBounded(source, limit).catch(error => {
+    const raw = await readBounded(source.path, source.identity, limit).catch(error => {
       if (error?.code === 'ENOENT') return undefined
       throw error
     })
@@ -81,22 +88,35 @@ export async function sanitizeArtifactDirectory(options = {}) {
   return { files, omitted, totalBytes }
 }
 
-function safeCandidate(workspace, candidate) {
+async function safeCandidate(workspace, candidate) {
   if (path.extname(candidate) !== '.log') throw new Error(`artifact is not allowlisted text: ${candidate}`)
   const resolved = path.resolve(workspace, candidate)
-  if (!resolved.startsWith(`${workspace}${path.sep}`)) throw new Error(`artifact escapes workspace: ${candidate}`)
-  return resolved
+  if (!isInside(workspace, resolved)) throw new Error(`artifact escapes workspace: ${candidate}`)
+  const identity = await lstat(resolved)
+  if (identity.isSymbolicLink()) throw new Error(`artifact must not be a symbolic link: ${candidate}`)
+  if (!identity.isFile()) throw new Error(`artifact must be a regular file: ${candidate}`)
+  const canonical = await realpath(resolved)
+  if (!isInside(workspace, canonical)) throw new Error(`artifact resolves outside workspace: ${candidate}`)
+  return { path: resolved, identity }
 }
 
-async function readBounded(file, limit) {
-  const handle = await open(file, 'r')
+async function readBounded(file, expected, limit) {
+  const noFollow = process.platform !== 'win32' && typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0
+  const handle = await open(file, fsConstants.O_RDONLY | noFollow)
   try {
+    const actual = await handle.stat()
+    if (!actual.isFile()) throw new Error(`artifact changed to a non-regular file before read: ${file}`)
+    if (actual.dev !== expected.dev || actual.ino !== expected.ino) throw new Error(`artifact changed before read: ${file}`)
     const buffer = Buffer.alloc(limit + 1)
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
     return { text: buffer.subarray(0, Math.min(bytesRead, limit)).toString('utf8'), truncated: bytesRead > limit }
   } finally {
     await handle.close()
   }
+}
+
+function isInside(root, target) {
+  return target.startsWith(`${root}${path.sep}`)
 }
 
 function validateLimits(maxFiles, maxFileBytes, maxTotalBytes) {
