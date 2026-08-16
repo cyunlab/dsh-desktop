@@ -5,14 +5,17 @@ import { ApplicationLifecycle } from './application.js'
 import { FakeHostLauncher } from './fake-host-launcher.js'
 import { NavigationPolicy } from './navigation-policy.js'
 import { selectDesktopPaths } from './paths.js'
+import { SingleInstanceFocusCoordinator } from './single-instance-focus.js'
 import { assertSupportedNodeVersion } from './version-guard.js'
 import { startupChannels } from '../shared/startup-contract.js'
 
 app.setName('DeepSeek Harness Desktop')
 assertSupportedNodeVersion(process.versions.node)
+const focusCoordinator = new SingleInstanceFocusCoordinator()
 if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
+  app.on('second-instance', () => focusCoordinator.requestFocus())
   void run()
 }
 
@@ -54,7 +57,11 @@ async function run(): Promise<void> {
       if (policy.decide(url) === 'external') void shell.openExternal(url)
       return { action: 'deny' }
     })
-    created.on('closed', () => { window = null })
+    created.on('closed', () => {
+      focusCoordinator.detach(created)
+      window = null
+    })
+    focusCoordinator.attach(created)
     return created
   }
 
@@ -74,12 +81,6 @@ async function run(): Promise<void> {
   ipcMain.handle(startupChannels.copyDiagnostics, () => clipboard.writeText(`DeepSeek Harness Desktop\nState: ${lifecycle.snapshot.state}\nMessage: ${lifecycle.snapshot.message}`))
   ipcMain.handle(startupChannels.revealLogs, () => shell.openPath(paths.logs))
 
-  app.on('second-instance', () => {
-    if (!window) return
-    if (window.isMinimized()) window.restore()
-    window.show()
-    window.focus()
-  })
   app.on('window-all-closed', () => { if (!quitting) app.quit() })
   app.on('before-quit', event => {
     if (quitting) return
