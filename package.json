@@ -17,10 +17,14 @@
     "start": "electron .",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:e2e": "pnpm build && playwright test",
+    "test:e2e:xvfb": "xvfb-run --auto-servernum pnpm test:e2e",
+    "test:behavior": "pnpm test && pnpm test:integration && pnpm test:e2e",
     "typecheck": "tsc --noEmit",
     "verify:runtime-closure": "node scripts/verify-runtime-closure.mjs --app-dir . --graph-only"
   },
   "devDependencies": {
+    "@playwright/test": "1.55.0",
     "@types/js-yaml": "4.0.9",
     "@types/node": "24.10.1",
     "electron": "43.4.0",

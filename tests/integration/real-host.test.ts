@@ -18,7 +18,7 @@ async function rpc<T>(origin: string, method: string, payload: unknown): Promise
   return body.result.value
 }
 
-describe.skipIf(process.env.DSH_REAL_HOST !== '1')('published Harness Web composition', () => {
+describe('published Harness Web composition', () => {
   it('binds loopback, serves Web/API, applies Workspace cwd and fallback cwd, and disposes', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'DSH Real Host With Spaces '))
     const paths = {
