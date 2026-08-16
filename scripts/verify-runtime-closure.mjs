@@ -12,7 +12,7 @@ const { values } = parseArgs({
     'graph-only': { type: 'boolean', default: false }
   }
 })
-const appDir = path.resolve(values['app-dir'] ?? '.')
+const appDir = await realpath(path.resolve(values['app-dir'] ?? '.'))
 const target = {
   platform: values['target-platform'] ?? process.platform,
   arch: values['target-arch'] ?? process.arch
@@ -60,8 +60,11 @@ while (queue.length > 0) {
     const configured = [...contents.matchAll(/^\s*(?:-\s*)?name:\s*['"]?(@?[^'"\s#]+)['"]?\s*(?:#.*)?$/gm)]
       .map(match => match[1])
     for (const name of configured) {
-      if (await findPackageManifest(packageNameFromSpecifier(name), packageDir, appDir) === undefined) {
+      const dependency = await findPackageManifest(packageNameFromSpecifier(name), packageDir, appDir)
+      if (dependency === undefined) {
         failures.push(`${manifest.name}/${asset} -> ${name} (missing dynamically configured package)`)
+      } else {
+        queue.push({ manifestPath: dependency, chain: [...current.chain, manifest.name ?? canonical] })
       }
     }
   }
@@ -84,7 +87,7 @@ if (failures.length > 0) {
 async function findPackageManifest(name, fromDir, root) {
   const segments = name.split('/')
   let cursor = fromDir
-  while (true) {
+  while (isWithin(root, cursor)) {
     const candidate = path.join(cursor, 'node_modules', ...segments, 'package.json')
     if (await exists(candidate)) return candidate
     const parent = path.dirname(cursor)
@@ -93,6 +96,11 @@ async function findPackageManifest(name, fromDir, root) {
   }
   const rootCandidate = path.join(root, 'node_modules', ...segments, 'package.json')
   return await exists(rootCandidate) ? rootCandidate : undefined
+}
+
+function isWithin(root, candidate) {
+  const relative = path.relative(root, candidate)
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))
 }
 
 async function realManifest(manifestPath) {

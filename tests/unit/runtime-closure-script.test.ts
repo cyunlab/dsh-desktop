@@ -29,6 +29,23 @@ async function writeRequiredAssets(root: string): Promise<void> {
 }
 
 describe('runtime closure verifier CLI', () => {
+  it('does not resolve a staged dependency from parent checkout node_modules', async () => {
+    const parent = await mkdtemp(path.join(tmpdir(), 'desktop-parent-'))
+    const root = path.join(parent, 'staged-app')
+    await mkdir(root)
+    await writeRequiredAssets(root)
+    await writePackage(parent, '@deepseek-ai/parent-only')
+    await writeFile(path.join(root, 'package.json'), JSON.stringify({
+      name: 'fixture',
+      dependencies: { '@deepseek-ai/parent-only': '1.0.0' }
+    }))
+
+    const result = spawnSync(process.execPath, [verifier, '--app-dir', root, '--target-platform', 'darwin', '--target-arch', 'arm64'], { encoding: 'utf8' })
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('@deepseek-ai/parent-only (missing required package)')
+  })
+
   it('rejects a dynamically configured plugin omitted from the staged application', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'desktop-closure-'))
     await writeRequiredAssets(root)
@@ -62,5 +79,23 @@ describe('runtime closure verifier CLI', () => {
 
     expect(result.status).toBe(0)
     expect(result.stdout).toContain('runtime closure verified')
+  })
+
+  it('traverses dependencies of a plugin discovered only through bundle YAML', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'desktop-closure-'))
+    await writeRequiredAssets(root)
+    await writeFile(path.join(root, 'package.json'), JSON.stringify({
+      name: 'fixture', dependencies: { '@deepseek-ai/dsh-base': '1.0.0' }
+    }))
+    const bundle = await writePackage(root, '@deepseek-ai/dsh-base')
+    await writeFile(path.join(bundle, 'cordis.patch.yml'), "- insert:\n  - name: '@deepseek-ai/dynamic-plugin'\n")
+    await writePackage(root, '@deepseek-ai/dynamic-plugin', {
+      dependencies: { '@deepseek-ai/missing-transitive': '1.0.0' }
+    })
+
+    const result = spawnSync(process.execPath, [verifier, '--app-dir', root, '--target-platform', 'darwin', '--target-arch', 'arm64'], { encoding: 'utf8' })
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('@deepseek-ai/dynamic-plugin -> @deepseek-ai/missing-transitive')
   })
 })

@@ -9,7 +9,7 @@ export default async function afterPack(context) {
 }
 
 export async function runAfterPack(context, dependencies = {}) {
-  const runCommand = dependencies.runCommand ?? run
+  const runCommand = dependencies.runCommand ?? runCommandWithTimeout
   const host = dependencies.host ?? { platform: process.platform, arch: process.arch }
   const log = dependencies.log ?? console.log
   const prepareAssets = dependencies.prepareAssets ?? (async (root, selectedTarget) => {
@@ -88,25 +88,82 @@ function packagedExecutable(context) {
   return path.join(context.appOutDir, 'deepseek-harness-desktop')
 }
 
-function run(command, args, extraEnv, timeoutMs = 30_000) {
+export function runCommandWithTimeout(command, args, extraEnv, timeoutMs = 30_000) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       env: { ...process.env, ...extraEnv },
       stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true
+      windowsHide: true,
+      detached: process.platform !== 'win32'
     })
     let output = ''
+    let timedOut = false
+    let exited = false
+    let exitCode = null
+    let exitSignal = null
     child.stdout.on('data', chunk => { output += chunk })
     child.stderr.on('data', chunk => { output += chunk })
-    const timeout = setTimeout(() => {
-      child.kill('SIGKILL')
-      reject(new Error(`timed out after ${timeoutMs} ms: ${command}`))
+    const exitPromise = new Promise(exitResolve => child.once('exit', (code, signal) => {
+      exited = true
+      exitCode = code
+      exitSignal = signal
+      exitResolve()
+    }))
+    const timeout = setTimeout(async () => {
+      timedOut = true
+      try {
+        await terminateProcessTree(child, exitPromise, () => exited)
+        reject(new Error(`timed out after ${timeoutMs} ms and terminated process tree: ${command}\n${output}`))
+      } catch (error) {
+        reject(new Error(`timed out after ${timeoutMs} ms; process tree termination failed: ${command}: ${error instanceof Error ? error.message : String(error)}\n${output}`))
+      }
     }, timeoutMs)
     child.once('error', error => { clearTimeout(timeout); reject(error) })
-    child.once('exit', code => {
+    void exitPromise.then(() => {
       clearTimeout(timeout)
-      if (code === 0) resolve(output)
-      else reject(new Error(`${command} exited with ${code}:\n${output}`))
+      if (timedOut) return
+      if (exitCode === 0) resolve(output)
+      else reject(new Error(`${command} exited with ${exitCode ?? exitSignal}:\n${output}`))
     })
+  })
+}
+
+async function terminateProcessTree(child, exitPromise, hasExited) {
+  if (hasExited() || child.pid === undefined) return
+  if (process.platform === 'win32') {
+    try {
+      await runTerminationCommand('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'])
+    } catch (error) {
+      if (!hasExited()) throw error
+    }
+    if (!await waitForExit(exitPromise, hasExited, 3_000)) throw new Error(`taskkill completed but PID ${child.pid} did not exit`)
+    return
+  }
+
+  signalProcessGroup(child.pid, 'SIGTERM')
+  if (await waitForExit(exitPromise, hasExited, 1_000)) return
+  signalProcessGroup(child.pid, 'SIGKILL')
+  if (!await waitForExit(exitPromise, hasExited, 3_000)) throw new Error(`PID ${child.pid} did not exit after SIGKILL`)
+}
+
+function signalProcessGroup(pid, signal) {
+  try { process.kill(-pid, signal) } catch (error) {
+    if (error?.code !== 'ESRCH') throw error
+  }
+}
+
+async function waitForExit(exitPromise, hasExited, timeoutMs) {
+  if (hasExited()) return true
+  return Promise.race([
+    exitPromise.then(() => true),
+    new Promise(resolve => setTimeout(() => resolve(false), timeoutMs))
+  ])
+}
+
+function runTerminationCommand(command, args) {
+  return new Promise((resolve, reject) => {
+    const terminator = spawn(command, args, { windowsHide: true, stdio: 'ignore' })
+    terminator.once('error', reject)
+    terminator.once('exit', code => code === 0 ? resolve() : reject(new Error(`${command} exited with ${code}`)))
   })
 }
