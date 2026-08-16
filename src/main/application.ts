@@ -2,6 +2,7 @@ import type { DesktopPaths } from './paths.js'
 import { prepareDesktopPaths } from './paths.js'
 import type { HostHandle, HostLauncher } from './host-launcher.js'
 import type { LifecycleSnapshot, LifecycleState } from '../shared/startup-contract.js'
+import { userFacingStartupError } from './user-facing-error.js'
 
 type SnapshotListener = (snapshot: LifecycleSnapshot) => void
 
@@ -10,6 +11,7 @@ export class ApplicationLifecycle {
   #handle?: HostHandle
   #operation?: Promise<void>
   #stopping?: Promise<void>
+  #shutdownRequested = false
   readonly #listeners = new Set<SnapshotListener>()
 
   constructor(readonly launcher: HostLauncher, readonly paths: DesktopPaths, readonly shutdownTimeoutMs = 5_000) {}
@@ -32,13 +34,23 @@ export class ApplicationLifecycle {
       this.#transition('preparing', 'Preparing application data')
       await prepareDesktopPaths(this.paths)
       this.#transition('booting', 'Starting local Host')
-      this.#handle = await this.launcher.launch(this.paths)
+      const handle = await this.launcher.launch(this.paths)
+      if (this.#shutdownRequested) {
+        await handle.dispose()
+        return
+      }
+      this.#handle = handle
       this.#transition('probing', 'Checking local Web Client', this.#handle.origin)
       this.#transition('ready', 'Web Client is ready', this.#handle.origin)
     } catch (error) {
       await this.#disposeHandle().catch(() => undefined)
-      this.#transition('failed', error instanceof Error ? error.message : 'Startup failed')
+      if (!this.#shutdownRequested) this.#transition('failed', userFacingStartupError('host-startup', error))
     }
+  }
+  async reportHostNavigationFailure(error: unknown): Promise<void> {
+    if (this.#shutdownRequested || this.#snapshot.state !== 'ready') return
+    await this.#disposeHandle().catch(() => undefined)
+    this.#transition('failed', userFacingStartupError('host-navigation', error))
   }
   stop(): Promise<void> {
     if (this.#stopping) return this.#stopping
@@ -47,6 +59,7 @@ export class ApplicationLifecycle {
   }
   async #stop(): Promise<void> {
     if (this.#snapshot.state === 'stopped') return
+    this.#shutdownRequested = true
     this.#transition('stopping', 'Stopping local Host')
     await Promise.race([
       this.#disposeHandle(),

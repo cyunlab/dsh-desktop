@@ -35,12 +35,32 @@ describe('application lifecycle', () => {
       .mockResolvedValueOnce({ origin: 'http://127.0.0.1:9876', dispose })
     const lifecycle = new ApplicationLifecycle({ launch }, await fixturePaths())
     await lifecycle.start()
-    expect(lifecycle.snapshot).toMatchObject({ state: 'failed', message: 'test startup failure' })
+    expect(lifecycle.snapshot).toMatchObject({ state: 'failed', message: 'The local Host could not start. Retry or copy diagnostics for help.' })
     const first = lifecycle.retry()
     const second = lifecycle.retry()
     await Promise.all([first, second])
     expect(launch).toHaveBeenCalledTimes(2)
     expect(lifecycle.snapshot.state).toBe('ready')
     await lifecycle.stop()
+  })
+
+  it('disposes a launch that resolves after shutdown without leaving stopped', async () => {
+    let resolveLaunch!: (handle: { origin: string, dispose(): Promise<void> }) => void
+    const dispose = vi.fn(async () => undefined)
+    const launch = new Promise<{ origin: string, dispose(): Promise<void> }>(resolve => { resolveLaunch = resolve })
+    const lifecycle = new ApplicationLifecycle({ launch: () => launch }, await fixturePaths())
+    const states: string[] = []
+    lifecycle.subscribe(snapshot => states.push(snapshot.state))
+
+    const starting = lifecycle.start()
+    await vi.waitFor(() => expect(lifecycle.snapshot.state).toBe('booting'))
+    await lifecycle.stop()
+    expect(lifecycle.snapshot.state).toBe('stopped')
+
+    resolveLaunch({ origin: 'http://127.0.0.1:7654', dispose })
+    await starting
+    expect(dispose).toHaveBeenCalledOnce()
+    expect(lifecycle.snapshot.state).toBe('stopped')
+    expect(states.slice(states.lastIndexOf('stopped') + 1)).toEqual([])
   })
 })

@@ -7,6 +7,7 @@ import { NavigationPolicy } from './navigation-policy.js'
 import { selectDesktopPaths } from './paths.js'
 import { SingleInstanceFocusCoordinator } from './single-instance-focus.js'
 import { assertSupportedNodeVersion } from './version-guard.js'
+import { navigateToHostSafely, openExternalSafely } from './window-effects.js'
 import { startupChannels } from '../shared/startup-contract.js'
 
 app.setName('DeepSeek Harness Desktop')
@@ -51,10 +52,10 @@ async function run(): Promise<void> {
       const decision = policy.decide(target)
       if (decision === 'allow') return
       event.preventDefault()
-      if (decision === 'external') void shell.openExternal(target)
+      if (decision === 'external') void openExternalSafely(url => shell.openExternal(url), target)
     })
     created.webContents.setWindowOpenHandler(({ url }) => {
-      if (policy.decide(url) === 'external') void shell.openExternal(url)
+      if (policy.decide(url) === 'external') void openExternalSafely(target => shell.openExternal(target), url)
       return { action: 'deny' }
     })
     created.on('closed', () => {
@@ -72,7 +73,12 @@ async function run(): Promise<void> {
     window.webContents.send(startupChannels.snapshot, snapshot)
     if (snapshot.state === 'ready' && snapshot.origin) {
       policy.setHostOrigin(snapshot.origin)
-      void window.loadURL(snapshot.origin)
+      const targetWindow = window
+      void navigateToHostSafely(
+        () => targetWindow.loadURL(snapshot.origin!),
+        () => targetWindow.loadFile(startupPath),
+        error => { void lifecycle.reportHostNavigationFailure(error) }
+      )
     }
   })
 
