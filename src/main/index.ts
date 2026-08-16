@@ -2,7 +2,7 @@ import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { ApplicationLifecycle } from './application.js'
-import { FakeHostLauncher } from './fake-host-launcher.js'
+import { HarnessHostLauncher } from './harness-host-launcher.js'
 import { NavigationPolicy } from './navigation-policy.js'
 import { selectDesktopPaths } from './paths.js'
 import { SingleInstanceFocusCoordinator } from './single-instance-focus.js'
@@ -27,7 +27,7 @@ async function run(): Promise<void> {
   const startupPath = path.join(distRoot, 'startup', 'index.html')
   const startupUrl = pathToFileURL(startupPath).href
   const paths = selectDesktopPaths(app)
-  const lifecycle = new ApplicationLifecycle(new FakeHostLauncher(), paths)
+  const lifecycle = new ApplicationLifecycle(new HarnessHostLauncher(), paths)
   const policy = new NavigationPolicy(startupUrl)
   let window: BrowserWindow | null = null
   let quitting = false
