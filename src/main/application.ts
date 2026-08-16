@@ -12,6 +12,7 @@ export class ApplicationLifecycle {
   #handle?: HostHandle
   #operation?: Promise<void>
   #retryOperation?: Promise<void>
+  #navigationFailureOperation?: Promise<void>
   #stopping?: Promise<void>
   #shutdownRequested = false
   readonly #listeners = new Set<SnapshotListener>()
@@ -68,10 +69,20 @@ export class ApplicationLifecycle {
       if (!this.#shutdownRequested) this.#transition('failed', userFacingStartupError('host-startup', error))
     }
   }
-  async reportHostNavigationFailure(error: unknown): Promise<void> {
-    if (this.#shutdownRequested || this.#snapshot.state !== 'ready') return
+  reportHostNavigationFailure(error: unknown): Promise<void> {
+    if (this.#navigationFailureOperation) return this.#navigationFailureOperation
+    if (this.#shutdownRequested || this.#snapshot.state !== 'ready') return Promise.resolve()
+    this.#navigationFailureOperation = this.#recoverFromNavigationFailure(error)
+      .finally(() => { this.#navigationFailureOperation = undefined })
+    return this.#navigationFailureOperation
+  }
+  async #recoverFromNavigationFailure(error: unknown): Promise<void> {
     this.diagnostics.failure('host-navigation', error)
-    await this.#disposeHandle().catch(disposeError => this.diagnostics.failure('host-disposal', disposeError))
+    try { await this.#disposeHandle() }
+    catch (disposeError) {
+      if (!this.#shutdownRequested) this.diagnostics.failure('host-disposal', disposeError)
+    }
+    if (this.#shutdownRequested) return
     this.#transition('failed', userFacingStartupError('host-navigation', error))
   }
   stop(): Promise<void> {
@@ -89,6 +100,7 @@ export class ApplicationLifecycle {
       // handle; wait for the whole branch before declaring cleanup complete.
       await this.#retryOperation?.catch(() => undefined)
       await this.#operation?.catch(() => undefined)
+      await this.#navigationFailureOperation?.catch(() => undefined)
       await this.#disposeHandle().catch(error => this.diagnostics.failure('host-shutdown', error))
     }
     let timeout: ReturnType<typeof setTimeout> | undefined

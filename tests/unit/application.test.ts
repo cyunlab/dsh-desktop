@@ -99,6 +99,43 @@ describe('application lifecycle', () => {
     expect(lifecycle.retry()).toBe(stop)
   })
 
+  it('serializes navigation-failure disposal with shutdown without post-stopped activity', async () => {
+    let releaseDispose!: () => void
+    const dispose = vi.fn(() => new Promise<void>(resolve => { releaseDispose = resolve }))
+    const lifecycleStates: string[] = []
+    const diagnosticEvents: string[] = []
+    const diagnostics = {
+      lifecycle: vi.fn(snapshot => diagnosticEvents.push(`state:${snapshot.state}`)),
+      assignedPort: vi.fn(), navigationRejected: vi.fn(),
+      failure: vi.fn(area => diagnosticEvents.push(`failure:${area}`)),
+      actionFailure: vi.fn(), flush: vi.fn(async () => undefined)
+    }
+    const lifecycle = new ApplicationLifecycle({
+      launch: async () => ({ origin: 'http://127.0.0.1:7788', dispose })
+    }, await fixturePaths(), 1_000, diagnostics)
+    lifecycle.subscribe(snapshot => lifecycleStates.push(snapshot.state))
+    await lifecycle.start()
+
+    const recovery = lifecycle.reportHostNavigationFailure(new Error('navigation failed'))
+    const duplicateRecovery = lifecycle.reportHostNavigationFailure(new Error('duplicate ignored'))
+    expect(recovery).toBe(duplicateRecovery)
+    await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce())
+    const stop = lifecycle.stop()
+    let stopped = false
+    void stop.then(() => { stopped = true })
+    await Promise.resolve()
+    expect(stopped).toBe(false)
+
+    releaseDispose()
+    await Promise.all([recovery, stop])
+    expect(lifecycle.snapshot.state).toBe('stopped')
+    expect(lifecycleStates).not.toContain('failed')
+    const stoppedState = lifecycleStates.lastIndexOf('stopped')
+    expect(lifecycleStates.slice(stoppedState + 1)).toEqual([])
+    const stoppedDiagnostic = diagnosticEvents.lastIndexOf('state:stopped')
+    expect(diagnosticEvents.slice(stoppedDiagnostic + 1)).toEqual([])
+  })
+
   it('waits for and disposes a launch that resolves during shutdown without leaving stopped', async () => {
     let resolveLaunch!: (handle: { origin: string, dispose(): Promise<void> }) => void
     const dispose = vi.fn(async () => undefined)
