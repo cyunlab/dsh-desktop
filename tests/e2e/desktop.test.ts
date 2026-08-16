@@ -1,5 +1,5 @@
 import { _electron as electron, expect, test, type ElectronApplication, type Page } from '@playwright/test'
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { access, mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
@@ -15,7 +15,8 @@ async function launchDesktop(options: { fakeHost?: boolean; failures?: number } 
   const root = await mkdtemp(path.join(tmpdir(), 'DSH Desktop E2E With Spaces '))
   const events = path.join(root, 'events.jsonl')
   const app = await electron.launch({
-    args: ['.'],
+    executablePath: await packagedExecutable(),
+    args: [],
     env: {
       ...process.env,
       ...(options.fakeHost ? { DSH_DESKTOP_TEST_HOST: 'fake' } : {}),
@@ -25,6 +26,22 @@ async function launchDesktop(options: { fakeHost?: boolean; failures?: number } 
     }
   })
   return { app, page: await app.firstWindow(), root, events }
+}
+
+async function packagedExecutable(): Promise<string> {
+  const output = path.resolve('release', 'E2E Package With Spaces')
+  const candidates = process.platform === 'darwin'
+    ? [
+        path.join(output, `mac-${process.arch}`, 'deepseek-harness-desktop.app', 'Contents', 'MacOS', 'deepseek-harness-desktop'),
+        path.join(output, 'mac', 'deepseek-harness-desktop.app', 'Contents', 'MacOS', 'deepseek-harness-desktop')
+      ]
+    : process.platform === 'win32'
+      ? [path.join(output, 'win-unpacked', 'deepseek-harness-desktop.exe')]
+      : [path.join(output, 'linux-unpacked', 'deepseek-harness-desktop')]
+  for (const candidate of candidates) {
+    try { await access(candidate); return candidate } catch { /* try platform fallback */ }
+  }
+  throw new Error(`No unpacked packaged Desktop executable found under ${output}`)
 }
 
 async function eventNames(file: string): Promise<string[]> {
@@ -56,8 +73,7 @@ test('a second launch activates the existing window without creating another Hos
     })
     await expect.poll(() => desktop.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.isMinimized())).toBe(true)
     const executable = desktop.app.process().spawnfile
-    const second = spawn(executable, ['.'], {
-      cwd: process.cwd(),
+    const second = spawn(executable, [], {
       env: {
         ...process.env,
         DSH_DESKTOP_TEST_HOST: 'fake',
