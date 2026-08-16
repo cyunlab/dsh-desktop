@@ -22,6 +22,7 @@ export class ApplicationLifecycle {
 
   start(): Promise<void> { return this.#run(false) }
   retry(): Promise<void> {
+    if (this.#shutdownRequested) return this.#stopping ?? Promise.resolve()
     if (this.#retryOperation) return this.#retryOperation
     if (this.#snapshot.state !== 'failed') return this.#operation ?? Promise.resolve()
     // A failed snapshot is published just before the current boot promise's
@@ -30,6 +31,7 @@ export class ApplicationLifecycle {
     const previous = this.#operation
     this.#retryOperation = (async () => {
       await previous?.catch(() => undefined)
+      if (this.#shutdownRequested) return
       await this.#run(true)
     })().finally(() => { this.#retryOperation = undefined })
     return this.#retryOperation
@@ -41,9 +43,15 @@ export class ApplicationLifecycle {
   }
   async #boot(retry: boolean): Promise<void> {
     try {
-      if (retry) { this.#transition('retrying', 'Retrying startup'); await this.#disposeHandle() }
+      if (this.#shutdownRequested) return
+      if (retry) {
+        this.#transition('retrying', 'Retrying startup')
+        await this.#disposeHandle()
+        if (this.#shutdownRequested) return
+      }
       this.#transition('preparing', 'Preparing application data')
       await prepareDesktopPaths(this.paths)
+      if (this.#shutdownRequested) return
       this.#transition('booting', 'Starting local Host')
       const handle = await this.launcher.launch(this.paths)
       if (this.#shutdownRequested) {
@@ -79,6 +87,7 @@ export class ApplicationLifecycle {
       // A launch that has not returned a handle yet still owns resources and
       // process-global path state. Its shutdown branch disposes that late
       // handle; wait for the whole branch before declaring cleanup complete.
+      await this.#retryOperation?.catch(() => undefined)
       await this.#operation?.catch(() => undefined)
       await this.#disposeHandle().catch(error => this.diagnostics.failure('host-shutdown', error))
     }

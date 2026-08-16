@@ -67,6 +67,38 @@ describe('application lifecycle', () => {
     await lifecycle.stop()
   })
 
+  it('atomically cancels an accepted retry when shutdown begins in the same turn', async () => {
+    const launch = vi.fn().mockRejectedValueOnce(new Error('first attempt failed'))
+    const lifecycleStates: string[] = []
+    const diagnosticStates: string[] = []
+    const diagnostics = {
+      lifecycle: vi.fn(snapshot => diagnosticStates.push(snapshot.state)),
+      assignedPort: vi.fn(), navigationRejected: vi.fn(), failure: vi.fn(), actionFailure: vi.fn(),
+      flush: vi.fn(async () => undefined)
+    }
+    const lifecycle = new ApplicationLifecycle({ launch }, await fixturePaths(), 100, diagnostics)
+    lifecycle.subscribe(snapshot => lifecycleStates.push(snapshot.state))
+    await lifecycle.start()
+    expect(lifecycle.snapshot.state).toBe('failed')
+
+    const retry = lifecycle.retry()
+    const duplicateRetry = lifecycle.retry()
+    const stop = lifecycle.stop()
+    const duplicateStop = lifecycle.stop()
+    const retryAfterStop = lifecycle.retry()
+    expect(retry).toBe(duplicateRetry)
+    expect(stop).toBe(duplicateStop)
+
+    await Promise.all([retry, stop, retryAfterStop])
+    expect(launch).toHaveBeenCalledTimes(1)
+    expect(lifecycle.snapshot.state).toBe('stopped')
+    const stoppedAt = lifecycleStates.lastIndexOf('stopped')
+    expect(lifecycleStates.slice(stoppedAt + 1)).toEqual([])
+    const diagnosticStoppedAt = diagnosticStates.lastIndexOf('stopped')
+    expect(diagnosticStates.slice(diagnosticStoppedAt + 1)).toEqual([])
+    expect(lifecycle.retry()).toBe(stop)
+  })
+
   it('waits for and disposes a launch that resolves during shutdown without leaving stopped', async () => {
     let resolveLaunch!: (handle: { origin: string, dispose(): Promise<void> }) => void
     const dispose = vi.fn(async () => undefined)
