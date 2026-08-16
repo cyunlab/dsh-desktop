@@ -1,8 +1,7 @@
 # DeepSeek Harness Desktop
 
-Secure Electron shell for the DeepSeek Harness Web Client. This first runnable
-slice uses a loopback-only fake Host behind the production launcher interface;
-the published Harness composition is integrated separately.
+Secure Electron shell for the DeepSeek Harness Web Client. Desktop starts the
+pinned published Harness Web composition on a loopback-only listener.
 
 ## Development
 
@@ -23,3 +22,15 @@ corepack pnpm test
 ```
 
 Desktop application for DSH.
+
+## Unsigned development packages
+
+Run `corepack pnpm package` on the native target platform. Artifacts are written
+to `release/` with a space-free `deepseek-harness-desktop-<version>-unsigned-dev-…`
+filename. The supported native targets are Windows x64 NSIS, separate macOS
+arm64 and x64 DMGs, and Linux x64 AppImage.
+
+These development artifacts are not signed. On macOS, Control-click the app,
+choose **Open**, then confirm **Open** to pass Gatekeeper. On Windows, choose
+**More info** and **Run anyway** in the SmartScreen prompt. Only use artifacts
+from a build you trust.
