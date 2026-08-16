@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self' data:">
+    <title>DeepSeek Harness Desktop</title>
+    <link rel="stylesheet" href="./index.css">
+  </head>
+  <body>
+    <main>
+      <div class="mark" aria-hidden="true">DS</div>
+      <p class="eyebrow">DeepSeek Harness Desktop</p>
+      <h1 id="state">Starting…</h1>
+      <p id="message" aria-live="polite">Preparing the local Web Client.</p>
+      <div id="actions" hidden>
+        <button id="retry" type="button">Retry</button>
+        <button id="copy" type="button">Copy diagnostics</button>
+        <button id="logs" type="button">Open logs</button>
+      </div>
+    </main>
+    <script type="module" src="./index.js"></script>
+  </body>
+</html>

@@ -1,0 +1,26 @@
+{
+  "name": "deepseek-harness-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "productName": "DeepSeek Harness Desktop",
+  "main": "dist/main/index.js",
+  "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "pnpm build && electron .",
+    "start": "electron .",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "electron": "43.4.0",
+    "esbuild": "0.27.3",
+    "typescript": "5.9.3",
+    "vitest": "4.0.18"
+  }
+}
