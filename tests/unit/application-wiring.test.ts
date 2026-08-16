@@ -61,4 +61,37 @@ describe('Electron application wiring', () => {
     await vi.waitFor(() => expect(app.quitCalls).toBe(2))
     await expect(fetch(origin)).rejects.toThrow()
   })
+
+  it('does not complete quit until a late launch handle has been disposed', async () => {
+    class FakeApp extends EventEmitter {
+      quitCalls = 0
+      quit(): void {
+        this.quitCalls += 1
+        let prevented = false
+        this.emit('before-quit', { preventDefault: () => { prevented = true } } satisfies QuitEvent)
+        if (!prevented) this.emit('quit-complete')
+      }
+    }
+    let resolveLaunch!: (handle: { origin: string; dispose(): Promise<void> }) => void
+    let resolveDispose!: () => void
+    const dispose = vi.fn(() => new Promise<void>(resolve => { resolveDispose = resolve }))
+    const lifecycle = new ApplicationLifecycle({
+      launch: () => new Promise(resolve => { resolveLaunch = resolve })
+    }, await fixturePaths())
+    void lifecycle.start()
+    await vi.waitFor(() => expect(lifecycle.snapshot.state).toBe('booting'))
+    const app = new FakeApp()
+    wireFinalWindowShutdown(app, lifecycle)
+
+    app.emit('window-all-closed')
+    expect(app.quitCalls).toBe(1)
+    resolveLaunch({ origin: 'http://127.0.0.1:45679', dispose })
+    await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce())
+    expect(app.quitCalls).toBe(1)
+    expect(lifecycle.snapshot.state).toBe('stopping')
+
+    resolveDispose()
+    await vi.waitFor(() => expect(app.quitCalls).toBe(2))
+    expect(lifecycle.snapshot.state).toBe('stopped')
+  })
 })

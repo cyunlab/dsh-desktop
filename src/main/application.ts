@@ -61,10 +61,22 @@ export class ApplicationLifecycle {
     if (this.#snapshot.state === 'stopped') return
     this.#shutdownRequested = true
     this.#transition('stopping', 'Stopping local Host')
-    await Promise.race([
-      this.#disposeHandle(),
-      new Promise<void>(resolve => setTimeout(resolve, this.shutdownTimeoutMs))
-    ])
+    const cleanup = async (): Promise<void> => {
+      // A launch that has not returned a handle yet still owns resources and
+      // process-global path state. Its shutdown branch disposes that late
+      // handle; wait for the whole branch before declaring cleanup complete.
+      await this.#operation?.catch(() => undefined)
+      await this.#disposeHandle()
+    }
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        cleanup(),
+        new Promise<void>(resolve => { timeout = setTimeout(resolve, this.shutdownTimeoutMs) })
+      ])
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout)
+    }
     this.#transition('stopped', 'Stopped')
   }
   async #disposeHandle(): Promise<void> { const handle = this.#handle; this.#handle = undefined; await handle?.dispose() }
