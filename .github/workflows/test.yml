@@ -96,14 +96,19 @@ jobs:
           test -z "$(git -C deepseek-harness status --porcelain)"
           git diff --exit-code --submodule=short -- deepseek-harness
 
+      - name: Sanitize bounded textual diagnostics
+        id: sanitize
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: node scripts/sanitize-ci-artifacts.mjs
+
       - name: Retain test diagnostics
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: behavior-test-diagnostics-${{ runner.os }}-${{ runner.arch }}
-          path: |
-            artifacts/
-            test-results/
+          path: sanitized-artifacts/
           if-no-files-found: warn
           retention-days: 7
 
@@ -117,8 +122,9 @@ jobs:
           E2E_OUTCOME: ${{ steps.e2e.outcome }}
           E2E_LINUX_OUTCOME: ${{ steps.e2e_linux.outcome }}
           HARNESS_GUARD_OUTCOME: ${{ steps.harness_guard.outcome }}
+          SANITIZE_OUTCOME: ${{ steps.sanitize.outcome }}
         run: |
-          outcomes="$TYPECHECK_OUTCOME $UNIT_OUTCOME $INTEGRATION_OUTCOME $HARNESS_GUARD_OUTCOME"
+          outcomes="$TYPECHECK_OUTCOME $UNIT_OUTCOME $INTEGRATION_OUTCOME $HARNESS_GUARD_OUTCOME $SANITIZE_OUTCOME"
           if [ "$RUNNER_OS" = Linux ]; then
             outcomes="$outcomes $E2E_LINUX_OUTCOME"
           else

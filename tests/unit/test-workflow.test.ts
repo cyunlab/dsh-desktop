@@ -43,8 +43,9 @@ describe('manual Desktop behavior workflow', () => {
   it('retains bounded diagnostics without building installer artifacts', async () => {
     const contents = await workflow()
     expect(contents).toContain('if: always()\n        uses: actions/upload-artifact@v6')
-    expect(contents).toContain('artifacts/')
-    expect(contents).toContain('test-results/')
+    expect(contents).toContain('node scripts/sanitize-ci-artifacts.mjs')
+    expect(contents).toContain('path: sanitized-artifacts/')
+    expect(contents).not.toMatch(/^\s+path: (?:artifacts|test-results)\//m)
     expect(contents).toContain('retention-days: 7')
     expect(contents).not.toMatch(/pnpm (?:package|build)|electron-builder/)
   })
