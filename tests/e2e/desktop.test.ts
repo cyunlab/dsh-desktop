@@ -2,7 +2,7 @@ import { _electron as electron, expect, test, type ElectronApplication, type Pag
 import { access, mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
+import { runCommandWithTimeout } from '../../scripts/after-pack.mjs'
 
 interface RunningDesktop {
   app: ElectronApplication
@@ -56,8 +56,12 @@ async function waitForWebClient(page: Page): Promise<void> {
 test('moves from the packaged startup page to the Web Client', async () => {
   const desktop = await launchDesktop()
   try {
-    await expect(desktop.page.getByRole('heading')).toContainText(/Preparing|Starting|Checking/)
     await waitForWebClient(desktop.page)
+    await expect.poll(async () => {
+      const names = await eventNames(desktop.events)
+      const startup = names.indexOf('startup-page-loaded')
+      return startup >= 0 && names.indexOf('web-client-loaded') > startup
+    }).toBe(true)
     await expect(desktop.page).toHaveTitle(/DeepSeek Harness/)
     expect(new URL(desktop.page.url()).hostname).toBe('127.0.0.1')
   } finally { await desktop.app.close() }
@@ -73,19 +77,11 @@ test('a second launch activates the existing window without creating another Hos
     })
     await expect.poll(() => desktop.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.isMinimized())).toBe(true)
     const executable = desktop.app.process().spawnfile
-    const second = spawn(executable, [], {
-      env: {
-        ...process.env,
-        DSH_DESKTOP_TEST_HOST: 'fake',
-        DSH_DESKTOP_TEST_USER_DATA: path.join(desktop.root, 'User Data With Spaces'),
-        DSH_DESKTOP_TEST_EVENTS: desktop.events
-      },
-      stdio: 'ignore'
-    })
-    await new Promise<void>((resolve, reject) => {
-      second.once('error', reject)
-      second.once('exit', code => code === 0 ? resolve() : reject(new Error(`second instance exited ${code}`)))
-    })
+    await runCommandWithTimeout(executable, [], {
+      DSH_DESKTOP_TEST_HOST: 'fake',
+      DSH_DESKTOP_TEST_USER_DATA: path.join(desktop.root, 'User Data With Spaces'),
+      DSH_DESKTOP_TEST_EVENTS: desktop.events
+    }, 5_000)
     await expect.poll(async () => {
       const names = await eventNames(desktop.events)
       return names.slice(names.lastIndexOf('second-instance'))

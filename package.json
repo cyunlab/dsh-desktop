@@ -13,7 +13,7 @@
     "build": "node scripts/build.mjs",
     "package": "pnpm build && pnpm verify:runtime-closure && electron-builder",
     "package:dir": "pnpm build && pnpm verify:runtime-closure && electron-builder --dir",
-    "package:e2e": "pnpm build && pnpm verify:runtime-closure && electron-builder --dir --config.directories.output=\"release/E2E Package With Spaces\"",
+    "package:e2e": "node scripts/build.mjs --e2e && pnpm verify:runtime-closure && electron-builder --dir --config.directories.output=\"release/E2E Package With Spaces\"",
     "dev": "pnpm build && electron .",
     "start": "electron .",
     "test": "vitest run",

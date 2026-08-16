@@ -17,16 +17,16 @@ import { FakeHostLauncher } from './fake-host-launcher.js'
 import { recordE2EEvent, shouldSuppressExternalOpen } from './e2e-observer.js'
 
 app.setName('DeepSeek Harness Desktop')
-if (process.env.DSH_DESKTOP_TEST_USER_DATA) app.setPath('userData', process.env.DSH_DESKTOP_TEST_USER_DATA)
+if (__DSH_E2E__ && process.env.DSH_DESKTOP_TEST_USER_DATA) app.setPath('userData', process.env.DSH_DESKTOP_TEST_USER_DATA)
 assertSupportedNodeVersion(process.versions.node)
-const focusCoordinator = new SingleInstanceFocusCoordinator(action => recordE2EEvent(`window-${action}`))
+const focusCoordinator = new SingleInstanceFocusCoordinator(__DSH_E2E__ ? action => recordE2EEvent(`window-${action}`) : undefined)
 if (process.env.DSH_PACKAGED_HOST_PROBE === '1') {
   void runPackagedHostProbe()
 } else if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
   app.on('second-instance', () => {
-    recordE2EEvent('second-instance')
+    if (__DSH_E2E__) recordE2EEvent('second-instance')
     focusCoordinator.requestFocus()
   })
   void run()
@@ -65,7 +65,7 @@ async function run(): Promise<void> {
     arch: process.arch
   }
   const diagnostics = new RollingDiagnostics(paths.logs, diagnosticContext)
-  const launcher = process.env.DSH_DESKTOP_TEST_HOST === 'fake'
+  const launcher = __DSH_E2E__ && process.env.DSH_DESKTOP_TEST_HOST === 'fake'
     ? new FakeHostLauncher(Number.parseInt(process.env.DSH_DESKTOP_TEST_FAILURES ?? '0', 10) || 0)
     : new HarnessHostLauncher()
   const lifecycle = new ApplicationLifecycle(launcher, paths, 5_000, diagnostics)
@@ -88,6 +88,10 @@ async function run(): Promise<void> {
       }
     })
     created.once('ready-to-show', () => created.show())
+    created.webContents.on('did-finish-load', () => {
+      if (!__DSH_E2E__) return
+      recordE2EEvent(created.webContents.getURL().startsWith('file:') ? 'startup-page-loaded' : 'web-client-loaded')
+    })
     created.webContents.on('will-navigate', (event, target) => {
       const decision = policy.decide(target)
       if (decision === 'allow') return
@@ -130,8 +134,10 @@ async function run(): Promise<void> {
   await lifecycle.start()
 
   function openExternal(target: string): Promise<void> {
-    recordE2EEvent('external-link')
-    if (shouldSuppressExternalOpen()) return Promise.resolve()
+    if (__DSH_E2E__) {
+      recordE2EEvent('external-link')
+      if (shouldSuppressExternalOpen()) return Promise.resolve()
+    }
     return openExternalSafely(url => shell.openExternal(url), target)
   }
 }
