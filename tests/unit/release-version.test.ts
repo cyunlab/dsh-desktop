@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { verifyReleaseVersion } from '../../scripts/verify-release-version.mjs'
 
 describe('release version verification', () => {
-  it.each(['0.1.0', '1.2.3-beta.1', '2.0.0-rc.6+build.4'])(
+  it.each(['0.1.0', '1.2.3-beta.1', '1.2.3+build.4', '2.0.0-rc.6+build.4'])(
     'accepts an exact semantic version %s',
     version => expect(verifyReleaseVersion(`v${version}`, version)).toBe(version)
   )

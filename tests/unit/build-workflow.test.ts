@@ -4,12 +4,11 @@ import { describe, expect, it } from 'vitest'
 const workflow = await readFile(new URL('../../.github/workflows/build.yml', import.meta.url), 'utf8')
 
 describe('native build workflow contract', () => {
-  it('only has manual and semantic-version tag entry points', () => {
+  it('only has manual and version-candidate tag entry points', () => {
     expect(workflow).toMatch(/^on:\n  workflow_dispatch:\n  push:\n    tags:/m)
     expect(workflow).not.toMatch(/^\s+pull_request:/m)
     expect(workflow).not.toMatch(/^\s+branches:/m)
-    expect(workflow).toContain("'v[0-9]+.[0-9]+.[0-9]+'")
-    expect(workflow).toContain("'v[0-9]+.[0-9]+.[0-9]+-*'")
+    expect(workflow).toContain("- 'v*'")
   })
 
   it('pins the toolchain and frozen installation', () => {
@@ -37,6 +36,11 @@ describe('native build workflow contract', () => {
     expect(workflow).toContain('--draft --verify-tag')
     expect(workflow).not.toMatch(/gh release (?:edit|create)[^\n]*--draft=false/)
     expect(workflow).not.toContain('gh release publish')
+  })
+
+  it('validates every tag candidate before allowing native builds', () => {
+    expect(workflow).toMatch(/validate-release-version:[\s\S]*if: github\.event_name == 'push'[\s\S]*node scripts\/verify-release-version\.mjs/)
+    expect(workflow).toMatch(/build:[\s\S]*needs: validate-release-version/)
   })
 
   it('labels uploads and release notes as unsigned development builds', () => {
