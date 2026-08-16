@@ -170,4 +170,40 @@ describe('application lifecycle', () => {
     expect(lifecycle.snapshot.state).toBe('stopped')
     expect(failure).toHaveBeenCalledWith('host-shutdown-timeout', expect.any(Error))
   })
+
+  it.each(['launch rejection', 'dispose rejection'] as const)('suppresses late %s activity after bounded shutdown reaches stopped', async scenario => {
+    let resolveLaunch!: (handle: { origin: string; dispose(): Promise<void> }) => void
+    let rejectLaunch!: (error: Error) => void
+    const launch = new Promise<{ origin: string; dispose(): Promise<void> }>((resolve, reject) => {
+      resolveLaunch = resolve
+      rejectLaunch = reject
+    })
+    const lifecycleStates: string[] = []
+    const diagnosticEvents: string[] = []
+    const diagnostics = {
+      lifecycle: vi.fn(snapshot => diagnosticEvents.push(`state:${snapshot.state}`)),
+      assignedPort: vi.fn(), navigationRejected: vi.fn(),
+      failure: vi.fn(area => diagnosticEvents.push(`failure:${area}`)),
+      actionFailure: vi.fn(), flush: vi.fn(async () => undefined)
+    }
+    const lifecycle = new ApplicationLifecycle({ launch: () => launch }, await fixturePaths(), 10, diagnostics)
+    lifecycle.subscribe(snapshot => lifecycleStates.push(snapshot.state))
+    const starting = lifecycle.start()
+    await vi.waitFor(() => expect(lifecycle.snapshot.state).toBe('booting'))
+
+    await lifecycle.stop()
+    expect(lifecycle.snapshot.state).toBe('stopped')
+    expect(diagnosticEvents).toContain('failure:host-shutdown-timeout')
+    const statesAtStop = [...lifecycleStates]
+    const diagnosticsAtStop = [...diagnosticEvents]
+
+    if (scenario === 'launch rejection') rejectLaunch(new Error('late private launch rejection'))
+    else resolveLaunch({
+      origin: 'http://127.0.0.1:9911',
+      dispose: async () => { throw new Error('late private dispose rejection') }
+    })
+    await starting
+    expect(lifecycleStates).toEqual(statesAtStop)
+    expect(diagnosticEvents).toEqual(diagnosticsAtStop)
+  })
 })

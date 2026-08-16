@@ -64,8 +64,11 @@ export class ApplicationLifecycle {
       this.#transition('probing', 'Checking local Web Client', this.#handle.origin)
       this.#transition('ready', 'Web Client is ready', this.#handle.origin)
     } catch (error) {
-      this.diagnostics.failure('host-startup', error)
-      await this.#disposeHandle().catch(disposeError => this.diagnostics.failure('host-disposal', disposeError))
+      if (!this.#shutdownRequested) this.diagnostics.failure('host-startup', error)
+      try { await this.#disposeHandle() }
+      catch (disposeError) {
+        if (!this.#shutdownRequested) this.diagnostics.failure('host-disposal', disposeError)
+      }
       if (!this.#shutdownRequested) this.#transition('failed', userFacingStartupError('host-startup', error))
     }
   }
@@ -101,7 +104,9 @@ export class ApplicationLifecycle {
       await this.#retryOperation?.catch(() => undefined)
       await this.#operation?.catch(() => undefined)
       await this.#navigationFailureOperation?.catch(() => undefined)
-      await this.#disposeHandle().catch(error => this.diagnostics.failure('host-shutdown', error))
+      await this.#disposeHandle().catch(error => {
+        if (this.#snapshot.state === 'stopping') this.diagnostics.failure('host-shutdown', error)
+      })
     }
     let timeout: ReturnType<typeof setTimeout> | undefined
     let timedOut = false
