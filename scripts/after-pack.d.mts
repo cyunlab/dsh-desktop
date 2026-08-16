@@ -13,3 +13,4 @@ interface Dependencies {
 }
 export default function afterPack(context: AfterPackContextLike): Promise<void>
 export function runAfterPack(context: AfterPackContextLike, dependencies?: Dependencies): Promise<void>
+export function runCommandWithTimeout(command: string, args: string[], environment: Record<string, string>, timeoutMs?: number): Promise<string>
