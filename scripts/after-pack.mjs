@@ -132,7 +132,7 @@ async function terminateProcessTree(child, exitPromise, hasExited) {
   if (hasExited() || child.pid === undefined) return
   if (process.platform === 'win32') {
     try {
-      await runTerminationCommand('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'])
+      await runTerminationCommand('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], { timeoutMs: 2_000 })
     } catch (error) {
       if (!hasExited()) throw error
     }
@@ -141,15 +141,78 @@ async function terminateProcessTree(child, exitPromise, hasExited) {
   }
 
   signalProcessGroup(child.pid, 'SIGTERM')
-  if (await waitForExit(exitPromise, hasExited, 1_000)) return
-  signalProcessGroup(child.pid, 'SIGKILL')
-  if (!await waitForExit(exitPromise, hasExited, 3_000)) throw new Error(`PID ${child.pid} did not exit after SIGKILL`)
+  await delay(1_000)
+  const survivors = await processGroupPids(child.pid)
+  if (survivors.length > 0 && !signalProcessGroup(child.pid, 'SIGKILL')) {
+    for (const pid of survivors) {
+      try { process.kill(pid, 'SIGKILL') } catch (error) {
+        if (error?.code !== 'ESRCH') throw error
+      }
+    }
+  }
+  if (!await waitForProcessGroupAbsent(child.pid, 3_000)) {
+    throw new Error(`process group ${child.pid} still exists after SIGKILL`)
+  }
+  if (!hasExited() && !await waitForExit(exitPromise, hasExited, 500)) {
+    throw new Error(`leader PID ${child.pid} did not report exit after its process group disappeared`)
+  }
 }
 
 function signalProcessGroup(pid, signal) {
-  try { process.kill(-pid, signal) } catch (error) {
+  try { process.kill(-pid, signal); return true } catch (error) {
+    if (error?.code === 'EPERM') return false
     if (error?.code !== 'ESRCH') throw error
+    return true
   }
+}
+
+async function waitForProcessGroupAbsent(pid, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while ((await processGroupPids(pid)).length > 0) {
+    if (Date.now() >= deadline) return false
+    await delay(25)
+  }
+  return true
+}
+
+async function processGroupPids(group) {
+  const output = await captureCommand('ps', ['-eo', 'pid=,pgid='])
+  return output.split(/\r?\n/).flatMap(line => {
+    const [pid, pgid] = line.trim().split(/\s+/).map(Number)
+    return Number.isInteger(pid) && pgid === group ? [pid] : []
+  })
+}
+
+function captureCommand(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+    let output = ''
+    let timedOut = false
+    let settled = false
+    child.stdout.on('data', chunk => { output += chunk })
+    const timeout = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, 500)
+    const secondary = setTimeout(() => {
+      if (settled) return
+      settled = true
+      reject(new Error(`${command} did not exit after SIGKILL`))
+    }, 1_000)
+    child.once('error', error => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      clearTimeout(secondary)
+      reject(error)
+    })
+    child.once('exit', code => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      clearTimeout(secondary)
+      if (timedOut) reject(new Error(`${command} timed out`))
+      else if (code === 0) resolve(output)
+      else reject(new Error(`${command} exited with ${code}`))
+    })
+  })
 }
 
 async function waitForExit(exitPromise, hasExited, timeoutMs) {
@@ -160,10 +223,41 @@ async function waitForExit(exitPromise, hasExited, timeoutMs) {
   ])
 }
 
-function runTerminationCommand(command, args) {
+export function runTerminationCommand(command, args, options = {}) {
+  const spawnProcess = options.spawnProcess ?? spawn
+  const timeoutMs = options.timeoutMs ?? 2_000
   return new Promise((resolve, reject) => {
-    const terminator = spawn(command, args, { windowsHide: true, stdio: 'ignore' })
-    terminator.once('error', reject)
-    terminator.once('exit', code => code === 0 ? resolve() : reject(new Error(`${command} exited with ${code}`)))
+    const terminator = spawnProcess(command, args, { windowsHide: true, stdio: 'ignore' })
+    let timedOut = false
+    let settled = false
+    const timeout = setTimeout(() => {
+      timedOut = true
+      terminator.kill('SIGKILL')
+    }, timeoutMs)
+    const secondary = setTimeout(() => {
+      if (settled) return
+      settled = true
+      reject(new Error(`${command} timed out and did not exit after SIGKILL`))
+    }, timeoutMs + 1_000)
+    terminator.once('error', error => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      clearTimeout(secondary)
+      reject(error)
+    })
+    terminator.once('exit', code => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      clearTimeout(secondary)
+      if (timedOut) reject(new Error(`${command} timed out after ${timeoutMs} ms and was killed`))
+      else if (code === 0) resolve()
+      else reject(new Error(`${command} exited with ${code}`))
+    })
   })
+}
+
+function delay(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds))
 }
