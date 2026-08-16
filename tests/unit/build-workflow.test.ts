@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
 
-const workflow = await readFile(new URL('../../.github/workflows/build.yml', import.meta.url), 'utf8')
+const workflow = (await readFile(new URL('../../.github/workflows/build.yml', import.meta.url), 'utf8')).replaceAll('\r\n', '\n')
 
 describe('native build workflow contract', () => {
   it('pins every third-party action to a reviewed commit', () => {
@@ -24,6 +24,11 @@ describe('native build workflow contract', () => {
     expect(workflow).toContain('version: 11.7.0')
     expect(workflow).toContain('node-version: 24')
     expect(workflow).toContain('pnpm install --frozen-lockfile')
+  })
+
+  it('passes one native target and disables implicit CI publishing', () => {
+    expect(workflow).toContain('pnpm package --${{ matrix.platform }} --${{ matrix.arch }} --publish never')
+    expect(workflow).not.toContain('pnpm package -- --')
   })
 
   it.each([

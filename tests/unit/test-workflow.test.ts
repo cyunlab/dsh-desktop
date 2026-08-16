@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 const workflowPath = '.github/workflows/test.yml'
 
 async function workflow(): Promise<string> {
-  return readFile(workflowPath, 'utf8')
+  return (await readFile(workflowPath, 'utf8')).replaceAll('\r\n', '\n')
 }
 
 describe('manual Desktop behavior workflow', () => {

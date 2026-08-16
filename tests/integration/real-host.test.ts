@@ -51,9 +51,9 @@ describe('published Harness Web composition', () => {
       })
       const fallback = await rpc<{ sessionId: string }>(handle.origin, 'session.create', {})
       const sessions = await rpc<{ items: { sessionId: string; cwd?: string }[] }>(handle.origin, 'session.list', {})
-      expect(sessions.items.find(item => item.sessionId === selected.sessionId)?.cwd)
+      expect(await realpath(sessions.items.find(item => item.sessionId === selected.sessionId)?.cwd ?? ''))
         .toBe(await realpath(selectedWorkspace))
-      expect(sessions.items.find(item => item.sessionId === fallback.sessionId)?.cwd)
+      expect(await realpath(sessions.items.find(item => item.sessionId === fallback.sessionId)?.cwd ?? ''))
         .toBe(await realpath(paths.fallbackWorkspace))
     } finally {
       await Promise.all([handle.dispose(), handle.dispose()])

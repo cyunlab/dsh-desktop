@@ -28,7 +28,7 @@ describe('Harness Host launcher', () => {
     const launchEnvironment = Object.freeze({ get: vi.fn(), getFrom: vi.fn() })
     const loadHarness = vi.fn(async () => {
       expect(process.env.DSH_HOME).toBe(paths.harnessHome)
-      expect(process.cwd()).toBe(await realpath(paths.fallbackWorkspace))
+      expect(await realpath(process.cwd())).toBe(await realpath(paths.fallbackWorkspace))
       return {
         initProfile,
         composeEntries: vi.fn(() => [{ id: 'agent-presets', name: '@deepseek-ai/dsh-agent-presets', config: { default: 'standard' } }]),

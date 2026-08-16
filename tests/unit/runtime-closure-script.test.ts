@@ -40,7 +40,7 @@ describe('runtime closure verifier CLI', () => {
       dependencies: { '@deepseek-ai/parent-only': '1.0.0' }
     }))
 
-    const result = spawnSync(process.execPath, [verifier, '--app-dir', root, '--target-platform', 'darwin', '--target-arch', 'arm64'], { encoding: 'utf8' })
+    const result = spawnSync(process.execPath, [verifier, '--app-dir', root, '--target-platform', 'darwin', '--target-arch', 'arm64', '--graph-only'], { encoding: 'utf8' })
 
     expect(result.status).toBe(1)
     expect(result.stderr).toContain('@deepseek-ai/parent-only (missing required package)')
@@ -56,7 +56,7 @@ describe('runtime closure verifier CLI', () => {
     const bundle = await writePackage(root, '@deepseek-ai/dsh-base')
     await writeFile(path.join(bundle, 'cordis.patch.yml'), "- insert:\n  - name: '@deepseek-ai/missing-plugin'\n")
 
-    const result = spawnSync(process.execPath, [verifier, '--app-dir', root, '--target-platform', 'darwin', '--target-arch', 'arm64'], { encoding: 'utf8' })
+    const result = spawnSync(process.execPath, [verifier, '--app-dir', root, '--target-platform', 'darwin', '--target-arch', 'arm64', '--graph-only'], { encoding: 'utf8' })
 
     expect(result.status).toBe(1)
     expect(result.stderr).toContain('@deepseek-ai/dsh-base/cordis.patch.yml -> @deepseek-ai/missing-plugin')
@@ -75,7 +75,7 @@ describe('runtime closure verifier CLI', () => {
     await writeFile(path.join(bundle, 'cordis.patch.yml'), "- insert:\n  - name: '@deepseek-ai/configured-plugin'\n")
     await writePackage(root, '@deepseek-ai/configured-plugin')
 
-    const result = spawnSync(process.execPath, [verifier, '--app-dir', root, '--target-platform', 'darwin', '--target-arch', 'arm64'], { encoding: 'utf8' })
+    const result = spawnSync(process.execPath, [verifier, '--app-dir', root, '--target-platform', 'darwin', '--target-arch', 'arm64', '--graph-only'], { encoding: 'utf8' })
 
     expect(result.status).toBe(0)
     expect(result.stdout).toContain('runtime closure verified')
@@ -93,7 +93,7 @@ describe('runtime closure verifier CLI', () => {
       dependencies: { '@deepseek-ai/missing-transitive': '1.0.0' }
     })
 
-    const result = spawnSync(process.execPath, [verifier, '--app-dir', root, '--target-platform', 'darwin', '--target-arch', 'arm64'], { encoding: 'utf8' })
+    const result = spawnSync(process.execPath, [verifier, '--app-dir', root, '--target-platform', 'darwin', '--target-arch', 'arm64', '--graph-only'], { encoding: 'utf8' })
 
     expect(result.status).toBe(1)
     expect(result.stderr).toContain('@deepseek-ai/dynamic-plugin -> @deepseek-ai/missing-transitive')

@@ -16,7 +16,10 @@ async function launchDesktop(options: { fakeHost?: boolean; failures?: number } 
   const events = path.join(root, 'events.jsonl')
   const app = await electron.launch({
     executablePath: await packagedExecutable(),
-    args: [],
+    // GitHub-hosted Linux runners cannot make an unpacked package's
+    // chrome-sandbox root-owned/setuid. Keep this exception at the test
+    // launcher boundary; the packaged renderer sandbox remains enabled.
+    args: process.platform === 'linux' ? ['--no-sandbox'] : [],
     env: {
       ...process.env,
       ...(options.fakeHost ? { DSH_DESKTOP_TEST_HOST: 'fake' } : {}),
@@ -71,21 +74,28 @@ test('a second launch activates the existing window without creating another Hos
   const desktop = await launchDesktop({ fakeHost: true })
   try {
     await expect(desktop.page.getByRole('heading', { name: 'DeepSeek Harness Web Client' })).toBeVisible()
-    await desktop.app.evaluate(({ BrowserWindow }) => {
+    await desktop.app.evaluate(({ BrowserWindow }, platform) => {
       const [window] = BrowserWindow.getAllWindows()
-      window.minimize()
-    })
-    await expect.poll(() => desktop.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.isMinimized())).toBe(true)
-    const executable = desktop.app.process().spawnfile
-    await runCommandWithTimeout(executable, [], {
+      if (platform === 'linux') window.hide()
+      else window.minimize()
+    }, process.platform)
+    await expect.poll(() => desktop.app.evaluate(({ BrowserWindow }, platform) => {
+      const window = BrowserWindow.getAllWindows()[0]
+      return platform === 'linux' ? !window?.isVisible() : window?.isMinimized()
+    }, process.platform)).toBe(true)
+    const executable = await packagedExecutable()
+    await runCommandWithTimeout(executable, process.platform === 'linux' ? ['--no-sandbox'] : [], {
       DSH_DESKTOP_TEST_HOST: 'fake',
       DSH_DESKTOP_TEST_USER_DATA: path.join(desktop.root, 'User Data With Spaces'),
       DSH_DESKTOP_TEST_EVENTS: desktop.events
     }, 5_000)
+    const activationEvents = process.platform === 'linux'
+      ? ['second-instance', 'window-shown', 'window-focused']
+      : ['second-instance', 'window-restored', 'window-shown', 'window-focused']
     await expect.poll(async () => {
       const names = await eventNames(desktop.events)
       return names.slice(names.lastIndexOf('second-instance'))
-    }).toEqual(['second-instance', 'window-restored', 'window-shown', 'window-focused'])
+    }).toEqual(activationEvents)
     expect(desktop.app.windows()).toHaveLength(1)
   } finally { await desktop.app.close() }
 })

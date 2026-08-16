@@ -64,7 +64,7 @@ jobs:
       - name: Install exact locked dependencies
         run: pnpm install --frozen-lockfile
       - name: Build native package and probe packaged Host
-        run: pnpm package -- --${{ matrix.platform }} --${{ matrix.arch }}
+        run: pnpm package --${{ matrix.platform }} --${{ matrix.arch }} --publish never
       - name: Upload unsigned development artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -103,9 +103,9 @@
     "files": ["dist/**/*", "package.json"],
     "directories": { "output": "release" },
     "afterPack": "scripts/after-pack.mjs",
-    "win": { "target": [{ "target": "nsis", "arch": ["x64"] }] },
-    "mac": { "target": [{ "target": "dmg", "arch": ["arm64", "x64"] }] },
-    "linux": { "target": [{ "target": "AppImage", "arch": ["x64"] }] },
+    "win": { "target": "nsis" },
+    "mac": { "target": "dmg" },
+    "linux": { "target": "AppImage" },
     "nsis": { "artifactName": "deepseek-harness-desktop-${version}-unsigned-dev-windows-${arch}.${ext}" },
     "dmg": { "artifactName": "deepseek-harness-desktop-${version}-unsigned-dev-macos-${arch}.${ext}" }
   }
