@@ -7,6 +7,7 @@ import { ApplicationLifecycle } from '../../src/main/application.js'
 import { wireFinalWindowShutdown, wireLifecycleToWindow, type QuitEvent } from '../../src/main/application-wiring.js'
 import { FakeHostLauncher } from '../../src/main/fake-host-launcher.js'
 import { NavigationPolicy } from '../../src/main/navigation-policy.js'
+import type { DiagnosticsSink } from '../../src/main/diagnostics.js'
 
 async function fixturePaths() {
   const root = await mkdtemp(path.join(tmpdir(), 'dsh wiring '))
@@ -91,6 +92,69 @@ describe('Electron application wiring', () => {
     expect(lifecycle.snapshot.state).toBe('stopping')
 
     resolveDispose()
+    await vi.waitFor(() => expect(app.quitCalls).toBe(2))
+    expect(lifecycle.snapshot.state).toBe('stopped')
+  })
+
+  it('flushes stopped and failure diagnostics before completing quit', async () => {
+    class FakeApp extends EventEmitter {
+      quitCalls = 0
+      quit(): void {
+        this.quitCalls += 1
+        let prevented = false
+        this.emit('before-quit', { preventDefault: () => { prevented = true } } satisfies QuitEvent)
+        if (!prevented) this.emit('quit-complete')
+      }
+    }
+    const records: string[] = []
+    const durableRecords: string[] = []
+    let releaseFlush!: () => void
+    const flush = vi.fn(() => {
+      durableRecords.push(...records)
+      return new Promise<void>(resolve => { releaseFlush = resolve })
+    })
+    const diagnostics: DiagnosticsSink = {
+      lifecycle: snapshot => records.push(snapshot.state),
+      assignedPort: vi.fn(),
+      navigationRejected: vi.fn(),
+      failure: area => records.push(`failure:${area}`),
+      actionFailure: vi.fn(),
+      flush
+    }
+    const lifecycle = new ApplicationLifecycle({ launch: async () => { throw new Error('private startup detail') } }, await fixturePaths(), 100, diagnostics)
+    await lifecycle.start()
+    const app = new FakeApp()
+    wireFinalWindowShutdown(app, lifecycle)
+
+    app.emit('window-all-closed')
+    await vi.waitFor(() => expect(flush).toHaveBeenCalledOnce())
+    expect(records).toEqual(expect.arrayContaining(['failure:host-startup', 'stopping', 'stopped']))
+    expect(durableRecords).toEqual(expect.arrayContaining(['failure:host-startup', 'stopping', 'stopped']))
+    expect(app.quitCalls).toBe(1)
+    releaseFlush()
+    await vi.waitFor(() => expect(app.quitCalls).toBe(2))
+  })
+
+  it('bounds a diagnostics flush that never settles', async () => {
+    class FakeApp extends EventEmitter {
+      quitCalls = 0
+      quit(): void {
+        this.quitCalls += 1
+        let prevented = false
+        this.emit('before-quit', { preventDefault: () => { prevented = true } } satisfies QuitEvent)
+        if (!prevented) this.emit('quit-complete')
+      }
+    }
+    const diagnostics: DiagnosticsSink = {
+      lifecycle: vi.fn(), assignedPort: vi.fn(), navigationRejected: vi.fn(), failure: vi.fn(), actionFailure: vi.fn(),
+      flush: () => new Promise(() => {})
+    }
+    const lifecycle = new ApplicationLifecycle(new FakeHostLauncher(), await fixturePaths(), 100, diagnostics)
+    await lifecycle.start()
+    const app = new FakeApp()
+    wireFinalWindowShutdown(app, lifecycle, 10)
+
+    app.emit('window-all-closed')
     await vi.waitFor(() => expect(app.quitCalls).toBe(2))
     expect(lifecycle.snapshot.state).toBe('stopped')
   })

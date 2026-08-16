@@ -22,7 +22,7 @@ describe('startup native actions', () => {
 
   it('contains clipboard and shell failures and records them', async () => {
     const actionFailure = vi.fn()
-    const diagnostics = { lifecycle: vi.fn(), assignedPort: vi.fn(), navigationRejected: vi.fn(), failure: vi.fn(), actionFailure }
+    const diagnostics = { lifecycle: vi.fn(), assignedPort: vi.fn(), navigationRejected: vi.fn(), failure: vi.fn(), actionFailure, flush: vi.fn(async () => undefined) }
     const actions = createStartupActions(
       () => ({ state: 'failed', message: 'Safe failure summary' }), context, '/platform/logs',
       {

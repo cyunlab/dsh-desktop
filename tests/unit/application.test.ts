@@ -92,10 +92,13 @@ describe('application lifecycle', () => {
   })
 
   it('bounds shutdown when a launch never settles', async () => {
-    const lifecycle = new ApplicationLifecycle({ launch: () => new Promise(() => {}) }, await fixturePaths(), 10)
+    const failure = vi.fn()
+    const diagnostics = { lifecycle: vi.fn(), assignedPort: vi.fn(), navigationRejected: vi.fn(), failure, actionFailure: vi.fn(), flush: vi.fn(async () => undefined) }
+    const lifecycle = new ApplicationLifecycle({ launch: () => new Promise(() => {}) }, await fixturePaths(), 10, diagnostics)
     void lifecycle.start()
     await vi.waitFor(() => expect(lifecycle.snapshot.state).toBe('booting'))
     await expect(lifecycle.stop()).resolves.toBeUndefined()
     expect(lifecycle.snapshot.state).toBe('stopped')
+    expect(failure).toHaveBeenCalledWith('host-shutdown-timeout', expect.any(Error))
   })
 })

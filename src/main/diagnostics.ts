@@ -19,6 +19,7 @@ export interface DiagnosticsSink {
   navigationRejected(target: string, decision: string): void
   failure(area: string, error: unknown): void
   actionFailure(action: string, error: unknown): void
+  flush(): Promise<void>
 }
 
 export class NullDiagnostics implements DiagnosticsSink {
@@ -27,6 +28,7 @@ export class NullDiagnostics implements DiagnosticsSink {
   navigationRejected(): void {}
   failure(): void {}
   actionFailure(): void {}
+  async flush(): Promise<void> {}
 }
 
 interface RollingDiagnosticsOptions {

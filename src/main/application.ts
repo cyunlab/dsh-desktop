@@ -83,15 +83,30 @@ export class ApplicationLifecycle {
       await this.#disposeHandle().catch(error => this.diagnostics.failure('host-shutdown', error))
     }
     let timeout: ReturnType<typeof setTimeout> | undefined
+    let timedOut = false
     try {
       await Promise.race([
         cleanup(),
-        new Promise<void>(resolve => { timeout = setTimeout(resolve, this.shutdownTimeoutMs) })
+        new Promise<void>(resolve => {
+          timeout = setTimeout(() => { timedOut = true; resolve() }, this.shutdownTimeoutMs)
+        })
       ])
     } finally {
       if (timeout !== undefined) clearTimeout(timeout)
     }
+    if (timedOut) this.diagnostics.failure('host-shutdown-timeout', new Error('Host shutdown exceeded its configured bound'))
     this.#transition('stopped', 'Stopped')
+  }
+  async flushDiagnostics(timeoutMs = 1_000): Promise<void> {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        this.diagnostics.flush(),
+        new Promise<void>(resolve => { timeout = setTimeout(resolve, timeoutMs) })
+      ])
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout)
+    }
   }
   async #disposeHandle(): Promise<void> { const handle = this.#handle; this.#handle = undefined; await handle?.dispose() }
   #transition(state: LifecycleState, message: string, origin?: string): void {
