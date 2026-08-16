@@ -44,6 +44,29 @@ describe('application lifecycle', () => {
     await lifecycle.stop()
   })
 
+  it('starts one fresh attempt when retry is requested from the failed-state notification', async () => {
+    const dispose = vi.fn(async () => undefined)
+    const launch = vi.fn()
+      .mockRejectedValueOnce(new Error('first attempt failed'))
+      .mockResolvedValueOnce({ origin: 'http://127.0.0.1:9988', dispose })
+    const lifecycle = new ApplicationLifecycle({ launch }, await fixturePaths())
+    let firstRetry: Promise<void> | undefined
+    let duplicateRetry: Promise<void> | undefined
+    lifecycle.subscribe(snapshot => {
+      if (snapshot.state === 'failed') {
+        firstRetry = lifecycle.retry()
+        duplicateRetry = lifecycle.retry()
+      }
+    })
+
+    await lifecycle.start()
+    expect(firstRetry).toBe(duplicateRetry)
+    await firstRetry
+    expect(launch).toHaveBeenCalledTimes(2)
+    expect(lifecycle.snapshot.state).toBe('ready')
+    await lifecycle.stop()
+  })
+
   it('waits for and disposes a launch that resolves during shutdown without leaving stopped', async () => {
     let resolveLaunch!: (handle: { origin: string, dispose(): Promise<void> }) => void
     const dispose = vi.fn(async () => undefined)
