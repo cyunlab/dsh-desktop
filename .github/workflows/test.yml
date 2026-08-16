@@ -1,0 +1,129 @@
+name: Desktop behavior tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }} behavior tests
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+          - name: macOS
+            os: macos-14
+          - name: Windows
+            os: windows-2022
+
+    steps:
+      - name: Check out the pinned Harness source reference
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install pnpm 11.7.0
+        uses: pnpm/action-setup@v5
+        with:
+          version: 11.7.0
+          run_install: false
+
+      - name: Install Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Create diagnostics directory
+        shell: bash
+        run: mkdir -p artifacts
+
+      - name: Typecheck
+        id: typecheck
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: set -o pipefail; pnpm typecheck 2>&1 | tee artifacts/typecheck.log
+
+      - name: Run unit tests
+        id: unit
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        run: set -o pipefail; pnpm test 2>&1 | tee artifacts/unit.log
+
+      - name: Run real-Host integration tests
+        id: integration
+        continue-on-error: true
+        timeout-minutes: 15
+        shell: bash
+        run: set -o pipefail; pnpm test:integration 2>&1 | tee artifacts/integration.log
+
+      - name: Run packaged Electron E2E tests
+        id: e2e
+        if: runner.os != 'Linux'
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: bash
+        run: set -o pipefail; pnpm test:e2e 2>&1 | tee artifacts/e2e.log
+
+      - name: Run packaged Electron E2E tests under Xvfb
+        id: e2e_linux
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: bash
+        run: set -o pipefail; pnpm test:e2e:xvfb 2>&1 | tee artifacts/e2e.log
+
+      - name: Verify the Harness submodule stayed unchanged
+        id: harness_guard
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          test -z "$(git -C deepseek-harness status --porcelain)"
+          git diff --exit-code --submodule=short -- deepseek-harness
+
+      - name: Retain test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: behavior-test-diagnostics-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            artifacts/
+            test-results/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Fail if any behavior check failed
+        if: always()
+        shell: bash
+        env:
+          TYPECHECK_OUTCOME: ${{ steps.typecheck.outcome }}
+          UNIT_OUTCOME: ${{ steps.unit.outcome }}
+          INTEGRATION_OUTCOME: ${{ steps.integration.outcome }}
+          E2E_OUTCOME: ${{ steps.e2e.outcome }}
+          E2E_LINUX_OUTCOME: ${{ steps.e2e_linux.outcome }}
+          HARNESS_GUARD_OUTCOME: ${{ steps.harness_guard.outcome }}
+        run: |
+          outcomes="$TYPECHECK_OUTCOME $UNIT_OUTCOME $INTEGRATION_OUTCOME $HARNESS_GUARD_OUTCOME"
+          if [ "$RUNNER_OS" = Linux ]; then
+            outcomes="$outcomes $E2E_LINUX_OUTCOME"
+          else
+            outcomes="$outcomes $E2E_OUTCOME"
+          fi
+          case " $outcomes " in
+            *" failure "*|*" cancelled "*) exit 1 ;;
+          esac
