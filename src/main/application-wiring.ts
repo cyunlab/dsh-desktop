@@ -37,13 +37,15 @@ export interface QuitApplication {
   quit(): void
 }
 
-export function wireFinalWindowShutdown(app: QuitApplication, lifecycle: ApplicationLifecycle): void {
+export function wireFinalWindowShutdown(app: QuitApplication, lifecycle: ApplicationLifecycle, diagnosticsFlushTimeoutMs = 1_000): void {
   let quitting = false
   app.on('window-all-closed', () => { if (!quitting) app.quit() })
   app.on('before-quit', event => {
     if (quitting) return
     event.preventDefault()
     quitting = true
-    void lifecycle.stop().finally(() => app.quit())
+    void lifecycle.stop().catch(() => undefined)
+      .then(() => lifecycle.flushDiagnostics(diagnosticsFlushTimeoutMs))
+      .finally(() => app.quit())
   })
 }
