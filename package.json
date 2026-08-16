@@ -18,7 +18,7 @@
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "typecheck": "tsc --noEmit",
-    "verify:runtime-closure": "node scripts/verify-runtime-closure.mjs --app-dir ."
+    "verify:runtime-closure": "node scripts/verify-runtime-closure.mjs --app-dir . --graph-only"
   },
   "devDependencies": {
     "@types/js-yaml": "4.0.9",

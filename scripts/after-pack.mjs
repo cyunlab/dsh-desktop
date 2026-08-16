@@ -1,21 +1,45 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { access, chmod, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
+import { requiredRuntimeAssets, shouldRunPackagedProbe, targetFromAfterPackContext } from './runtime-assets.mjs'
 
 export default async function afterPack(context) {
-  const resources = path.join(context.appOutDir, 'resources')
+  return runAfterPack(context)
+}
+
+export async function runAfterPack(context, dependencies = {}) {
+  const runCommand = dependencies.runCommand ?? run
+  const host = dependencies.host ?? { platform: process.platform, arch: process.arch }
+  const log = dependencies.log ?? console.log
+  const prepareAssets = dependencies.prepareAssets ?? (async (root, selectedTarget) => {
+    await waitForPath(path.join(root, 'node_modules'))
+    await ensureExecutableModes(root, selectedTarget)
+  })
+  const target = targetFromAfterPackContext(context)
+  const resources = target.platform === 'darwin'
+    ? path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`, 'Contents', 'Resources')
+    : path.join(context.appOutDir, 'resources')
   const unpacked = path.join(resources, 'app.asar.unpacked')
-  await run(process.execPath, [
+  await prepareAssets(unpacked, target)
+  const verifierArgs = [
     path.resolve('scripts/verify-runtime-closure.mjs'),
     '--app-dir', unpacked,
-    '--manifest', path.resolve('package.json')
-  ], { DSH_CLOSURE_TARGET_PLATFORM: context.electronPlatformName })
+    '--manifest', path.resolve('package.json'),
+    '--target-platform', target.platform,
+    '--target-arch', target.arch
+  ]
+  await retry(() => runCommand(process.execPath, verifierArgs, {}), 5_000)
+
+  if (!shouldRunPackagedProbe(target, host)) {
+    log(`afterPack: static closure verified for ${target.platform}-${target.arch}; packaged Host probe skipped because runner is ${host.platform}-${host.arch}.`)
+    return
+  }
 
   const probeData = await mkdtemp(path.join(tmpdir(), 'dsh-packaged-probe-'))
   try {
     const executable = packagedExecutable(context)
-    const output = await run(executable, [
+    const output = await runCommand(executable, [
       '--headless',
       '--no-sandbox',
       `--user-data-dir=${path.join(probeData, 'User Data')}`
@@ -25,6 +49,33 @@ export default async function afterPack(context) {
     }
   } finally {
     await rm(probeData, { recursive: true, force: true })
+  }
+}
+
+async function ensureExecutableModes(root, target) {
+  if (target.platform === 'win32') return
+  for (const asset of requiredRuntimeAssets(target).filter(asset => asset.executable)) {
+    try { await chmod(path.join(root, asset.path), 0o755) } catch { /* verifier reports missing assets */ }
+  }
+}
+
+async function waitForPath(target, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs
+  while (true) {
+    try { await access(target); return } catch {
+      if (Date.now() >= deadline) throw new Error(`timed out waiting for packaged resources: ${target}`)
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+  }
+}
+
+async function retry(operation, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while (true) {
+    try { return await operation() } catch (error) {
+      if (Date.now() >= deadline) throw error
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
   }
 }
 

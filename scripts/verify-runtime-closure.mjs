@@ -1,11 +1,25 @@
-import { access, readFile, realpath, stat } from 'node:fs/promises'
+import { access, readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { parseArgs } from 'node:util'
+import { verifyRequiredRuntimeAssets } from './runtime-assets.mjs'
 
 const { values } = parseArgs({
-  options: { 'app-dir': { type: 'string' }, manifest: { type: 'string' } }
+  options: {
+    'app-dir': { type: 'string' },
+    manifest: { type: 'string' },
+    'target-platform': { type: 'string' },
+    'target-arch': { type: 'string' },
+    'graph-only': { type: 'boolean', default: false }
+  }
 })
 const appDir = path.resolve(values['app-dir'] ?? '.')
+const target = {
+  platform: values['target-platform'] ?? process.platform,
+  arch: values['target-arch'] ?? process.arch
+}
+if (!['darwin', 'linux', 'win32'].includes(target.platform) || !['arm64', 'x64'].includes(target.arch)) {
+  throw new Error(`unsupported runtime target: ${target.platform}-${target.arch}`)
+}
 const failures = []
 const visited = new Set()
 const queue = [{
@@ -53,7 +67,11 @@ while (queue.length > 0) {
   }
 }
 
-await verifyNativeRuntime(appDir, failures)
+if (!values['graph-only']) {
+  for (const missing of await verifyRequiredRuntimeAssets(appDir, target)) {
+    failures.push(`required runtime asset -> ${missing}`)
+  }
+}
 
 if (failures.length > 0) {
   console.error('verify-runtime-closure: staged application is incomplete:')
@@ -88,24 +106,4 @@ function packageNameFromSpecifier(specifier) {
 
 async function exists(target) {
   try { await access(target); return true } catch { return false }
-}
-
-async function verifyNativeRuntime(root, output) {
-  const pty = await findPackageManifest('node-pty', root, root)
-  if (pty !== undefined) {
-    const nativeDir = path.join(path.dirname(pty), 'prebuilds', `${process.platform}-${process.arch}`)
-    if (!await exists(path.join(nativeDir, 'pty.node'))) output.push(`node-pty -> prebuilds/${process.platform}-${process.arch}/pty.node (missing native addon)`)
-    if (process.platform === 'darwin') {
-      const helper = path.join(nativeDir, 'spawn-helper')
-      if (!await exists(helper)) output.push(`node-pty -> prebuilds/${process.platform}-${process.arch}/spawn-helper (missing macOS helper)`)
-      else if (((await stat(helper)).mode & 0o111) === 0) output.push(`node-pty -> prebuilds/${process.platform}-${process.arch}/spawn-helper (not executable)`)
-    }
-  }
-  const koffi = await findPackageManifest('koffi', root, root)
-  if (koffi !== undefined) {
-    const platformPackage = `@koromix/koffi-${process.platform}-${process.arch}`
-    if (await findPackageManifest(platformPackage, path.dirname(koffi), root) === undefined) {
-      output.push(`koffi -> ${platformPackage} (missing native runtime package)`)
-    }
-  }
 }
