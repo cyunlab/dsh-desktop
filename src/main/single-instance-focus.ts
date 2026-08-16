@@ -5,23 +5,27 @@ export interface FocusableWindow {
   focus(): void
 }
 
+export type FocusAction = 'restored' | 'shown' | 'focused'
+
 export class SingleInstanceFocusCoordinator {
   #window?: FocusableWindow
   #pending = false
+
+  constructor(private readonly observe: (action: FocusAction) => void = () => {}) {}
 
   requestFocus(): void {
     if (!this.#window) {
       this.#pending = true
       return
     }
-    focus(this.#window)
+    focus(this.#window, this.observe)
   }
 
   attach(window: FocusableWindow): void {
     this.#window = window
     if (!this.#pending) return
     this.#pending = false
-    focus(window)
+    focus(window, this.observe)
   }
 
   detach(window: FocusableWindow): void {
@@ -29,8 +33,13 @@ export class SingleInstanceFocusCoordinator {
   }
 }
 
-function focus(window: FocusableWindow): void {
-  if (window.isMinimized()) window.restore()
+function focus(window: FocusableWindow, observe: (action: FocusAction) => void): void {
+  if (window.isMinimized()) {
+    window.restore()
+    observe('restored')
+  }
   window.show()
+  observe('shown')
   window.focus()
+  observe('focused')
 }

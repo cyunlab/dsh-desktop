@@ -25,12 +25,14 @@ describe('single-instance focus coordinator', () => {
   })
 
   it('focuses an attached window immediately', () => {
-    const coordinator = new SingleInstanceFocusCoordinator()
-    const window = fakeWindow()
+    const actions: string[] = []
+    const coordinator = new SingleInstanceFocusCoordinator(action => actions.push(action))
+    const window = fakeWindow(true)
     coordinator.attach(window)
     coordinator.requestFocus()
-    expect(window.restore).not.toHaveBeenCalled()
+    expect(window.restore).toHaveBeenCalledOnce()
     expect(window.show).toHaveBeenCalledOnce()
     expect(window.focus).toHaveBeenCalledOnce()
+    expect(actions).toEqual(['restored', 'shown', 'focused'])
   })
 })

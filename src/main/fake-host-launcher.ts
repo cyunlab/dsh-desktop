@@ -4,7 +4,13 @@ import type { HostLauncher, HostHandle } from './host-launcher.js'
 const page = `<!doctype html><html><head><meta charset="utf-8"><title>DeepSeek Harness</title></head><body><main><h1>DeepSeek Harness Web Client</h1><p>Fake Host launcher active. Real Harness integration is implemented separately.</p></main></body></html>`
 
 export class FakeHostLauncher implements HostLauncher {
+  constructor(private failuresRemaining = 0) {}
+
   async launch(): Promise<HostHandle> {
+    if (this.failuresRemaining > 0) {
+      this.failuresRemaining -= 1
+      throw new Error('Synthetic Host startup failure')
+    }
     const server = createServer((_request, response) => {
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
       response.end(page)
