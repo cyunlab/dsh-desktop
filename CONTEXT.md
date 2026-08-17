@@ -12,7 +12,7 @@ The versioned Electron application: main process, preload bridge, local startup 
 
 ### Desktop window
 
-The single controlled window owned by Desktop. It shows the Startup page until the Host is ready, then shows the Web Client while enforcing Desktop navigation, external-link, popup, and focus rules. The Desktop window is not synonymous with Electron's `BrowserWindow`, which is an implementation detail.
+The single controlled window owned by Desktop. It shows the Startup page until the Host is ready, then shows the Web Client while enforcing Desktop navigation, external-link, popup, and focus rules.
 
 ### Host
 

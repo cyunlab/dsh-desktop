@@ -65,12 +65,19 @@ export interface DesktopWindowOptions {
   observe?: Partial<DesktopWindowEventObserver>
 }
 
+interface WindowOpening {
+  window: DesktopBrowserWindow
+  promise: Promise<void>
+  invalidated: Promise<void>
+  invalidate(): void
+}
+
 /** 将 BrowserWindow、安全导航、焦点与生命周期快照收敛为一个 Desktop 概念。 */
 export class DesktopWindow {
   readonly #policy: NavigationPolicy
   readonly #observe: Required<DesktopWindowEventObserver>
   #window?: DesktopBrowserWindow
-  #opening?: { window: DesktopBrowserWindow, promise: Promise<void> }
+  #opening?: WindowOpening
   #pendingFocus = false
 
   /** 以路径、事件及窄化的 BrowserWindow 工厂建立 Desktop 窗口所有权。 */
@@ -91,11 +98,20 @@ export class DesktopWindow {
     if (this.#opening && this.#opening.window === liveWindow) return this.#opening.promise
     if (liveWindow) return Promise.resolve()
     const window = this.#createWindow()
-    const opening = { window, promise: Promise.resolve() }
+    this.#opening?.invalidate()
+    let invalidate!: () => void
+    const opening: WindowOpening = {
+      window,
+      promise: Promise.resolve(),
+      invalidated: new Promise(resolve => { invalidate = resolve }),
+      invalidate: () => invalidate()
+    }
+    this.#window = window
+    this.#opening = opening
+    this.#attach(window)
     opening.promise = this.#loadStartup(window).finally(() => {
       if (this.#opening === opening) this.#opening = undefined
     })
-    this.#opening = opening
     return opening.promise
   }
 
@@ -116,8 +132,6 @@ export class DesktopWindow {
         sandbox: true
       }
     })
-    this.#window = window
-    this.#attach(window)
     return window
   }
 
@@ -151,14 +165,39 @@ export class DesktopWindow {
 
   /** 允许指定 Host origin 并导航；失败时恢复启动页后仍向调用方报告原始错误。 */
   async showHost(origin: string): Promise<void> {
-    const window = this.#liveWindow()
+    let window = this.#liveWindow()
     if (!window) return
     this.#policy.setHostOrigin(origin)
-    try {
-      await window.loadURL(origin)
-    } catch (error) {
-      try { await window.loadFile(this.options.startupPath) } catch { /* 保留原始 Host 导航错误。 */ }
-      throw error
+    while (window) {
+      try {
+        await window.loadURL(origin)
+        if (this.#owns(window)) return
+      } catch (error) {
+        if (this.#owns(window)) {
+          try { await window.loadFile(this.options.startupPath) } catch { /* 保留原始 Host 导航错误。 */ }
+          if (this.#owns(window)) throw error
+        }
+      }
+      window = await this.#replacementFor(window)
+    }
+  }
+
+  /** 判断窗口是否仍是当前受控且存活的 Desktop 窗口。 */
+  #owns(window: DesktopBrowserWindow): boolean {
+    return this.#window === window && !window.isDestroyed()
+  }
+
+  /** 等待替代窗口完成启动页加载，并在连续替换时重新选择最新窗口。 */
+  async #replacementFor(staleWindow: DesktopBrowserWindow): Promise<DesktopBrowserWindow | undefined> {
+    while (true) {
+      const replacement = this.#liveWindow()
+      if (!replacement || replacement === staleWindow) return undefined
+      const opening = this.#opening
+      if (!opening || opening.window !== replacement) return replacement
+      await Promise.race([
+        opening.promise.then(() => undefined, () => undefined),
+        opening.invalidated
+      ])
     }
   }
 
@@ -181,7 +220,10 @@ export class DesktopWindow {
     })
     window.on('closed', () => {
       if (this.#window === window) this.#window = undefined
-      if (this.#opening?.window === window) this.#opening = undefined
+      if (this.#opening?.window === window) {
+        this.#opening.invalidate()
+        this.#opening = undefined
+      }
     })
     if (!this.#pendingFocus) return
     this.#pendingFocus = false

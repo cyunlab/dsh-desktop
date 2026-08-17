@@ -7,7 +7,8 @@ import { wireFinalWindowShutdown, wireLifecycleToWindow } from './lifecycle/elec
 import { HarnessHostLauncher } from './host/harness-launcher.js'
 import { prepareDesktopPaths, selectDesktopPaths } from './paths.js'
 import { assertSupportedNodeVersion } from './version-guard.js'
-import { DesktopWindow } from './window/desktop-window.js'
+import { DesktopWindow, type DesktopBrowserWindow, type DesktopBrowserWindowOptions } from './window/desktop-window.js'
+import type { NavigationDecision } from './window/navigation-policy.js'
 import { startupChannels } from '../shared/startup-contract.js'
 import { NullDiagnostics, RollingDiagnostics, type DiagnosticContext, type DiagnosticsSink } from './diagnostics.js'
 import { createStartupActions } from './startup-actions.js'
@@ -23,26 +24,55 @@ const distRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const startupPath = path.join(distRoot, 'startup', 'index.html')
 const desktopLogoPath = path.join(distRoot, 'assets', desktopLogoFileName)
 let windowDiagnostics: Pick<DiagnosticsSink, 'navigationRejected'> = new NullDiagnostics()
+
+/** 将窗口导航拒绝延迟委派给 app ready 后创建的诊断实现。 */
+function reportWindowNavigationRejected(target: string, decision: NavigationDecision): void {
+  windowDiagnostics.navigationRejected(target, decision)
+}
+
+/** 使用生产 Electron adapter 创建受控 BrowserWindow。 */
+function createDesktopBrowserWindow(options: DesktopBrowserWindowOptions): DesktopBrowserWindow {
+  return new BrowserWindow(options)
+}
+
+/** 将受控外链交给 E2E 观察器或操作系统默认浏览器。 */
+async function openDesktopExternal(target: string): Promise<void> {
+  if (__DSH_E2E__) {
+    recordE2EEvent('external-link')
+    if (shouldSuppressExternalOpen()) return
+  }
+  await shell.openExternal(target)
+}
+
+/** 记录窗口恢复事件。 */
+function observeWindowRestored(): void { recordE2EEvent('window-restored') }
+
+/** 记录窗口显示事件。 */
+function observeWindowShown(): void { recordE2EEvent('window-shown') }
+
+/** 记录窗口聚焦事件。 */
+function observeWindowFocused(): void { recordE2EEvent('window-focused') }
+
+/** 记录启动页完成加载事件。 */
+function observeStartupPageLoaded(): void { recordE2EEvent('startup-page-loaded') }
+
+/** 记录 Web Client 完成加载事件。 */
+function observeWebClientLoaded(): void { recordE2EEvent('web-client-loaded') }
+
 const desktopWindow = new DesktopWindow({
   startupPath,
   preloadPath: path.join(distRoot, 'preload', 'startup.cjs'),
   iconPath: desktopLogoPath,
   snapshotChannel: startupChannels.snapshot,
-  diagnostics: { navigationRejected: (target, decision) => windowDiagnostics.navigationRejected(target, decision) },
-  createBrowserWindow: options => new BrowserWindow(options),
-  openExternal: async target => {
-    if (__DSH_E2E__) {
-      recordE2EEvent('external-link')
-      if (shouldSuppressExternalOpen()) return
-    }
-    await shell.openExternal(target)
-  },
+  diagnostics: { navigationRejected: reportWindowNavigationRejected },
+  createBrowserWindow: createDesktopBrowserWindow,
+  openExternal: openDesktopExternal,
   observe: __DSH_E2E__ ? {
-    restored: () => recordE2EEvent('window-restored'),
-    shown: () => recordE2EEvent('window-shown'),
-    focused: () => recordE2EEvent('window-focused'),
-    startupPageLoaded: () => recordE2EEvent('startup-page-loaded'),
-    webClientLoaded: () => recordE2EEvent('web-client-loaded')
+    restored: observeWindowRestored,
+    shown: observeWindowShown,
+    focused: observeWindowFocused,
+    startupPageLoaded: observeStartupPageLoaded,
+    webClientLoaded: observeWebClientLoaded
   } : undefined
 })
 if (process.env.DSH_PACKAGED_HOST_PROBE === '1') {

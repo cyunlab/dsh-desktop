@@ -123,6 +123,28 @@ describe('DesktopWindow', () => {
     vi.mocked(window.loadURL).mockRejectedValueOnce(failure); vi.mocked(window.loadFile).mockRejectedValueOnce(new Error('restore failed')); await expect(desktop.showHost('http://127.0.0.1:1236')).rejects.toBe(failure)
   })
 
+  it('replays a resolved stale Host navigation after its replacement startup completes', async () => {
+    const first = fakeWindow(); const second = fakeWindow(); let finishOldNavigation!: () => void; let finishReplacementStartup!: () => void
+    vi.mocked(first.loadURL).mockImplementationOnce(() => new Promise(resolve => { finishOldNavigation = () => resolve(undefined) }))
+    vi.mocked(second.loadFile).mockImplementationOnce(() => new Promise(resolve => { finishReplacementStartup = () => resolve(undefined) }))
+    const { desktop } = fixture([first, second]); await desktop.open()
+    const showing = desktop.showHost('http://127.0.0.1:1234'); first.emitWindow('closed'); const replacementOpening = desktop.open()
+    finishOldNavigation(); await Promise.resolve(); expect(second.loadURL).not.toHaveBeenCalled()
+    finishReplacementStartup(); await replacementOpening; await showing
+    expect(second.loadURL).toHaveBeenCalledWith('http://127.0.0.1:1234')
+  })
+
+  it('contains a rejected stale Host navigation and replays it on the replacement', async () => {
+    const first = fakeWindow(); const second = fakeWindow(); const staleFailure = new Error('stale navigation failed'); let rejectOldNavigation!: () => void; let finishReplacementStartup!: () => void
+    vi.mocked(first.loadURL).mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOldNavigation = () => reject(staleFailure) }))
+    vi.mocked(second.loadFile).mockImplementationOnce(() => new Promise(resolve => { finishReplacementStartup = () => resolve(undefined) }))
+    const { desktop } = fixture([first, second]); await desktop.open()
+    const showing = desktop.showHost('http://127.0.0.1:1234'); first.emitWindow('closed'); const replacementOpening = desktop.open()
+    rejectOldNavigation(); await Promise.resolve(); expect(first.loadFile).toHaveBeenCalledOnce(); expect(second.loadURL).not.toHaveBeenCalled()
+    finishReplacementStartup(); await replacementOpening; await expect(showing).resolves.toBeUndefined()
+    expect(second.loadURL).toHaveBeenCalledWith('http://127.0.0.1:1234')
+  })
+
   it('does nothing when asked to show a Host without a live window', async () => {
     const { desktop } = fixture(); await expect(desktop.showHost('http://127.0.0.1:1234')).resolves.toBeUndefined()
   })
