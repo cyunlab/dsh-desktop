@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 import { DesktopWindow, type DesktopBrowserWindow, type DesktopBrowserWindowOptions } from '../../../src/main/window/desktop-window.js'
 
+/** 创建可由测试精确控制完成时机的 Promise。 */
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise })
+  return { promise, resolve, reject }
+}
+
 /** 为 DesktopWindow 测试创建可触发窗口与 webContents 事件的假窗口。 */
 function fakeWindow(minimized = false): DesktopBrowserWindow & {
   emitWindow(event: 'ready-to-show' | 'closed'): void
@@ -143,6 +151,33 @@ describe('DesktopWindow', () => {
     rejectOldNavigation(); await Promise.resolve(); expect(first.loadFile).toHaveBeenCalledOnce(); expect(second.loadURL).not.toHaveBeenCalled()
     finishReplacementStartup(); await replacementOpening; await expect(showing).resolves.toBeUndefined()
     expect(second.loadURL).toHaveBeenCalledWith('http://127.0.0.1:1234')
+  })
+
+  it('replays Host navigation only on the current window after rapid replacements', async () => {
+    const first = fakeWindow(); const second = fakeWindow(); const third = fakeWindow()
+    const firstNavigation = deferred<unknown>(); const secondStartup = deferred<unknown>(); const thirdStartup = deferred<unknown>()
+    vi.mocked(first.loadURL).mockReturnValueOnce(firstNavigation.promise)
+    vi.mocked(second.loadFile).mockReturnValueOnce(secondStartup.promise)
+    vi.mocked(third.loadFile).mockReturnValueOnce(thirdStartup.promise)
+    const { desktop, createBrowserWindow } = fixture([first, second, third]); await desktop.open()
+
+    const showing = desktop.showHost('http://127.0.0.1:1234')
+    first.emitWindow('closed'); const secondOpening = desktop.open()
+    second.emitWindow('closed'); const thirdOpening = desktop.open()
+    expect(createBrowserWindow).toHaveBeenCalledTimes(3)
+    firstNavigation.resolve(undefined); secondStartup.resolve(undefined); await secondOpening
+    await Promise.resolve(); expect(second.loadURL).not.toHaveBeenCalled(); expect(third.loadURL).not.toHaveBeenCalled()
+    thirdStartup.resolve(undefined); await thirdOpening; await expect(showing).resolves.toBeUndefined()
+    expect(second.loadURL).not.toHaveBeenCalled(); expect(third.loadURL).toHaveBeenCalledWith('http://127.0.0.1:1234')
+    expect(first.loadFile).toHaveBeenCalledOnce(); expect(second.loadFile).toHaveBeenCalledOnce()
+  })
+
+  it('contains stale Host navigation rejection when the user closes without replacement', async () => {
+    const window = fakeWindow(); const navigation = deferred<unknown>(); vi.mocked(window.loadURL).mockReturnValueOnce(navigation.promise)
+    const { desktop } = fixture([window]); await desktop.open()
+    const showing = desktop.showHost('http://127.0.0.1:1234'); const result = expect(showing).resolves.toBeUndefined()
+    window.emitWindow('closed'); navigation.reject(new Error('stale navigation failed')); await result
+    expect(window.loadFile).toHaveBeenCalledOnce()
   })
 
   it('does nothing when asked to show a Host without a live window', async () => {
