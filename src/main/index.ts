@@ -1,17 +1,16 @@
 import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import path from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 import { inspect } from 'node:util'
 import { ApplicationLifecycle } from './lifecycle/application.js'
 import { wireFinalWindowShutdown, wireLifecycleToWindow } from './lifecycle/electron-wiring.js'
 import { HarnessHostLauncher } from './host/harness-launcher.js'
-import { NavigationPolicy } from './navigation-policy.js'
 import { prepareDesktopPaths, selectDesktopPaths } from './paths.js'
-import { SingleInstanceFocusCoordinator } from './single-instance-focus.js'
 import { assertSupportedNodeVersion } from './version-guard.js'
-import { openExternalSafely } from './window-effects.js'
+import { DesktopWindow, type DesktopBrowserWindow, type DesktopBrowserWindowOptions } from './window/desktop-window.js'
+import type { NavigationDecision } from './window/navigation-policy.js'
 import { startupChannels } from '../shared/startup-contract.js'
-import { RollingDiagnostics, type DiagnosticContext } from './diagnostics.js'
+import { NullDiagnostics, RollingDiagnostics, type DiagnosticContext, type DiagnosticsSink } from './diagnostics.js'
 import { createStartupActions } from './startup-actions.js'
 import { FakeHostLauncher } from './host/fake-launcher.js'
 import { recordE2EEvent, shouldSuppressExternalOpen } from './e2e-observer.js'
@@ -21,7 +20,61 @@ const desktopLogoFileName = 'dsh-desktop-logo.png'
 app.setName('DeepSeek Harness Desktop')
 if (__DSH_E2E__ && process.env.DSH_DESKTOP_TEST_USER_DATA) app.setPath('userData', process.env.DSH_DESKTOP_TEST_USER_DATA)
 assertSupportedNodeVersion(process.versions.node)
-const focusCoordinator = new SingleInstanceFocusCoordinator(__DSH_E2E__ ? action => recordE2EEvent(`window-${action}`) : undefined)
+const distRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const startupPath = path.join(distRoot, 'startup', 'index.html')
+const desktopLogoPath = path.join(distRoot, 'assets', desktopLogoFileName)
+let windowDiagnostics: Pick<DiagnosticsSink, 'navigationRejected'> = new NullDiagnostics()
+
+/** 将窗口导航拒绝延迟委派给 app ready 后创建的诊断实现。 */
+function reportWindowNavigationRejected(target: string, decision: NavigationDecision): void {
+  windowDiagnostics.navigationRejected(target, decision)
+}
+
+/** 使用生产 Electron adapter 创建受控 BrowserWindow。 */
+function createDesktopBrowserWindow(options: DesktopBrowserWindowOptions): DesktopBrowserWindow {
+  return new BrowserWindow(options)
+}
+
+/** 将受控外链交给 E2E 观察器或操作系统默认浏览器。 */
+async function openDesktopExternal(target: string): Promise<void> {
+  if (__DSH_E2E__) {
+    recordE2EEvent('external-link')
+    if (shouldSuppressExternalOpen()) return
+  }
+  await shell.openExternal(target)
+}
+
+/** 记录窗口恢复事件。 */
+function observeWindowRestored(): void { recordE2EEvent('window-restored') }
+
+/** 记录窗口显示事件。 */
+function observeWindowShown(): void { recordE2EEvent('window-shown') }
+
+/** 记录窗口聚焦事件。 */
+function observeWindowFocused(): void { recordE2EEvent('window-focused') }
+
+/** 记录启动页完成加载事件。 */
+function observeStartupPageLoaded(): void { recordE2EEvent('startup-page-loaded') }
+
+/** 记录 Web Client 完成加载事件。 */
+function observeWebClientLoaded(): void { recordE2EEvent('web-client-loaded') }
+
+const desktopWindow = new DesktopWindow({
+  startupPath,
+  preloadPath: path.join(distRoot, 'preload', 'startup.cjs'),
+  iconPath: desktopLogoPath,
+  snapshotChannel: startupChannels.snapshot,
+  diagnostics: { navigationRejected: reportWindowNavigationRejected },
+  createBrowserWindow: createDesktopBrowserWindow,
+  openExternal: openDesktopExternal,
+  observe: __DSH_E2E__ ? {
+    restored: observeWindowRestored,
+    shown: observeWindowShown,
+    focused: observeWindowFocused,
+    startupPageLoaded: observeStartupPageLoaded,
+    webClientLoaded: observeWebClientLoaded
+  } : undefined
+})
 if (process.env.DSH_PACKAGED_HOST_PROBE === '1') {
   void runPackagedHostProbe()
 } else if (!app.requestSingleInstanceLock()) {
@@ -29,11 +82,12 @@ if (process.env.DSH_PACKAGED_HOST_PROBE === '1') {
 } else {
   app.on('second-instance', () => {
     if (__DSH_E2E__) recordE2EEvent('second-instance')
-    focusCoordinator.requestFocus()
+    desktopWindow.requestFocus()
   })
   void run()
 }
 
+/** 启动打包产物 Host 探针并以进程状态码报告结果。 */
 async function runPackagedHostProbe(): Promise<void> {
   try {
     await app.whenReady()
@@ -52,13 +106,10 @@ async function runPackagedHostProbe(): Promise<void> {
   }
 }
 
+/** 在 Electron 就绪后组合 Desktop、Host 生命周期与 IPC 服务。 */
 async function run(): Promise<void> {
   await app.whenReady()
 
-  const distRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-  const startupPath = path.join(distRoot, 'startup', 'index.html')
-  const desktopLogoPath = path.join(distRoot, 'assets', desktopLogoFileName)
-  const startupUrl = pathToFileURL(startupPath).href
   if (process.platform === 'darwin') app.dock?.setIcon(desktopLogoPath)
   const paths = selectDesktopPaths(app)
   const diagnosticContext: DiagnosticContext = {
@@ -69,58 +120,13 @@ async function run(): Promise<void> {
     arch: process.arch
   }
   const diagnostics = new RollingDiagnostics(paths.logs, diagnosticContext)
+  windowDiagnostics = diagnostics
   const launcher = __DSH_E2E__ && process.env.DSH_DESKTOP_TEST_HOST === 'fake'
     ? new FakeHostLauncher(Number.parseInt(process.env.DSH_DESKTOP_TEST_FAILURES ?? '0', 10) || 0)
     : new HarnessHostLauncher()
   const lifecycle = new ApplicationLifecycle(launcher, paths, 5_000, diagnostics)
-  const policy = new NavigationPolicy(startupUrl)
-  let window: BrowserWindow | null = null
-
-  const createWindow = (): BrowserWindow => {
-    const created = new BrowserWindow({
-      width: 1100,
-      height: 760,
-      minWidth: 720,
-      minHeight: 520,
-      title: 'DeepSeek Harness Desktop',
-      icon: desktopLogoPath,
-      show: false,
-      webPreferences: {
-        preload: path.join(distRoot, 'preload', 'startup.cjs'),
-        nodeIntegration: false,
-        contextIsolation: true,
-        sandbox: true
-      }
-    })
-    created.once('ready-to-show', () => created.show())
-    created.webContents.on('did-finish-load', () => {
-      if (!__DSH_E2E__) return
-      recordE2EEvent(created.webContents.getURL().startsWith('file:') ? 'startup-page-loaded' : 'web-client-loaded')
-    })
-    created.webContents.on('will-navigate', (event, target) => {
-      const decision = policy.decide(target)
-      if (decision === 'allow') return
-      event.preventDefault()
-      diagnostics.navigationRejected(target, decision)
-      if (decision === 'external') void openExternal(target)
-    })
-    created.webContents.setWindowOpenHandler(({ url }) => {
-      const decision = policy.decide(url)
-      diagnostics.navigationRejected(url, decision)
-      if (decision === 'external') void openExternal(url)
-      return { action: 'deny' }
-    })
-    created.on('closed', () => {
-      focusCoordinator.detach(created)
-      window = null
-    })
-    focusCoordinator.attach(created)
-    return created
-  }
-
-  window = createWindow()
-  await window.loadFile(startupPath)
-  wireLifecycleToWindow(lifecycle, () => window, startupPath, startupChannels.snapshot, policy)
+  await desktopWindow.open()
+  wireLifecycleToWindow(lifecycle, desktopWindow)
 
   ipcMain.handle(startupChannels.snapshot, () => lifecycle.snapshot)
   ipcMain.handle(startupChannels.retry, () => lifecycle.retry())
@@ -137,12 +143,4 @@ async function run(): Promise<void> {
   wireFinalWindowShutdown(app, lifecycle)
 
   await lifecycle.start()
-
-  function openExternal(target: string): Promise<void> {
-    if (__DSH_E2E__) {
-      recordE2EEvent('external-link')
-      if (shouldSuppressExternalOpen()) return Promise.resolve()
-    }
-    return openExternalSafely(url => shell.openExternal(url), target)
-  }
 }

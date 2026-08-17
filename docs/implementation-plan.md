@@ -26,7 +26,9 @@ src/
 │   │   ├── harness-launcher.ts  Published-package Web composition adapter
 │   │   ├── fake-launcher.ts     Fake Host adapter
 │   │   └── readiness.ts         Bounded loopback HTTP probe
-│   ├── navigation-policy.ts     Exact-origin and external-link policy
+│   ├── window/
+│   │   ├── desktop-window.ts    Controlled Desktop window implementation
+│   │   └── navigation-policy.ts Exact-origin and external-link policy
 │   ├── diagnostics.ts           Redacted rolling diagnostics
 │   └── version-guard.ts         Electron Node/Harness engine assertion
 ├── preload/

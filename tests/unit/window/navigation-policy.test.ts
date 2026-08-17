@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { NavigationPolicy } from '../../src/main/navigation-policy.js'
+import { NavigationPolicy } from '../../../src/main/window/navigation-policy.js'
 
 describe('navigation policy', () => {
   it('allows only the startup document and exact assigned Host origin', () => {
