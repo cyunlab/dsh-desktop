@@ -1,4 +1,4 @@
-name: Build unsigned development artifacts
+name: Build desktop artifacts
 
 on:
   workflow_dispatch:
@@ -65,7 +65,7 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Build native package and probe packaged Host
         run: pnpm package --${{ matrix.platform }} --${{ matrix.arch }} --publish never
-      - name: Upload unsigned development artifact
+      - name: Upload desktop artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact }}
@@ -86,13 +86,13 @@ jobs:
           pattern: dsh-desktop-*
           path: artifacts
           merge-multiple: true
-      - name: Write unsigned installation warnings
+      - name: Write installation notes
         shell: bash
         run: |
           cat > release-notes.md <<'EOF'
-          ## Unsigned development build
+          ## Desktop build
 
-          These artifacts are for development testing. They are not signed, notarized, or suitable for a public production release.
+          Verify the downloaded filename and source before installing. Platform security prompts depend on the signing and notarization configuration used for this build.
 
           - **Windows (x64, NSIS):** Microsoft Defender SmartScreen may warn that the publisher is unknown. Choose **More info**, verify the downloaded filename, then choose **Run anyway** only if you trust this repository and build.
           - **macOS (Apple silicon arm64 or Intel x64, DMG):** Gatekeeper will block an unnotarized app. After verifying the downloaded filename, control-click the app in Finder, choose **Open**, then confirm **Open** only if you trust this repository and build.

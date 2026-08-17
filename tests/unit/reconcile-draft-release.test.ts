@@ -4,7 +4,7 @@ import { reconcileDraftRelease, type GhResult } from '../../scripts/reconcile-dr
 const options = {
   repository: 'owner/repo',
   tag: 'v1.2.3+build.4',
-  title: 'Desktop v1.2.3+build.4 (unsigned development build)',
+  title: 'Desktop v1.2.3+build.4',
   notesFile: 'notes.md',
   artifacts: ['one.dmg', 'two.exe']
 }

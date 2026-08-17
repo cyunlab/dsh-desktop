@@ -97,7 +97,7 @@
     "appId": "io.github.xlcyun.dsh-desktop",
     "productName": "DeepSeek Harness Desktop",
     "executableName": "deepseek-harness-desktop",
-    "artifactName": "deepseek-harness-desktop-${version}-unsigned-dev-${os}-${arch}.${ext}",
+    "artifactName": "deepseek-harness-desktop-${version}-${os}-${arch}.${ext}",
     "asar": true,
     "asarUnpack": ["node_modules/**/*"],
     "files": ["dist/**/*", "package.json"],
@@ -106,7 +106,7 @@
     "win": { "target": "nsis" },
     "mac": { "target": "dmg" },
     "linux": { "target": "AppImage" },
-    "nsis": { "artifactName": "deepseek-harness-desktop-${version}-unsigned-dev-windows-${arch}.${ext}" },
-    "dmg": { "artifactName": "deepseek-harness-desktop-${version}-unsigned-dev-macos-${arch}.${ext}" }
+    "nsis": { "artifactName": "deepseek-harness-desktop-${version}-windows-${arch}.${ext}" },
+    "dmg": { "artifactName": "deepseek-harness-desktop-${version}-macos-${arch}.${ext}" }
   }
 }

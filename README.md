@@ -23,14 +23,14 @@ corepack pnpm test
 
 Desktop application for DSH.
 
-## Unsigned development packages
+## Desktop packages
 
 Run `corepack pnpm package` on the native target platform. Artifacts are written
-to `release/` with a space-free `deepseek-harness-desktop-<version>-unsigned-dev-…`
+to `release/` with a space-free `deepseek-harness-desktop-<version>-…`
 filename. The supported native targets are Windows x64 NSIS, separate macOS
 arm64 and x64 DMGs, and Linux x64 AppImage.
 
-These development artifacts are not signed. On macOS, Control-click the app,
+Depending on the build's signing configuration, macOS may require you to Control-click the app,
 choose **Open**, then confirm **Open** to pass Gatekeeper. On Windows, choose
 **More info** and **Run anyway** in the SmartScreen prompt. Only use artifacts
 from a build you trust.
