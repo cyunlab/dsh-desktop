@@ -17,7 +17,7 @@ describe('Harness Host launcher', () => {
     const originalHome = process.env.DSH_HOME
     const originalCwd = process.cwd()
     const dispose = vi.fn(async () => undefined)
-    const profileDir = path.join(paths.harnessHome, 'profiles', 'web')
+    const profileDir = path.join(paths.harnessHome, 'profiles', 'desktop')
     const initProfile = vi.fn(() => mkdirSync(profileDir, { recursive: true }))
     const provideCmdline = vi.fn()
     const boot = vi.fn(async (_name, _config, _patches, prepare) => {
@@ -26,6 +26,16 @@ describe('Harness Host launcher', () => {
       return { webServer: { host: '127.0.0.1', port: 43210 }, fiber: { dispose } } as never
     })
     const launchEnvironment = Object.freeze({ get: vi.fn(), getFrom: vi.fn() })
+    const loadProfile = vi.fn(() => ({
+      name: 'desktop',
+      dir: profileDir,
+      patchPath: path.join(profileDir, 'cordis.patch.yml'),
+      layers: [
+        { packageName: '@deepseek-ai/dsh-base', packageDir: '/base', patchPath: '/base/cordis.patch.yml', patches: [{ insert: [] }] },
+        { packageName: '@deepseek-ai/dsh-web-app', packageDir: '/web', patchPath: '/web/cordis.patch.yml', patches: [{ id: 'web' }] }
+      ],
+      patches: []
+    }))
     const loadHarness = vi.fn(async () => {
       expect(process.env.DSH_HOME).toBe(paths.harnessHome)
       expect(await realpath(process.cwd())).toBe(await realpath(paths.fallbackWorkspace))
@@ -33,16 +43,7 @@ describe('Harness Host launcher', () => {
         initProfile,
         composeEntries: vi.fn(() => [{ id: 'agent-presets', name: '@deepseek-ai/dsh-agent-presets', config: { default: 'standard' } }]),
         healProfilesModuleFallback: vi.fn(),
-        loadProfile: vi.fn(() => ({
-          name: 'web',
-          dir: profileDir,
-          patchPath: path.join(profileDir, 'cordis.patch.yml'),
-          layers: [
-            { packageName: '@deepseek-ai/dsh-base', packageDir: '/base', patchPath: '/base/cordis.patch.yml', patches: [{ insert: [] }] },
-            { packageName: '@deepseek-ai/dsh-web-app', packageDir: '/web', patchPath: '/web/cordis.patch.yml', patches: [{ id: 'web' }] }
-          ],
-          patches: []
-        })),
+        loadProfile,
         loadLayeredEnv: vi.fn(() => launchEnvironment),
         provideCmdline,
         launchEnvironmentKey: 'launchEnvironment' as const,
@@ -57,8 +58,14 @@ describe('Harness Host launcher', () => {
     const handle = await launcher.launch(paths)
     expect(handle.origin).toBe('http://127.0.0.1:43210')
     expect(initProfile).toHaveBeenCalledWith(
-      path.join(paths.harnessHome, 'profiles', 'web'),
+      path.join(paths.harnessHome, 'profiles', 'desktop'),
       ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
+    )
+    expect(loadProfile).toHaveBeenCalledWith(
+      'deepseek-harness-desktop',
+      'desktop',
+      expect.any(String),
+      paths.harnessHome
     )
     expect(provideCmdline).toHaveBeenCalledWith(expect.anything(), {
       args: ['--host', '127.0.0.1', '--port', '0'],

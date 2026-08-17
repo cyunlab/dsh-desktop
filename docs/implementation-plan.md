@@ -73,7 +73,7 @@ Set `DSH_HOME` before importing or invoking Harness code that resolves it. Creat
 ### Host launch
 
 1. Resolve the published `@deepseek-ai/dsh` package manifest as the installation anchor.
-2. Use public `@deepseek-ai/dsh-app-boot` profile APIs to initialize/load the `web` profile from the isolated Harness Home.
+2. Use public `@deepseek-ai/dsh-app-boot` profile APIs to initialize/load the Desktop-owned `desktop` profile from the isolated Harness Home; its contents remain the official Web composition.
 3. Compose `@deepseek-ai/dsh-base` followed by `@deepseek-ai/dsh-web-app`; do not copy their YAML or read from the submodule.
 4. Supply Web arguments equivalent to `--host 127.0.0.1 --port 0` through the published command-line provider.
 5. Boot the Cordis root and retain its context/disposer behind `HostLauncher`.

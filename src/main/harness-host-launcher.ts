@@ -9,7 +9,8 @@ import type { HostHandle, HostLauncher } from './host-launcher.js'
 import type { DesktopPaths } from './paths.js'
 import { waitForHttpReady, type ReadinessOptions } from './readiness.js'
 
-const PROFILE_NAME = 'web'
+// Desktop owns the profile identity; its contents remain the official Web composition.
+const PROFILE_NAME = 'desktop'
 const BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] as const
 const ROOT_CONFIG = '# Desktop profile root; official bundle patches are applied in order.\n[]\n'
 
