@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DeepSeek Harness Desktop 架构</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --paper: #f7fbff;
+      --ink: #08243f;
+      --muted: #4d6074;
+      --accent: #4d6bfe;
+      --sans: 'Geist', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+      --serif: 'Instrument Serif', 'Songti SC', serif;
+      --mono: 'Geist Mono', 'Noto Sans Mono CJK SC', monospace;
+    }
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 48px 32px;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--sans);
+    }
+    .frame { width: 100%; max-width: 1280px; }
+    .eyebrow {
+      margin-bottom: 8px;
+      color: var(--muted);
+      font: 500 12px/1 var(--mono);
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin-bottom: 24px;
+      color: var(--ink);
+      font: 400 32px/1.15 var(--serif);
+    }
+    svg { display: block; width: 100%; min-width: 960px; }
+  </style>
+</head>
+<body>
+  <main class="frame">
+    <p class="eyebrow">Architecture · DeepSeek Harness Desktop</p>
+    <h1>安装即用的桌面运行方式</h1>
+
+    <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="desktop-architecture-title desktop-architecture-desc">
+      <title id="desktop-architecture-title">DeepSeek Harness Desktop 架构</title>
+      <desc id="desktop-architecture-desc">用户启动跨平台桌面应用，Desktop 管理本地 DeepSeek Harness Host 并显示 Web Client，同时把原生桌面能力、运行时和界面开放给插件。</desc>
+      <defs>
+        <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;display=swap');</style>
+        <marker id="arch-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4d6074"/></marker>
+        <marker id="arch-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4d6bfe"/></marker>
+        <marker id="arch-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#0067d9"/></marker>
+      </defs>
+
+      <rect width="1280" height="720" fill="#f7fbff"/>
+
+      <rect x="260" y="104" width="960" height="448" rx="8" fill="rgba(8,36,63,0.02)" stroke="rgba(8,36,63,0.12)" stroke-width="0.8"/>
+      <rect x="284" y="108" width="124" height="16" rx="2" fill="#f7fbff"/>
+      <text x="346" y="120" fill="#5b6f84" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">DESKTOP APP</text>
+
+      <line x1="200" y1="280" x2="320" y2="280" stroke="#0067d9" stroke-width="1.2" marker-end="url(#arch-arrow-link)"/>
+      <line x1="520" y1="280" x2="600" y2="280" stroke="#4d6bfe" stroke-width="1.2" marker-end="url(#arch-arrow-accent)"/>
+      <line x1="840" y1="280" x2="920" y2="280" stroke="#4d6074" stroke-width="1.2" marker-end="url(#arch-arrow)"/>
+
+      <line x1="480" y1="416" x2="480" y2="324" stroke="#0067d9" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arch-arrow-link)"/>
+      <line x1="720" y1="416" x2="720" y2="324" stroke="#0067d9" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arch-arrow-link)"/>
+      <line x1="960" y1="416" x2="960" y2="324" stroke="#0067d9" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arch-arrow-link)"/>
+
+      <rect x="220" y="252" width="72" height="16" rx="2" fill="#f7fbff"/>
+      <text x="256" y="264" fill="#0067d9" font-size="12" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">LAUNCH</text>
+      <rect x="532" y="252" width="56" height="16" rx="2" fill="#f7fbff"/>
+      <text x="560" y="264" fill="#4d6bfe" font-size="12" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">START</text>
+      <rect x="852" y="252" width="56" height="16" rx="2" fill="#f7fbff"/>
+      <text x="880" y="264" fill="#4d6074" font-size="12" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SERVE</text>
+
+      <rect x="40" y="240" width="160" height="80" rx="6" fill="#f7fbff"/>
+      <rect x="40" y="240" width="160" height="80" rx="6" fill="rgba(77,96,116,0.10)" stroke="#5b6f84" stroke-width="1"/>
+      <rect x="52" y="252" width="40" height="12" rx="2" fill="transparent" stroke="rgba(91,111,132,0.50)" stroke-width="0.8"/>
+      <text x="72" y="261" fill="#5b6f84" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">USER</text>
+      <text x="120" y="284" fill="#08243f" font-size="16" font-weight="600" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">安装并启动</text>
+      <text x="120" y="304" fill="#4d6074" font-size="12" font-family="'Geist Mono', monospace" text-anchor="middle">WIN · MAC · LINUX</text>
+
+      <rect x="320" y="236" width="200" height="88" rx="6" fill="#f7fbff"/>
+      <rect x="320" y="236" width="200" height="88" rx="6" fill="rgba(77,107,254,0.08)" stroke="#4d6bfe" stroke-width="1.2"/>
+      <rect x="332" y="248" width="68" height="12" rx="2" fill="transparent" stroke="rgba(77,107,254,0.50)" stroke-width="0.8"/>
+      <text x="366" y="257" fill="#4d6bfe" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">DESKTOP</text>
+      <text x="420" y="284" fill="#08243f" font-size="16" font-weight="600" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">Desktop Shell</text>
+      <text x="420" y="304" fill="#4d6074" font-size="12" font-family="'Geist Mono', monospace" text-anchor="middle">WINDOW · NATIVE APIS</text>
+
+      <rect x="600" y="236" width="240" height="88" rx="6" fill="#f7fbff"/>
+      <rect x="600" y="236" width="240" height="88" rx="6" fill="#ffffff" stroke="#08243f" stroke-width="1"/>
+      <rect x="612" y="248" width="56" height="12" rx="2" fill="transparent" stroke="rgba(8,36,63,0.40)" stroke-width="0.8"/>
+      <text x="640" y="257" fill="#08243f" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">RUNTIME</text>
+      <text x="720" y="284" fill="#08243f" font-size="16" font-weight="600" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">DeepSeek Harness Host</text>
+      <text x="720" y="304" fill="#4d6074" font-size="12" font-family="'Geist Mono', monospace" text-anchor="middle">LOCAL · VERSION MATCHED</text>
+
+      <rect x="920" y="236" width="200" height="88" rx="6" fill="#f7fbff"/>
+      <rect x="920" y="236" width="200" height="88" rx="6" fill="rgba(8,36,63,0.03)" stroke="rgba(8,36,63,0.30)" stroke-width="1"/>
+      <rect x="932" y="248" width="32" height="12" rx="2" fill="transparent" stroke="rgba(8,36,63,0.30)" stroke-width="0.8"/>
+      <text x="948" y="257" fill="#5b6f84" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">UI</text>
+      <text x="1020" y="284" fill="#08243f" font-size="16" font-weight="600" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">Web Client</text>
+      <text x="1020" y="304" fill="#4d6074" font-size="12" font-family="'Geist Mono', monospace" text-anchor="middle">SESSIONS · WORKSPACES</text>
+
+      <rect x="400" y="416" width="640" height="80" rx="6" fill="#f7fbff"/>
+      <rect x="400" y="416" width="640" height="80" rx="6" fill="rgba(0,103,217,0.05)" stroke="#0067d9" stroke-width="1"/>
+      <rect x="412" y="428" width="56" height="12" rx="2" fill="transparent" stroke="rgba(0,103,217,0.45)" stroke-width="0.8"/>
+      <text x="440" y="437" fill="#0067d9" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">PLUGINS</text>
+      <text x="720" y="460" fill="#08243f" font-size="16" font-weight="600" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">把原生桌面能力、运行时与界面开放给插件</text>
+      <text x="720" y="480" fill="#4d6074" font-size="12" font-family="'Geist Mono', monospace" text-anchor="middle">CLIENT APIS · WORKFLOWS · UI BLOCKS</text>
+
+      <line x1="40" y1="624" x2="1240" y2="624" stroke="rgba(8,36,63,0.12)" stroke-width="0.8"/>
+      <text x="40" y="648" fill="#5b6f84" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+      <line x1="148" y1="664" x2="184" y2="664" stroke="#0067d9" stroke-width="1.2" marker-end="url(#arch-arrow-link)"/>
+      <text x="196" y="668" fill="#4d6074" font-size="12" font-family="'Geist', 'PingFang SC', sans-serif">启动</text>
+      <line x1="296" y1="664" x2="332" y2="664" stroke="#4d6bfe" stroke-width="1.2" marker-end="url(#arch-arrow-accent)"/>
+      <text x="344" y="668" fill="#4d6074" font-size="12" font-family="'Geist', 'PingFang SC', sans-serif">主要运行路径</text>
+      <line x1="520" y1="664" x2="556" y2="664" stroke="#0067d9" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arch-arrow-link)"/>
+      <text x="568" y="668" fill="#4d6074" font-size="12" font-family="'Geist', 'PingFang SC', sans-serif">插件扩展</text>
+    </svg>
+  </main>
+</body>
+</html>

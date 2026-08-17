@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="plugin-tree-title plugin-tree-desc">
+      <title id="plugin-tree-title">DeepSeek Harness 一切皆插件</title>
+      <desc id="plugin-tree-desc">DeepSeek Harness 通过插件组合模型、工具技能、会话工作流、沙箱存储和界面能力，Desktop 继续把积木式 UI 与原生桌面能力开放给插件。</desc>
+      <defs>
+        <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;display=swap');</style>
+      </defs>
+
+      <rect width="1280" height="720" fill="#f7fbff"/>
+
+      <path d="M 640,180 V 232 Q 640,240 632,240 H 132 V 276" fill="none" stroke="#4d6074" stroke-width="1"/>
+      <line x1="132" y1="240" x2="1080" y2="240" stroke="#4d6074" stroke-width="1"/>
+      <line x1="360" y1="240" x2="360" y2="276" stroke="#4d6074" stroke-width="1"/>
+      <line x1="588" y1="240" x2="588" y2="276" stroke="#4d6074" stroke-width="1"/>
+      <line x1="816" y1="240" x2="816" y2="276" stroke="#4d6074" stroke-width="1"/>
+      <line x1="1080" y1="240" x2="1080" y2="276" stroke="#4d6074" stroke-width="1"/>
+
+      <path d="M 1080,356 V 400 Q 1080,408 1072,408 H 928 V 456" fill="none" stroke="#0067d9" stroke-width="1"/>
+      <line x1="928" y1="408" x2="1148" y2="408" stroke="#0067d9" stroke-width="1"/>
+      <line x1="1148" y1="408" x2="1148" y2="456" stroke="#0067d9" stroke-width="1"/>
+
+      <rect x="500" y="100" width="280" height="80" rx="6" fill="#f7fbff"/>
+      <rect x="500" y="100" width="280" height="80" rx="6" fill="rgba(77,107,254,0.08)" stroke="#4d6bfe" stroke-width="1.2"/>
+      <rect x="512" y="112" width="52" height="12" rx="2" fill="transparent" stroke="rgba(77,107,254,0.50)" stroke-width="0.8"/>
+      <text x="538" y="121" fill="#4d6bfe" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CORDIS</text>
+      <text x="640" y="144" fill="#08243f" font-size="16" font-weight="600" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">DeepSeek Harness</text>
+      <text x="640" y="164" fill="#4d6bfe" font-size="12" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">EVERYTHING IS A PLUGIN</text>
+
+      <rect x="40" y="276" width="184" height="80" rx="6" fill="#f7fbff" stroke="#08243f" stroke-width="1"/>
+      <text x="132" y="312" fill="#08243f" font-size="16" font-weight="600" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">Model</text>
+      <text x="132" y="336" fill="#4d6074" font-size="16" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">模型</text>
+
+      <rect x="268" y="276" width="184" height="80" rx="6" fill="#f7fbff" stroke="#08243f" stroke-width="1"/>
+      <text x="360" y="312" fill="#08243f" font-size="16" font-weight="600" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">Tools &amp; Skills</text>
+      <text x="360" y="336" fill="#4d6074" font-size="16" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">工具与技能</text>
+
+      <rect x="496" y="276" width="184" height="80" rx="6" fill="#f7fbff" stroke="#08243f" stroke-width="1"/>
+      <text x="588" y="312" fill="#08243f" font-size="16" font-weight="600" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">Session &amp; Workflow</text>
+      <text x="588" y="336" fill="#4d6074" font-size="16" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">会话与工作流</text>
+
+      <rect x="724" y="276" width="184" height="80" rx="6" fill="#f7fbff" stroke="#08243f" stroke-width="1"/>
+      <text x="816" y="312" fill="#08243f" font-size="16" font-weight="600" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">Sandbox &amp; Storage</text>
+      <text x="816" y="336" fill="#4d6074" font-size="16" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">沙箱与存储</text>
+
+      <rect x="988" y="276" width="184" height="80" rx="6" fill="rgba(0,103,217,0.05)" stroke="#0067d9" stroke-width="1"/>
+      <rect x="1000" y="288" width="60" height="12" rx="2" fill="transparent" stroke="rgba(0,103,217,0.45)" stroke-width="0.8"/>
+      <text x="1030" y="297" fill="#0067d9" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">DESKTOP</text>
+      <text x="1080" y="320" fill="#08243f" font-size="16" font-weight="600" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">UI &amp; Desktop</text>
+      <text x="1080" y="340" fill="#4d6074" font-size="16" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">界面与桌面能力</text>
+
+      <rect x="836" y="456" width="184" height="96" rx="6" fill="#f7fbff" stroke="#0067d9" stroke-width="0.8"/>
+      <text x="928" y="496" fill="#08243f" font-size="16" font-weight="600" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">UI Blocks</text>
+      <text x="928" y="524" fill="#4d6074" font-size="16" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">积木式 UI</text>
+
+      <rect x="1056" y="456" width="184" height="96" rx="6" fill="#f7fbff" stroke="#0067d9" stroke-width="0.8"/>
+      <text x="1148" y="496" fill="#08243f" font-size="16" font-weight="600" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">Desktop APIs</text>
+      <text x="1148" y="524" fill="#4d6074" font-size="16" font-family="'Geist', 'PingFang SC', sans-serif" text-anchor="middle">桌面能力开放给插件</text>
+
+      <line x1="40" y1="624" x2="1240" y2="624" stroke="rgba(8,36,63,0.12)" stroke-width="0.8"/>
+      <text x="40" y="648" fill="#5b6f84" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+      <rect x="148" y="656" width="20" height="16" rx="4" fill="rgba(77,107,254,0.08)" stroke="#4d6bfe" stroke-width="1"/>
+      <text x="180" y="668" fill="#4d6074" font-size="12" font-family="'Geist', 'PingFang SC', sans-serif">插件内核</text>
+      <rect x="300" y="656" width="20" height="16" rx="4" fill="#f7fbff" stroke="#08243f" stroke-width="1"/>
+      <text x="332" y="668" fill="#4d6074" font-size="12" font-family="'Geist', 'PingFang SC', sans-serif">插件能力</text>
+      <rect x="452" y="656" width="20" height="16" rx="4" fill="rgba(0,103,217,0.05)" stroke="#0067d9" stroke-width="1"/>
+      <text x="484" y="668" fill="#4d6074" font-size="12" font-family="'Geist', 'PingFang SC', sans-serif">Desktop 延伸方向</text>
+    </svg>
