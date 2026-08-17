@@ -70,7 +70,7 @@ export class DesktopWindow {
   readonly #policy: NavigationPolicy
   readonly #observe: Required<DesktopWindowEventObserver>
   #window?: DesktopBrowserWindow
-  #opening?: Promise<void>
+  #opening?: { window: DesktopBrowserWindow, promise: Promise<void> }
   #pendingFocus = false
 
   /** 以路径、事件及窄化的 BrowserWindow 工厂建立 Desktop 窗口所有权。 */
@@ -87,18 +87,20 @@ export class DesktopWindow {
 
   /** 打开启动页；重复调用不会创建第二个仍存活的窗口。 */
   open(): Promise<void> {
-    if (this.#opening) return this.#opening
-    if (this.#liveWindow()) return Promise.resolve()
-    let opening!: Promise<void>
-    opening = this.#createAndLoad().finally(() => {
+    const liveWindow = this.#liveWindow()
+    if (this.#opening && this.#opening.window === liveWindow) return this.#opening.promise
+    if (liveWindow) return Promise.resolve()
+    const window = this.#createWindow()
+    const opening = { window, promise: Promise.resolve() }
+    opening.promise = this.#loadStartup(window).finally(() => {
       if (this.#opening === opening) this.#opening = undefined
     })
     this.#opening = opening
-    return opening
+    return opening.promise
   }
 
-  /** 创建窗口并加载启动页，失败时销毁并释放当前所有权。 */
-  async #createAndLoad(): Promise<void> {
+  /** 创建并绑定一个新的受控窗口。 */
+  #createWindow(): DesktopBrowserWindow {
     const window = this.options.createBrowserWindow({
       width: 1100,
       height: 760,
@@ -116,6 +118,11 @@ export class DesktopWindow {
     })
     this.#window = window
     this.#attach(window)
+    return window
+  }
+
+  /** 加载启动页，失败时销毁并释放当前窗口所有权。 */
+  async #loadStartup(window: DesktopBrowserWindow): Promise<void> {
     try {
       await window.loadFile(this.options.startupPath)
     } catch (error) {
@@ -174,6 +181,7 @@ export class DesktopWindow {
     })
     window.on('closed', () => {
       if (this.#window === window) this.#window = undefined
+      if (this.#opening?.window === window) this.#opening = undefined
     })
     if (!this.#pendingFocus) return
     this.#pendingFocus = false

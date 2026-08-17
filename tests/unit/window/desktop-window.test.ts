@@ -70,8 +70,10 @@ describe('DesktopWindow', () => {
   it('does not let a window closed during opening clear its later replacement', async () => {
     const first = fakeWindow(); const second = fakeWindow(); let finishLoad!: () => void
     vi.mocked(first.loadFile).mockImplementationOnce(() => new Promise(resolve => { finishLoad = () => resolve(undefined) }))
-    const { desktop } = fixture([first, second])
-    const opening = desktop.open(); first.emitWindow('closed'); finishLoad(); await opening; await desktop.open()
+    const { desktop, createBrowserWindow } = fixture([first, second])
+    const firstOpening = desktop.open(); first.emitWindow('closed'); const secondOpening = desktop.open()
+    expect(secondOpening).not.toBe(firstOpening); expect(createBrowserWindow).toHaveBeenCalledTimes(2); expect(second.loadFile).toHaveBeenCalledOnce()
+    await secondOpening; finishLoad(); await firstOpening
     first.emitWindow('closed'); desktop.publishSnapshot({ state: 'idle', message: 'x' })
     expect(second.webContents.send).toHaveBeenCalledOnce()
   })
