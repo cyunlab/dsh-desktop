@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { waitForHttpReady } from '../../src/main/readiness.js'
+import { waitForHttpReady } from '../../../src/main/host/readiness.js'
 
 describe('HTTP readiness', () => {
   it('retries until the Host responds successfully', async () => {

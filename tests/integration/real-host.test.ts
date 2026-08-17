@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { HarnessHostLauncher } from '../../src/main/harness-host-launcher.js'
+import { HarnessHostLauncher } from '../../src/main/host/harness-launcher.js'
 
 async function rpc<T>(origin: string, method: string, payload: unknown): Promise<T> {
   const response = await fetch(`${origin}/api/${method}`, {

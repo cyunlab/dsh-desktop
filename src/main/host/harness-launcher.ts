@@ -5,8 +5,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { PatchOptions } from '@deepseek-ai/cordis-plugin-include'
-import type { HostHandle, HostLauncher } from './host-launcher.js'
-import type { DesktopPaths } from './paths.js'
+import type { HostHandle, HostLauncher } from './launcher.js'
+import type { DesktopPaths } from '../paths.js'
 import { waitForHttpReady, type ReadinessOptions } from './readiness.js'
 
 // Desktop owns the profile identity; its contents remain the official Web composition.

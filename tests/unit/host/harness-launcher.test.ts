@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
-import { HarnessHostLauncher, resolveRuntimeManifestPath } from '../../src/main/harness-host-launcher.js'
+import { HarnessHostLauncher, resolveRuntimeManifestPath } from '../../../src/main/host/harness-launcher.js'
 
 describe('packaged Harness install anchor', () => {
   it('maps an ASAR manifest URL to the unpacked runtime tree', () => {

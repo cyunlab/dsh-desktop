@@ -1,4 +1,4 @@
-import type { DesktopPaths } from './paths.js'
+import type { DesktopPaths } from '../paths.js'
 
 export interface HostHandle {
   readonly origin: string

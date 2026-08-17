@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { ApplicationLifecycle } from '../../src/main/application.js'
-import type { HostLauncher } from '../../src/main/host-launcher.js'
+import type { HostLauncher } from '../../src/main/host/launcher.js'
 
 async function fixturePaths() {
   const root = await mkdtemp(path.join(tmpdir(), 'dsh lifecycle '))

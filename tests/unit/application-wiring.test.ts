@@ -5,7 +5,7 @@ import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { ApplicationLifecycle } from '../../src/main/application.js'
 import { wireFinalWindowShutdown, wireLifecycleToWindow, type QuitEvent } from '../../src/main/application-wiring.js'
-import { FakeHostLauncher } from '../../src/main/fake-host-launcher.js'
+import { FakeHostLauncher } from '../../src/main/host/fake-launcher.js'
 import { NavigationPolicy } from '../../src/main/navigation-policy.js'
 import type { DiagnosticsSink } from '../../src/main/diagnostics.js'
 
