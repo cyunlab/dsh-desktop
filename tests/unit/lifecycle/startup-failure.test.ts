@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { userFacingStartupError } from '../../src/main/user-facing-error.js'
+import { userFacingStartupError } from '../../../src/main/lifecycle/startup-failure.js'
 
 describe('user-facing startup errors', () => {
   it.each([

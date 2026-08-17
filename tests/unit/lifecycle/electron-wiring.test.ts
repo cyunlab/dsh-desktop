@@ -3,11 +3,11 @@ import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { ApplicationLifecycle } from '../../src/main/application.js'
-import { wireFinalWindowShutdown, wireLifecycleToWindow, type QuitEvent } from '../../src/main/application-wiring.js'
-import { FakeHostLauncher } from '../../src/main/host/fake-launcher.js'
-import { NavigationPolicy } from '../../src/main/navigation-policy.js'
-import type { DiagnosticsSink } from '../../src/main/diagnostics.js'
+import { ApplicationLifecycle } from '../../../src/main/lifecycle/application.js'
+import { wireFinalWindowShutdown, wireLifecycleToWindow, type QuitEvent } from '../../../src/main/lifecycle/electron-wiring.js'
+import { FakeHostLauncher } from '../../../src/main/host/fake-launcher.js'
+import { NavigationPolicy } from '../../../src/main/navigation-policy.js'
+import type { DiagnosticsSink } from '../../../src/main/diagnostics.js'
 
 async function fixturePaths() {
   const root = await mkdtemp(path.join(tmpdir(), 'dsh wiring '))

@@ -16,7 +16,10 @@ Excluded: tray/background mode, updater, custom terminal, plugin marketplace, ex
 src/
 ├── main/
 │   ├── index.ts                 Electron entry and single-instance wiring
-│   ├── application.ts           Application lifecycle coordinator
+│   ├── lifecycle/
+│   │   ├── application.ts       Application lifecycle coordinator
+│   │   ├── electron-wiring.ts   Electron lifecycle adapter
+│   │   └── startup-failure.ts   User-facing startup failure mapping
 │   ├── paths.ts                 Harness Home, fallback workspace, and logs
 │   ├── host/
 │   │   ├── launcher.ts          Narrow HostLauncher interface
