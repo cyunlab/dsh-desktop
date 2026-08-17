@@ -34,6 +34,7 @@ export interface DesktopBrowserWindow {
   once(event: 'ready-to-show', listener: () => void): unknown
   on(event: 'closed', listener: () => void): unknown
   isDestroyed(): boolean
+  destroy(): void
   isMinimized(): boolean
   restore(): void
   show(): void
@@ -69,6 +70,7 @@ export class DesktopWindow {
   readonly #policy: NavigationPolicy
   readonly #observe: Required<DesktopWindowEventObserver>
   #window?: DesktopBrowserWindow
+  #opening?: Promise<void>
   #pendingFocus = false
 
   /** 以路径、事件及窄化的 BrowserWindow 工厂建立 Desktop 窗口所有权。 */
@@ -84,8 +86,19 @@ export class DesktopWindow {
   }
 
   /** 打开启动页；重复调用不会创建第二个仍存活的窗口。 */
-  async open(): Promise<void> {
-    if (this.#liveWindow()) return
+  open(): Promise<void> {
+    if (this.#opening) return this.#opening
+    if (this.#liveWindow()) return Promise.resolve()
+    let opening!: Promise<void>
+    opening = this.#createAndLoad().finally(() => {
+      if (this.#opening === opening) this.#opening = undefined
+    })
+    this.#opening = opening
+    return opening
+  }
+
+  /** 创建窗口并加载启动页，失败时销毁并释放当前所有权。 */
+  async #createAndLoad(): Promise<void> {
     const window = this.options.createBrowserWindow({
       width: 1100,
       height: 760,
@@ -103,7 +116,15 @@ export class DesktopWindow {
     })
     this.#window = window
     this.#attach(window)
-    await window.loadFile(this.options.startupPath)
+    try {
+      await window.loadFile(this.options.startupPath)
+    } catch (error) {
+      if (this.#window === window) this.#window = undefined
+      try {
+        if (!window.isDestroyed()) window.destroy()
+      } catch { /* 清理失败不能覆盖启动页加载错误。 */ }
+      throw error
+    }
   }
 
   /** 请求把当前窗口恢复、显示并聚焦；窗口未创建时保留请求。 */

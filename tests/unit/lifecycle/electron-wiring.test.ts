@@ -46,6 +46,19 @@ describe('Electron application wiring', () => {
     await vi.waitFor(() => expect(lifecycle.snapshot.state).toBe('failed'))
   })
 
+  it('contains a rejection while reporting Host navigation failure', async () => {
+    const lifecycle = new ApplicationLifecycle({
+      launch: vi.fn(async () => ({ origin: 'http://127.0.0.1:45678', dispose: vi.fn(async () => undefined) }))
+    }, await fixturePaths())
+    const report = vi.spyOn(lifecycle, 'reportHostNavigationFailure').mockRejectedValue(new Error('report failed'))
+    const window = { publishSnapshot: vi.fn(), showHost: vi.fn(async () => { throw new Error('navigation failed') }) }
+    wireLifecycleToWindow(lifecycle, window)
+
+    await lifecycle.start()
+    await vi.waitFor(() => expect(report).toHaveBeenCalledOnce())
+    await new Promise(resolve => setTimeout(resolve, 0))
+  })
+
   it('stops the listener before the final-window quit completes', async () => {
     class FakeApp extends EventEmitter {
       quitCalls = 0

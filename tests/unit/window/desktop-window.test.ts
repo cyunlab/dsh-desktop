@@ -19,7 +19,7 @@ function fakeWindow(minimized = false): DesktopBrowserWindow & {
   return {
     once: vi.fn((event: 'ready-to-show', listener: () => void) => { windowListeners.set(event, listener) }),
     on: vi.fn((event: 'closed', listener: () => void) => { windowListeners.set(event, listener) }),
-    isDestroyed: vi.fn(() => false), isMinimized: vi.fn(() => minimized), restore: vi.fn(), show: vi.fn(), focus: vi.fn(),
+    isDestroyed: vi.fn(() => false), destroy: vi.fn(), isMinimized: vi.fn(() => minimized), restore: vi.fn(), show: vi.fn(), focus: vi.fn(),
     loadFile: vi.fn(async () => undefined), loadURL: vi.fn(async () => undefined), webContents,
     emitWindow: event => windowListeners.get(event)?.(),
     emitContents: (event, target = '') => {
@@ -51,6 +51,29 @@ describe('DesktopWindow', () => {
     expect(createBrowserWindow.mock.calls[0][0]).toMatchObject({ show: false, webPreferences: { preload: '/desktop/preload.cjs', nodeIntegration: false, contextIsolation: true, sandbox: true } })
     expect(window.loadFile).toHaveBeenCalledWith('/desktop/startup.html')
     window.emitWindow('ready-to-show'); expect(window.show).toHaveBeenCalledOnce()
+  })
+
+  it('shares concurrent opening and retries with a new window after startup load failure', async () => {
+    const first = fakeWindow(); const second = fakeWindow(); const failure = new Error('startup failed')
+    let rejectLoad!: (error: Error) => void
+    vi.mocked(first.loadFile).mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectLoad = reject }))
+    const { desktop, createBrowserWindow } = fixture([first, second])
+    const one = desktop.open(); const two = desktop.open()
+    expect(two).toBe(one)
+    expect(createBrowserWindow).toHaveBeenCalledOnce()
+    rejectLoad(failure)
+    await expect(one).rejects.toBe(failure); await expect(two).rejects.toBe(failure)
+    expect(first.destroy).toHaveBeenCalledOnce()
+    await desktop.open(); expect(createBrowserWindow).toHaveBeenCalledTimes(2); expect(second.loadFile).toHaveBeenCalledOnce()
+  })
+
+  it('does not let a window closed during opening clear its later replacement', async () => {
+    const first = fakeWindow(); const second = fakeWindow(); let finishLoad!: () => void
+    vi.mocked(first.loadFile).mockImplementationOnce(() => new Promise(resolve => { finishLoad = () => resolve(undefined) }))
+    const { desktop } = fixture([first, second])
+    const opening = desktop.open(); first.emitWindow('closed'); finishLoad(); await opening; await desktop.open()
+    first.emitWindow('closed'); desktop.publishSnapshot({ state: 'idle', message: 'x' })
+    expect(second.webContents.send).toHaveBeenCalledOnce()
   })
 
   it('recreates after close or destruction without clearing a replacement', async () => {

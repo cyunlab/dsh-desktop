@@ -15,7 +15,9 @@ export function wireLifecycleToWindow(
   return lifecycle.subscribe(snapshot => {
     desktopWindow.publishSnapshot(snapshot)
     if (snapshot.state !== 'ready' || !snapshot.origin) return
-    void desktopWindow.showHost(snapshot.origin).catch(error => { void lifecycle.reportHostNavigationFailure(error) })
+    void desktopWindow.showHost(snapshot.origin)
+      .catch(error => lifecycle.reportHostNavigationFailure(error))
+      .catch(() => undefined)
   })
 }
 
