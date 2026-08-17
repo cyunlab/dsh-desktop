@@ -60,6 +60,8 @@ test('moves from the packaged startup page to the Web Client', async () => {
   const desktop = await launchDesktop()
   try {
     await waitForWebClient(desktop.page)
+    await expect(desktop.page.getByRole('button', { name: /Settings|设置/ })).toBeVisible({ timeout: 30_000 })
+    await expect(desktop.page.getByText('Failed to load plugins')).toHaveCount(0)
     await expect.poll(async () => {
       const names = await eventNames(desktop.events)
       const startup = names.indexOf('startup-page-loaded')
