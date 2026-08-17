@@ -128,5 +128,13 @@ async function loadHarnessModules(): Promise<HarnessModules> {
 }
 
 function resolvePublishedManifest(specifier: string): string {
-  return fileURLToPath(import.meta.resolve(specifier))
+  return resolveRuntimeManifestPath(import.meta.resolve(specifier))
+}
+
+// 将 Electron ASAR 中的逻辑模块路径映射到实际解包的运行时目录。
+export function resolveRuntimeManifestPath(resolvedUrl: string): string {
+  const manifestPath = fileURLToPath(resolvedUrl)
+  const archiveSegment = `${path.sep}app.asar${path.sep}`
+  if (!manifestPath.includes(archiveSegment)) return manifestPath
+  return manifestPath.replace(archiveSegment, `${path.sep}app.asar.unpacked${path.sep}`)
 }

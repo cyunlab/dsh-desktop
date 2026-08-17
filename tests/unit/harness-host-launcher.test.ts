@@ -2,8 +2,25 @@ import { mkdirSync } from 'node:fs'
 import { mkdir, mkdtemp, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
-import { HarnessHostLauncher } from '../../src/main/harness-host-launcher.js'
+import { HarnessHostLauncher, resolveRuntimeManifestPath } from '../../src/main/harness-host-launcher.js'
+
+describe('packaged Harness install anchor', () => {
+  it('maps an ASAR manifest URL to the unpacked runtime tree', () => {
+    const root = path.parse(process.cwd()).root
+    const archiveManifest = path.join(
+      root, 'Applications', 'deepseek-harness-desktop.app', 'Contents', 'Resources',
+      'app.asar', 'node_modules', '@deepseek-ai', 'dsh', 'package.json'
+    )
+    const unpackedManifest = path.join(
+      root, 'Applications', 'deepseek-harness-desktop.app', 'Contents', 'Resources',
+      'app.asar.unpacked', 'node_modules', '@deepseek-ai', 'dsh', 'package.json'
+    )
+
+    expect(resolveRuntimeManifestPath(pathToFileURL(archiveManifest).href)).toBe(unpackedManifest)
+  })
+})
 
 describe('Harness Host launcher', () => {
   it('sets process paths before loading Harness, composes official bundles, and restores on dispose', async () => {
