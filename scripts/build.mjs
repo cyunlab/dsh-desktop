@@ -1,8 +1,12 @@
 import { cp, mkdir, readFile, readdir, rm } from 'node:fs/promises'
 import { build } from 'esbuild'
+import sharp from 'sharp'
 
 const e2e = process.argv.slice(2).includes('--e2e')
 const define = { __DSH_E2E__: JSON.stringify(e2e) }
+const desktopLogoFileName = 'dsh-desktop-logo.svg'
+const desktopLogoSource = `assets/${desktopLogoFileName}`
+const desktopLogoRuntimePath = `dist/assets/${desktopLogoFileName.replace(/\.svg$/, '.png')}`
 const e2eObserver = {
   name: 'e2e-observer-build-variant',
   setup(builder) {
@@ -30,9 +34,12 @@ if (!e2e) {
   }
 }
 await mkdir('dist/startup', { recursive: true })
+await mkdir('dist/assets', { recursive: true })
 await Promise.all([
   cp('src/startup/index.html', 'dist/startup/index.html'),
-  cp('src/startup/index.css', 'dist/startup/index.css')
+  cp('src/startup/index.css', 'dist/startup/index.css'),
+  cp(desktopLogoSource, `dist/assets/${desktopLogoFileName}`),
+  sharp(desktopLogoSource).resize(1024, 1024).png().toFile(desktopLogoRuntimePath)
 ])
 
 async function mainArtifacts(directory) {

@@ -18,6 +18,14 @@ The in-process DeepSeek Harness Cordis runtime that exposes the loopback HTTP/AP
 
 The upstream browser UI served by the Host. It owns the normal product experience, including Workspace management; Desktop does not fork or recreate it.
 
+### Web Client readiness
+
+The condition in which the Web Client app shell and its required core services have activated and the normal product surface can render. Host HTTP availability alone does not establish Web Client readiness.
+
+### Web Client startup observer
+
+The Desktop-owned, read-only observer that reports Web Client readiness or activation failure across the renderer-to-main boundary. It does not modify the Web Client or expose Desktop capabilities to it.
+
 ### Web composition
 
 The ordered upstream profile bundles `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app`, plus only the launcher/runtime packages needed to boot them. The bundles transitively supply the standard Host and Client plugin roster.
@@ -38,6 +46,14 @@ The deterministic empty Desktop-owned directory used as the Host process working
 
 The packaged, sandboxed Desktop renderer shown while the Host starts or when startup fails. It is not the Web Client and exposes only the narrow lifecycle/diagnostic preload API.
 
+### Startup recovery cycle
+
+A bounded recovery attempt that first reloads a failed Web Client while preserving its healthy Host, then restarts the Host if client activation fails again. A later user-requested retry begins a new cycle.
+
+### Prolonged startup
+
+A non-terminal state in which the Web Client has reported neither readiness nor activation failure after the normal waiting period. Desktop continues waiting while offering the user recovery actions; elapsed time alone does not make startup fail.
+
 ### Runtime closure
 
 The complete set of published JavaScript, bundle patches, frontend assets, native modules, and peer/runtime packages required for the pinned Web composition to boot from a packaged application without a system Node or Harness installation.
@@ -45,3 +61,7 @@ The complete set of published JavaScript, bundle patches, frontend assets, nativ
 ### Development artifact
 
 An unsigned NSIS, DMG, or AppImage produced for this milestone. It is labelled as unsigned and is not automatically published as a public release.
+
+### Architecture mismatch
+
+The condition in which a Desktop artifact runs through processor translation although a native artifact is available for that machine. Desktop blocks normal startup by default, while permitting an explicit one-run override for developer validation.

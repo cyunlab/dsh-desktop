@@ -16,6 +16,8 @@ import { createStartupActions } from './startup-actions.js'
 import { FakeHostLauncher } from './fake-host-launcher.js'
 import { recordE2EEvent, shouldSuppressExternalOpen } from './e2e-observer.js'
 
+const desktopLogoFileName = 'dsh-desktop-logo.png'
+
 app.setName('DeepSeek Harness Desktop')
 if (__DSH_E2E__ && process.env.DSH_DESKTOP_TEST_USER_DATA) app.setPath('userData', process.env.DSH_DESKTOP_TEST_USER_DATA)
 assertSupportedNodeVersion(process.versions.node)
@@ -55,7 +57,9 @@ async function run(): Promise<void> {
 
   const distRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
   const startupPath = path.join(distRoot, 'startup', 'index.html')
+  const desktopLogoPath = path.join(distRoot, 'assets', desktopLogoFileName)
   const startupUrl = pathToFileURL(startupPath).href
+  if (process.platform === 'darwin') app.dock?.setIcon(desktopLogoPath)
   const paths = selectDesktopPaths(app)
   const diagnosticContext: DiagnosticContext = {
     appVersion: app.getVersion(),
@@ -79,6 +83,7 @@ async function run(): Promise<void> {
       minWidth: 720,
       minHeight: 520,
       title: 'DeepSeek Harness Desktop',
+      icon: desktopLogoPath,
       show: false,
       webPreferences: {
         preload: path.join(distRoot, 'preload', 'startup.cjs'),

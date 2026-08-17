@@ -106,6 +106,7 @@ test('shows startup failure and retries in the same window', async () => {
   const desktop = await launchDesktop({ fakeHost: true, failures: 1 })
   try {
     await expect(desktop.page.getByRole('heading', { name: 'Startup failed' })).toBeVisible()
+    await expect(desktop.page.locator('img.mark')).toHaveAttribute('src', '../assets/dsh-desktop-logo.svg')
     await desktop.page.getByRole('button', { name: 'Retry' }).click()
     await expect(desktop.page.getByRole('heading', { name: 'DeepSeek Harness Web Client' })).toBeVisible()
     expect(desktop.app.windows()).toHaveLength(1)

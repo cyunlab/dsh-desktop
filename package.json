@@ -32,6 +32,7 @@
     "electron": "43.4.0",
     "electron-builder": "26.15.3",
     "esbuild": "0.27.3",
+    "sharp": "0.35.3",
     "typescript": "5.9.3",
     "vitest": "4.0.18"
   },
@@ -100,6 +101,7 @@
     "artifactName": "deepseek-harness-desktop-${version}-${os}-${arch}.${ext}",
     "asar": true,
     "asarUnpack": ["node_modules/**/*"],
+    "icon": "assets/dsh-desktop-logo.svg",
     "files": ["dist/**/*", "package.json"],
     "directories": { "output": "release" },
     "afterPack": "scripts/after-pack.mjs",
