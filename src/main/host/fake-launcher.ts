@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http'
-import type { HostLauncher, HostHandle } from './host-launcher.js'
+import type { HostLauncher, HostHandle } from './launcher.js'
 
 const page = `<!doctype html><html><head><meta charset="utf-8"><title>DeepSeek Harness</title></head><body><main><h1>DeepSeek Harness Web Client</h1><p>Fake Host launcher active. Real Harness integration is implemented separately.</p></main></body></html>`
 
