@@ -1,9 +1,9 @@
-import type { DesktopPaths } from './paths.js'
-import { prepareDesktopPaths } from './paths.js'
-import type { HostHandle, HostLauncher } from './host/launcher.js'
-import type { LifecycleSnapshot, LifecycleState } from '../shared/startup-contract.js'
-import { userFacingStartupError } from './user-facing-error.js'
-import { NullDiagnostics, type DiagnosticsSink } from './diagnostics.js'
+import type { DesktopPaths } from '../paths.js'
+import { prepareDesktopPaths } from '../paths.js'
+import type { HostHandle, HostLauncher } from '../host/launcher.js'
+import type { LifecycleSnapshot, LifecycleState } from '../../shared/startup-contract.js'
+import { userFacingStartupError } from './startup-failure.js'
+import { NullDiagnostics, type DiagnosticsSink } from '../diagnostics.js'
 
 type SnapshotListener = (snapshot: LifecycleSnapshot) => void
 

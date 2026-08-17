@@ -1,6 +1,6 @@
 import type { ApplicationLifecycle } from './application.js'
-import type { NavigationPolicy } from './navigation-policy.js'
-import { navigateToHostSafely } from './window-effects.js'
+import type { NavigationPolicy } from '../navigation-policy.js'
+import { navigateToHostSafely } from '../window-effects.js'
 
 export interface LifecycleWindow {
   isDestroyed(): boolean
