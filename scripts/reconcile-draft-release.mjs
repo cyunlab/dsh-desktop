@@ -49,7 +49,7 @@ async function main() {
   const result = await reconcileDraftRelease({
     repository: process.env.GITHUB_REPOSITORY,
     tag,
-    title: `DeepSeek Harness Desktop ${tag} (unsigned development build)`,
+    title: `DeepSeek Harness Desktop ${tag}`,
     notesFile,
     artifacts
   })

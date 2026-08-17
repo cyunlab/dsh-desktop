@@ -56,7 +56,7 @@ describe('native build workflow contract', () => {
     expect(workflow).toMatch(/build:[\s\S]*needs: validate-release-version/)
   })
 
-  it('labels uploads and release notes as unsigned development builds', () => {
+  it('uses release-ready artifact and workflow labels', () => {
     for (const artifact of [
       'dsh-desktop-windows-x64',
       'dsh-desktop-macos-arm64',
@@ -66,9 +66,8 @@ describe('native build workflow contract', () => {
       expect(workflow).toContain(`artifact: ${artifact}`)
     }
     expect(workflow).toContain('pattern: dsh-desktop-*')
-    expect(workflow).not.toContain('artifact: unsigned-dev-')
-    expect(workflow).not.toContain('pattern: unsigned-dev-*')
-    expect(workflow).toContain('not signed, notarized, or suitable for a public production release')
+    expect(workflow.toLowerCase()).not.toContain('unsigned')
+    expect(workflow.toLowerCase()).not.toContain('development')
     expect(workflow).toContain('SmartScreen')
     expect(workflow).toContain('Gatekeeper')
     expect(workflow).toContain('chmod +x')
