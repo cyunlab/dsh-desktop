@@ -1,15 +1,13 @@
 import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import path from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 import { inspect } from 'node:util'
 import { ApplicationLifecycle } from './lifecycle/application.js'
 import { wireFinalWindowShutdown, wireLifecycleToWindow } from './lifecycle/electron-wiring.js'
 import { HarnessHostLauncher } from './host/harness-launcher.js'
-import { NavigationPolicy } from './navigation-policy.js'
 import { prepareDesktopPaths, selectDesktopPaths } from './paths.js'
-import { SingleInstanceFocusCoordinator } from './single-instance-focus.js'
 import { assertSupportedNodeVersion } from './version-guard.js'
-import { openExternalSafely } from './window-effects.js'
+import { DesktopWindow } from './window/desktop-window.js'
 import { startupChannels } from '../shared/startup-contract.js'
 import { RollingDiagnostics, type DiagnosticContext } from './diagnostics.js'
 import { createStartupActions } from './startup-actions.js'
@@ -21,7 +19,8 @@ const desktopLogoFileName = 'dsh-desktop-logo.png'
 app.setName('DeepSeek Harness Desktop')
 if (__DSH_E2E__ && process.env.DSH_DESKTOP_TEST_USER_DATA) app.setPath('userData', process.env.DSH_DESKTOP_TEST_USER_DATA)
 assertSupportedNodeVersion(process.versions.node)
-const focusCoordinator = new SingleInstanceFocusCoordinator(__DSH_E2E__ ? action => recordE2EEvent(`window-${action}`) : undefined)
+let desktopWindow: DesktopWindow | undefined
+let pendingSecondInstanceFocus = false
 if (process.env.DSH_PACKAGED_HOST_PROBE === '1') {
   void runPackagedHostProbe()
 } else if (!app.requestSingleInstanceLock()) {
@@ -29,11 +28,13 @@ if (process.env.DSH_PACKAGED_HOST_PROBE === '1') {
 } else {
   app.on('second-instance', () => {
     if (__DSH_E2E__) recordE2EEvent('second-instance')
-    focusCoordinator.requestFocus()
+    if (desktopWindow) desktopWindow.requestFocus()
+    else pendingSecondInstanceFocus = true
   })
   void run()
 }
 
+/** 启动打包产物 Host 探针并以进程状态码报告结果。 */
 async function runPackagedHostProbe(): Promise<void> {
   try {
     await app.whenReady()
@@ -52,13 +53,13 @@ async function runPackagedHostProbe(): Promise<void> {
   }
 }
 
+/** 在 Electron 就绪后组合 Desktop、Host 生命周期与 IPC 服务。 */
 async function run(): Promise<void> {
   await app.whenReady()
 
   const distRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
   const startupPath = path.join(distRoot, 'startup', 'index.html')
   const desktopLogoPath = path.join(distRoot, 'assets', desktopLogoFileName)
-  const startupUrl = pathToFileURL(startupPath).href
   if (process.platform === 'darwin') app.dock?.setIcon(desktopLogoPath)
   const paths = selectDesktopPaths(app)
   const diagnosticContext: DiagnosticContext = {
@@ -73,54 +74,31 @@ async function run(): Promise<void> {
     ? new FakeHostLauncher(Number.parseInt(process.env.DSH_DESKTOP_TEST_FAILURES ?? '0', 10) || 0)
     : new HarnessHostLauncher()
   const lifecycle = new ApplicationLifecycle(launcher, paths, 5_000, diagnostics)
-  const policy = new NavigationPolicy(startupUrl)
-  let window: BrowserWindow | null = null
-
-  const createWindow = (): BrowserWindow => {
-    const created = new BrowserWindow({
-      width: 1100,
-      height: 760,
-      minWidth: 720,
-      minHeight: 520,
-      title: 'DeepSeek Harness Desktop',
-      icon: desktopLogoPath,
-      show: false,
-      webPreferences: {
-        preload: path.join(distRoot, 'preload', 'startup.cjs'),
-        nodeIntegration: false,
-        contextIsolation: true,
-        sandbox: true
+  desktopWindow = new DesktopWindow({
+    startupPath,
+    preloadPath: path.join(distRoot, 'preload', 'startup.cjs'),
+    iconPath: desktopLogoPath,
+    snapshotChannel: startupChannels.snapshot,
+    diagnostics,
+    createBrowserWindow: options => new BrowserWindow(options),
+    openExternal: async target => {
+      if (__DSH_E2E__) {
+        recordE2EEvent('external-link')
+        if (shouldSuppressExternalOpen()) return
       }
-    })
-    created.once('ready-to-show', () => created.show())
-    created.webContents.on('did-finish-load', () => {
-      if (!__DSH_E2E__) return
-      recordE2EEvent(created.webContents.getURL().startsWith('file:') ? 'startup-page-loaded' : 'web-client-loaded')
-    })
-    created.webContents.on('will-navigate', (event, target) => {
-      const decision = policy.decide(target)
-      if (decision === 'allow') return
-      event.preventDefault()
-      diagnostics.navigationRejected(target, decision)
-      if (decision === 'external') void openExternal(target)
-    })
-    created.webContents.setWindowOpenHandler(({ url }) => {
-      const decision = policy.decide(url)
-      diagnostics.navigationRejected(url, decision)
-      if (decision === 'external') void openExternal(url)
-      return { action: 'deny' }
-    })
-    created.on('closed', () => {
-      focusCoordinator.detach(created)
-      window = null
-    })
-    focusCoordinator.attach(created)
-    return created
-  }
-
-  window = createWindow()
-  await window.loadFile(startupPath)
-  wireLifecycleToWindow(lifecycle, () => window, startupPath, startupChannels.snapshot, policy)
+      await shell.openExternal(target)
+    },
+    observe: __DSH_E2E__ ? {
+      restored: () => recordE2EEvent('window-restored'),
+      shown: () => recordE2EEvent('window-shown'),
+      focused: () => recordE2EEvent('window-focused'),
+      startupPageLoaded: () => recordE2EEvent('startup-page-loaded'),
+      webClientLoaded: () => recordE2EEvent('web-client-loaded')
+    } : undefined
+  })
+  if (pendingSecondInstanceFocus) desktopWindow.requestFocus()
+  await desktopWindow.open()
+  wireLifecycleToWindow(lifecycle, desktopWindow)
 
   ipcMain.handle(startupChannels.snapshot, () => lifecycle.snapshot)
   ipcMain.handle(startupChannels.retry, () => lifecycle.retry())
@@ -137,12 +115,4 @@ async function run(): Promise<void> {
   wireFinalWindowShutdown(app, lifecycle)
 
   await lifecycle.start()
-
-  function openExternal(target: string): Promise<void> {
-    if (__DSH_E2E__) {
-      recordE2EEvent('external-link')
-      if (shouldSuppressExternalOpen()) return Promise.resolve()
-    }
-    return openExternalSafely(url => shell.openExternal(url), target)
-  }
 }

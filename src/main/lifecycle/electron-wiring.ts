@@ -1,32 +1,21 @@
 import type { ApplicationLifecycle } from './application.js'
-import type { NavigationPolicy } from '../navigation-policy.js'
-import { navigateToHostSafely } from '../window-effects.js'
+import type { LifecycleSnapshot } from '../../shared/startup-contract.js'
 
-export interface LifecycleWindow {
-  isDestroyed(): boolean
-  readonly webContents: { send(channel: string, snapshot: unknown): void }
-  loadURL(url: string): Promise<unknown>
-  loadFile(path: string): Promise<unknown>
+/** 生命周期向 Desktop 窗口发送状态与 Host 导航请求的最小接口。 */
+export interface LifecycleDesktopWindow {
+  publishSnapshot(snapshot: LifecycleSnapshot): void
+  showHost(origin: string): Promise<void>
 }
 
+/** 将生命周期状态变化连接到已封装的 Desktop 窗口。 */
 export function wireLifecycleToWindow(
   lifecycle: ApplicationLifecycle,
-  getWindow: () => LifecycleWindow | null,
-  startupPath: string,
-  snapshotChannel: string,
-  policy: NavigationPolicy
+  desktopWindow: LifecycleDesktopWindow
 ): () => void {
   return lifecycle.subscribe(snapshot => {
-    const window = getWindow()
-    if (!window || window.isDestroyed()) return
-    window.webContents.send(snapshotChannel, snapshot)
+    desktopWindow.publishSnapshot(snapshot)
     if (snapshot.state !== 'ready' || !snapshot.origin) return
-    policy.setHostOrigin(snapshot.origin)
-    void navigateToHostSafely(
-      () => window.loadURL(snapshot.origin!),
-      () => window.loadFile(startupPath),
-      error => { void lifecycle.reportHostNavigationFailure(error) }
-    )
+    void desktopWindow.showHost(snapshot.origin).catch(error => { void lifecycle.reportHostNavigationFailure(error) })
   })
 }
 
@@ -37,6 +26,7 @@ export interface QuitApplication {
   quit(): void
 }
 
+/** 在最后一个窗口关闭时有序停止 Host 并落盘诊断信息。 */
 export function wireFinalWindowShutdown(app: QuitApplication, lifecycle: ApplicationLifecycle, diagnosticsFlushTimeoutMs = 1_000): void {
   let quitting = false
   app.on('window-all-closed', () => { if (!quitting) app.quit() })

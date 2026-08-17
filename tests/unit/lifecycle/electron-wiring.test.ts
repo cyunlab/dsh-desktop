@@ -6,7 +6,6 @@ import { describe, expect, it, vi } from 'vitest'
 import { ApplicationLifecycle } from '../../../src/main/lifecycle/application.js'
 import { wireFinalWindowShutdown, wireLifecycleToWindow, type QuitEvent } from '../../../src/main/lifecycle/electron-wiring.js'
 import { FakeHostLauncher } from '../../../src/main/host/fake-launcher.js'
-import { NavigationPolicy } from '../../../src/main/navigation-policy.js'
 import type { DiagnosticsSink } from '../../../src/main/diagnostics.js'
 
 async function fixturePaths() {
@@ -24,20 +23,27 @@ describe('Electron application wiring', () => {
     const lifecycle = new ApplicationLifecycle({
       launch: vi.fn(async () => ({ origin: 'http://127.0.0.1:45678', dispose }))
     }, await fixturePaths())
-    const loadURL = vi.fn(async () => undefined)
+    const showHost = vi.fn(async () => undefined)
     const window = {
-      isDestroyed: vi.fn(() => false),
-      webContents: { send: vi.fn() },
-      loadURL,
-      loadFile: vi.fn(async () => undefined)
+      publishSnapshot: vi.fn(),
+      showHost
     }
-    const policy = new NavigationPolicy('file:///desktop/startup.html')
-    wireLifecycleToWindow(lifecycle, () => window, '/desktop/startup.html', 'startup:snapshot', policy)
+    wireLifecycleToWindow(lifecycle, window)
 
     await lifecycle.start()
-    await vi.waitFor(() => expect(loadURL).toHaveBeenCalledWith('http://127.0.0.1:45678'))
-    expect(policy.decide('http://127.0.0.1:45678/workspaces')).toBe('allow')
+    await vi.waitFor(() => expect(showHost).toHaveBeenCalledWith('http://127.0.0.1:45678'))
     await lifecycle.stop()
+  })
+
+  it('reports a rejected Desktop Host navigation to the lifecycle', async () => {
+    const lifecycle = new ApplicationLifecycle({
+      launch: vi.fn(async () => ({ origin: 'http://127.0.0.1:45678', dispose: vi.fn(async () => undefined) }))
+    }, await fixturePaths())
+    const window = { publishSnapshot: vi.fn(), showHost: vi.fn(async () => { throw new Error('navigation failed') }) }
+    wireLifecycleToWindow(lifecycle, window)
+
+    await lifecycle.start()
+    await vi.waitFor(() => expect(lifecycle.snapshot.state).toBe('failed'))
   })
 
   it('stops the listener before the final-window quit completes', async () => {

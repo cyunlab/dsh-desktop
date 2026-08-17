@@ -10,6 +10,10 @@ DeepSeek Harness Desktop is a native application shell that owns one local Harne
 
 The versioned Electron application: main process, preload bridge, local startup page, packaging, and lifecycle automation. Avoid using this term for the upstream Web Client alone.
 
+### Desktop window
+
+The single controlled window owned by Desktop. It shows the Startup page until the Host is ready, then shows the Web Client while enforcing Desktop navigation, external-link, popup, and focus rules. The Desktop window is not synonymous with Electron's `BrowserWindow`, which is an implementation detail.
+
 ### Host
 
 The in-process DeepSeek Harness Cordis runtime that exposes the loopback HTTP/API surface. One Desktop instance owns exactly one Host in the first milestone.
