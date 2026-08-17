@@ -61,8 +61,8 @@ describe('electron-builder target context', () => {
     )).toBe(false)
   })
 
-  it('statically verifies but skips executing a non-native packaged target', async () => {
-    const calls: string[][] = []
+  it('statically verifies, skips a non-native probe, and seals the macOS bundle', async () => {
+    const calls: Array<{ command: string, args: string[] }> = []
     const messages: string[] = []
     await runAfterPack({
       appOutDir: '/packaged/x64',
@@ -72,12 +72,26 @@ describe('electron-builder target context', () => {
     }, {
       host: { platform: 'darwin', arch: 'arm64' },
       prepareAssets: async () => {},
-      runCommand: async (_command, args) => { calls.push(args); return 'closure verified' },
+      runCommand: async (command, args) => { calls.push({ command, args }); return 'closure verified' },
       log: message => messages.push(message)
     })
 
-    expect(calls).toHaveLength(1)
-    expect(calls[0]).toContain('x64')
+    expect(calls).toHaveLength(3)
+    expect(calls[0].args).toContain('x64')
+    expect(calls[1]).toEqual({
+      command: '/usr/bin/codesign',
+      args: [
+        '--force', '--deep', '--sign', '-', '--timestamp=none',
+        '/packaged/x64/DeepSeek Harness Desktop.app'
+      ]
+    })
+    expect(calls[2]).toEqual({
+      command: '/usr/bin/codesign',
+      args: [
+        '--verify', '--deep', '--strict', '--verbose=4',
+        '/packaged/x64/DeepSeek Harness Desktop.app'
+      ]
+    })
     expect(messages[0]).toContain('packaged Host probe skipped')
   })
 })

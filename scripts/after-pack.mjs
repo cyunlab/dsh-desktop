@@ -33,23 +33,35 @@ export async function runAfterPack(context, dependencies = {}) {
 
   if (!shouldRunPackagedProbe(target, host)) {
     log(`afterPack: static closure verified for ${target.platform}-${target.arch}; packaged Host probe skipped because runner is ${host.platform}-${host.arch}.`)
-    return
+  } else {
+    const probeData = await mkdtemp(path.join(tmpdir(), 'dsh-packaged-probe-'))
+    try {
+      const executable = packagedExecutable(context)
+      const output = await runCommand(executable, [
+        '--headless',
+        '--no-sandbox',
+        `--user-data-dir=${path.join(probeData, 'User Data')}`
+      ], { DSH_PACKAGED_HOST_PROBE: '1' }, 60_000)
+      if (!output.includes('"probe":"packaged-host-ready"')) {
+        throw new Error(`packaged Host probe did not report readiness:\n${output}`)
+      }
+    } finally {
+      await rm(probeData, { recursive: true, force: true })
+    }
   }
 
-  const probeData = await mkdtemp(path.join(tmpdir(), 'dsh-packaged-probe-'))
-  try {
-    const executable = packagedExecutable(context)
-    const output = await runCommand(executable, [
-      '--headless',
-      '--no-sandbox',
-      `--user-data-dir=${path.join(probeData, 'User Data')}`
-    ], { DSH_PACKAGED_HOST_PROBE: '1' }, 60_000)
-    if (!output.includes('"probe":"packaged-host-ready"')) {
-      throw new Error(`packaged Host probe did not report readiness:\n${output}`)
-    }
-  } finally {
-    await rm(probeData, { recursive: true, force: true })
-  }
+  if (target.platform === 'darwin') await sealMacBundle(context, runCommand)
+}
+
+// 为未配置 Developer ID 的开发构建创建完整的 bundle 级临时签名，避免残留的 linker signature 被 Gatekeeper 判为损坏。
+async function sealMacBundle(context, runCommand) {
+  const appBundle = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`)
+  await runCommand('/usr/bin/codesign', [
+    '--force', '--deep', '--sign', '-', '--timestamp=none', appBundle
+  ], {}, 60_000)
+  await runCommand('/usr/bin/codesign', [
+    '--verify', '--deep', '--strict', '--verbose=4', appBundle
+  ], {}, 60_000)
 }
 
 async function ensureExecutableModes(root, target) {
