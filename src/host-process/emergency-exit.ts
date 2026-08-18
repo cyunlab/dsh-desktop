@@ -38,7 +38,8 @@ export async function emergencyExitHostProcess(
       }
     } else {
       const killProcess = system.killProcess ?? process.kill
-      if (remaining(deadline) > 0) signalProcessGroup(pid, 'SIGTERM', killProcess)
+      // 即使 deadline 已耗尽，也必须至少尝试一次已验证的 group TERM。
+      signalProcessGroup(pid, 'SIGTERM', killProcess)
       if (remaining(deadline) > 0) signalProcessGroup(pid, 'SIGKILL', killProcess)
     }
   } catch {

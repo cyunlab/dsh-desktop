@@ -193,4 +193,52 @@ describe('Host child runtime', () => {
     expect(terminator.kill).toHaveBeenCalledWith('SIGKILL')
     expect(system.killProcess).toHaveBeenCalledWith(4321, 'SIGKILL')
   }, 5_000)
+
+  it('still attempts a safe POSIX group TERM when the disconnect deadline is exhausted', async () => {
+    const system = new FakeHostSystem()
+    system.platform = 'linux'
+    system.parentDisconnectTimeoutMs = 0
+    system.killProcess = vi.fn()
+    const dispose = vi.fn(() => new Promise<void>(() => {}))
+    await startHostProcess(runtime(dispose), system)
+
+    system.emit('disconnect')
+    await vi.waitFor(() => expect(system.exitCalls).toContain(1))
+    expect(system.killProcess).toHaveBeenCalledWith(-4321, 'SIGTERM')
+  }, 5_000)
+
+  it('waits for a pending boot and disposes a handle that arrives after disconnect', async () => {
+    const system = new FakeHostSystem()
+    system.parentDisconnectTimeoutMs = 100
+    let resolveBoot!: (handle: Awaited<ReturnType<HostProcessRuntime['bootHarnessHost']>>) => void
+    const boot = new Promise<Awaited<ReturnType<HostProcessRuntime['bootHarnessHost']>>>(resolve => { resolveBoot = resolve })
+    const dispose = vi.fn(async () => undefined)
+    const starting = startHostProcess({ bootHarnessHost: async () => boot }, system)
+
+    system.emit('disconnect')
+    await new Promise(resolve => setImmediate(resolve))
+    expect(system.exitCalls).toEqual([])
+    resolveBoot({ origin: 'http://127.0.0.1:43210', binding: { host: '127.0.0.1', port: 43210 }, dispose })
+    await starting
+
+    expect(dispose).toHaveBeenCalledOnce()
+    expect(system.exitCalls).toEqual([0])
+  })
+
+  it('uses emergency cleanup when boot never settles before disconnect deadline', async () => {
+    const system = new FakeHostSystem()
+    system.platform = 'linux'
+    system.parentDisconnectTimeoutMs = 20
+    system.killProcess = vi.fn()
+    let resolveBoot!: (handle: Awaited<ReturnType<HostProcessRuntime['bootHarnessHost']>>) => void
+    const boot = new Promise<Awaited<ReturnType<HostProcessRuntime['bootHarnessHost']>>>(resolve => { resolveBoot = resolve })
+    const starting = startHostProcess({ bootHarnessHost: async () => boot }, system)
+
+    system.emit('disconnect')
+    await vi.waitFor(() => expect(system.exitCalls).toContain(1))
+    expect(system.killProcess).toHaveBeenCalledWith(-4321, 'SIGTERM')
+
+    resolveBoot({ origin: 'http://127.0.0.1:43210', binding: { host: '127.0.0.1', port: 43210 }, dispose: vi.fn(async () => undefined) })
+    await starting
+  }, 5_000)
 })

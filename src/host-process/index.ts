@@ -18,6 +18,14 @@ export interface HostProcessRuntime {
   }>
 }
 
+/** 已创建 Host Handle 的最小 child-side 类型别名。 */
+type HostProcessHandle = Awaited<ReturnType<HostProcessRuntime['bootHarnessHost']>>
+
+/** 记录 boot 已完成或失败，供 parent disconnect 继续等待同一个异步尝试。 */
+type HostProcessBootOutcome =
+  | { readonly kind: 'fulfilled'; readonly handle: HostProcessHandle }
+  | { readonly kind: 'rejected'; readonly error: unknown }
+
 /** Host child 进程所需的最小 IPC/进程接口。 */
 export interface HostProcessSystem extends HostProcessEmergencySystem {
   readonly env: NodeJS.ProcessEnv
@@ -41,7 +49,8 @@ export async function startHostProcess(
   system: HostProcessSystem = process as unknown as HostProcessSystem
 ): Promise<void> {
   if (typeof system.send !== 'function') throw new Error('Host process IPC is unavailable')
-  let handle: Awaited<ReturnType<HostProcessRuntime['bootHarnessHost']>> | undefined
+  let handle: HostProcessHandle | undefined
+  let bootOutcome: Promise<HostProcessBootOutcome> | undefined
   let readySent = false
   let stopping: Promise<void> | undefined
   let disconnectedStopping: Promise<void> | undefined
@@ -102,6 +111,19 @@ export async function startHostProcess(
     disconnectedStopping = (async () => {
       const timeoutMs = system.parentDisconnectTimeoutMs ?? 2_000
       const deadline = disconnectedDeadline ??= Date.now() + Math.max(0, timeoutMs)
+      const boot = handle
+        ? { kind: 'fulfilled' as const, handle }
+        : await waitForBootWithDeadline(bootOutcome, deadline)
+      if (!boot) {
+        await emergencyExitHostProcess(system, remaining(deadline), deadline)
+        return
+      }
+      if (boot.kind === 'rejected') {
+        system.exitCode = 1
+        system.exit(1)
+        return
+      }
+      handle = boot.handle
       const disposed = await disposeWithDeadline(handle, deadline)
       if (!disposed) {
         await emergencyExitHostProcess(system, remaining(deadline), deadline)
@@ -129,18 +151,29 @@ export async function startHostProcess(
     if (command.type === 'stop') void shutdown(0)
   })
 
-  try {
-    // spawn 的 cwd/env 已在 child 创建时设定；这里首次动态加载真实 Harness。
-    handle = await runtime.bootHarnessHost({
+  // 先记录 boot promise，再开始 await，使 disconnect 能等待同一轮真实 boot。
+  bootOutcome = Promise.resolve()
+    .then(() => runtime.bootHarnessHost({
       harnessHome: system.env.DSH_HOME ?? '',
       defaultWorkingDirectory: system.cwd()
-    })
+    }))
+    .then(
+      created => {
+        handle = created
+        return { kind: 'fulfilled' as const, handle: created }
+      },
+      error => ({ kind: 'rejected' as const, error })
+    )
+
+  try {
+    // spawn 的 cwd/env 已在 child 创建时设定；这里首次动态加载真实 Harness。
+    const boot = await bootOutcome
+    if (boot === undefined) throw new Error('Host boot was not started')
+    if (boot.kind === 'rejected') throw boot.error
+    handle = boot.handle
     if (stopping || parentDisconnected) {
       if (parentDisconnected) {
-        const timeoutMs = system.parentDisconnectTimeoutMs ?? 2_000
-        const deadline = disconnectedDeadline ??= Date.now() + Math.max(0, timeoutMs)
-        const disposed = await disposeWithDeadline(handle, deadline)
-        if (!disposed) await emergencyExitHostProcess(system, remaining(deadline), deadline)
+        await disconnectedStopping
       } else {
         await handle.dispose().catch(() => undefined)
       }
@@ -150,6 +183,25 @@ export async function startHostProcess(
     readySent = true
   } catch (error) {
     await shutdown(1, { kind: 'startup-failed', error })
+  }
+}
+
+/** 在 disconnect 的绝对 deadline 内等待 boot outcome，超时返回 undefined。 */
+async function waitForBootWithDeadline(
+  boot: Promise<HostProcessBootOutcome> | undefined,
+  deadline: number
+): Promise<HostProcessBootOutcome | undefined> {
+  if (!boot) return undefined
+  const timeoutMs = Math.max(0, deadline - Date.now())
+  if (timeoutMs <= 0) return undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      boot,
+      new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), timeoutMs) })
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
   }
 }
 
