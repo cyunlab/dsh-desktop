@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
+import type { WindowsJobOwner } from './windows-job.js'
 
 /** 可替换的进程树清理依赖，便于在不触发真实 taskkill 的情况下测试。 */
 export interface ProcessTreeTerminationOptions {
@@ -6,6 +7,8 @@ export interface ProcessTreeTerminationOptions {
   readonly spawnProcess?: (command: string, args: string[], options: SpawnOptions) => ChildProcess
   readonly killProcess?: (pid: number, signal?: NodeJS.Signals | number) => void
   readonly useProcessGroup?: boolean
+  /** Windows Job Object owner；关闭失败时 taskkill 仍作为有界 fallback。 */
+  readonly windowsJob?: WindowsJobOwner
   /** 调用方的绝对截止时间；存在时所有阶段共享这一预算。 */
   readonly deadline?: number
 }
@@ -30,7 +33,7 @@ export async function terminateChildProcess(
   }
 
   if (platform === 'win32') {
-    await terminateWindowsTree(child, pid, deadline, options.spawnProcess ?? spawn)
+    await terminateWindowsTree(child, pid, deadline, options.spawnProcess ?? spawn, options.windowsJob)
     return
   }
 
@@ -55,8 +58,19 @@ async function terminateWindowsTree(
   child: ChildProcess,
   pid: number,
   deadline: number,
-  spawnProcess: (command: string, args: string[], options: SpawnOptions) => ChildProcess
+  spawnProcess: (command: string, args: string[], options: SpawnOptions) => ChildProcess,
+  windowsJob?: WindowsJobOwner
 ): Promise<void> {
+  let jobClosed = false
+  if (windowsJob) {
+    try {
+      windowsJob.close()
+      jobClosed = true
+    } catch {
+      // Job close failure falls through to taskkill instead of leaving an unowned tree.
+    }
+    if (jobClosed && await waitForExit(child, remaining(deadline))) return
+  }
   const terminator = spawnProcess('taskkill.exe', ['/pid', String(pid), '/T', '/F'], {
     windowsHide: true,
     shell: false,

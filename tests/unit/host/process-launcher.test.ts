@@ -1,5 +1,6 @@
 import { mkdir, mkdtemp, realpath } from 'node:fs/promises'
 import { spawn as spawnChild, type ChildProcess, type SpawnOptions } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -175,5 +176,87 @@ describe('ProcessHostLauncher', () => {
     await expect(handle.dispose()).resolves.toBeUndefined()
     expect(Date.now() - started).toBeLessThan(500)
     await vi.waitFor(() => expect(attempt.getChild()?.exitCode ?? attempt.getChild()?.signalCode ?? null).not.toBeNull())
+  }, 5_000)
+
+  it('rejects and removes listeners when child emits error before ready', async () => {
+    /** 模拟尚未启动完成、可发出 error/exit 的 ChildProcess seam。 */
+    class ErroringChild extends EventEmitter {
+      pid = undefined
+      exitCode: number | null = null
+      signalCode: NodeJS.Signals | null = null
+      connected = false
+      stdout = null
+      stderr = null
+      kill = vi.fn(() => {
+        this.exitCode = 1
+        this.emit('exit', 1, null)
+        return true
+      })
+    }
+    const child = new ErroringChild()
+    const paths = await fixturePaths()
+    const launcher = new ProcessHostLauncher({
+      platform: 'darwin',
+      hostEntry: '/tmp/host-entry.js',
+      processTree: { platform: 'darwin' },
+      spawnProcess: () => {
+        queueMicrotask(() => child.emit('error', new Error('child spawn error')))
+        return child as unknown as ChildProcess
+      }
+    })
+
+    await expect(launcher.launch(paths)).rejects.toThrow('child spawn error')
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+    expect(child.listenerCount('message')).toBe(0)
+    expect(child.listenerCount('exit')).toBe(0)
+    expect(child.listenerCount('error')).toBe(0)
+  })
+
+  it('fails closed and taskkills when Windows Job Object setup fails', async () => {
+    /** 模拟 Windows 上尚未退出的 child，并让终止动作产生 exit。 */
+    class UnownedChild extends EventEmitter {
+      pid = 4321
+      exitCode: number | null = null
+      signalCode: NodeJS.Signals | null = null
+      connected = false
+      stdout = null
+      stderr = null
+      kill = vi.fn(() => {
+        this.exitCode = 1
+        this.emit('exit', 1, null)
+        return true
+      })
+    }
+    const child = new UnownedChild()
+    const terminator = new UnownedChild()
+    terminator.pid = 9999
+    const spawnProcess = vi.fn((command: string) => {
+      if (command === 'taskkill.exe') {
+        queueMicrotask(() => terminator.emit('exit', 0, null))
+        return terminator as unknown as ChildProcess
+      }
+      return child as unknown as ChildProcess
+    })
+    const paths = await fixturePaths()
+    const launcher = new ProcessHostLauncher({
+      platform: 'win32',
+      hostEntry: '/tmp/host-entry.js',
+      shutdownTimeoutMs: 100,
+      processTree: { platform: 'win32', spawnProcess },
+      spawnProcess,
+      windowsJobBindings: {
+        createJobObjectW: vi.fn(() => null),
+        setInformationJobObject: vi.fn(() => 1),
+        openProcess: vi.fn(() => 22n),
+        assignProcessToJobObject: vi.fn(() => 1),
+        closeHandle: vi.fn(() => 1),
+        getLastError: vi.fn(() => 5)
+      }
+    })
+
+    await expect(launcher.launch(paths)).rejects.toThrow(/process isolation could not be established/i)
+    expect(spawnProcess).toHaveBeenCalledWith('taskkill.exe', ['/pid', '4321', '/T', '/F'], expect.objectContaining({ shell: false }))
+    expect(child.listenerCount('error')).toBe(0)
+    expect(child.listenerCount('exit')).toBe(0)
   }, 5_000)
 })

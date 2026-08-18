@@ -12,6 +12,11 @@ import {
 import type { HostClosedEvent, HostHandle, HostLauncher } from './launcher.js'
 import { waitForHttpReady, type ReadinessOptions } from './readiness.js'
 import { terminateChildProcess, type ProcessTreeTerminationOptions } from './process-tree.js'
+import {
+  createWindowsJobForProcess,
+  type WindowsJobBindings,
+  type WindowsJobOwner
+} from './windows-job.js'
 
 /** 生产 Host 进程 adapter 的可替换依赖和超时配置。 */
 export interface ProcessHostLauncherOptions {
@@ -23,6 +28,9 @@ export interface ProcessHostLauncherOptions {
   readonly maxDiagnosticBytes?: number
   readonly onDiagnosticOutput?: (stream: 'stdout' | 'stderr', output: string) => void
   readonly processTree?: ProcessTreeTerminationOptions
+  /** 可注入的平台值与 Win32 bindings 仅用于隔离测试；生产默认读取运行时平台。 */
+  readonly platform?: NodeJS.Platform
+  readonly windowsJobBindings?: WindowsJobBindings
 }
 
 /** 通过独立 Electron-as-Node child 启动真实 Harness Host。 */
@@ -37,6 +45,7 @@ export class ProcessHostLauncher implements HostLauncher {
   /** 创建隔离 child，等待受控 ready IPC 和 HTTP readiness 后返回句柄。 */
   async launch(paths: DesktopPaths): Promise<HostHandle> {
     const hostEntry = this.#options.hostEntry ?? resolveHostEntry()
+    const platform = this.#options.platform ?? process.platform
     const child = (this.#options.spawnProcess ?? spawn)(process.execPath, [hostEntry], {
       cwd: paths.defaultWorkingDirectory,
       env: {
@@ -47,10 +56,29 @@ export class ProcessHostLauncher implements HostLauncher {
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       windowsHide: true,
       shell: false,
-      detached: process.platform !== 'win32'
+      detached: platform !== 'win32'
     })
+    let setupFailure: Error | undefined
+    const onSetupError = (error: Error): void => { setupFailure ??= error }
+    const onSetupExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      setupFailure ??= new Error(`Host child exited before listeners were attached (${code ?? signal ?? 'unknown'})`)
+    }
+    child.once('error', onSetupError)
+    child.once('exit', onSetupExit)
+    let job: WindowsJobOwner | undefined
+    try {
+      job = platform === 'win32' ? establishWindowsJob(child, platform, this.#options) : undefined
+      if (setupFailure) throw setupFailure
+    } catch (error) {
+      try { job?.close() } catch { /* fallback cleanup below remains bounded */ }
+      await terminateFailedLaunch(child, platform, this.#options)
+      throw error
+    } finally {
+      child.off('error', onSetupError)
+      child.off('exit', onSetupExit)
+    }
     const outputCleanup = consumeOutput(child, this.#options)
-    const controller = new ProcessHostController(child, this.#options, outputCleanup)
+    const controller = new ProcessHostController(child, this.#options, outputCleanup, job)
     try {
       await controller.waitUntilReady(paths)
       return controller
@@ -126,14 +154,16 @@ class ProcessHostController implements HostHandle {
   #disposePromise?: Promise<void>
   #closeEvent?: HostClosedEvent
   #treeTermination?: Promise<void>
+  #job?: WindowsJobOwner
   #binding?: HostProcessBinding
   #origin?: string
 
   /** 绑定 IPC 与 ChildProcess 事件，尚未向调用者暴露句柄。 */
-  constructor(child: ChildProcess, options: ProcessHostLauncherOptions, cleanupOutput: () => void) {
+  constructor(child: ChildProcess, options: ProcessHostLauncherOptions, cleanupOutput: () => void, job?: WindowsJobOwner) {
     this.#child = child
     this.#options = options
     this.#cleanupOutput = cleanupOutput
+    this.#job = job
     child.on('message', this.#onMessage)
     child.once('exit', this.#onExit)
     child.once('error', this.#onError)
@@ -309,7 +339,7 @@ class ProcessHostController implements HostHandle {
     this.#treeTermination = terminateChildProcess(
       this.#child,
       timeoutMs,
-      { ...this.#options.processTree, deadline: Date.now() + timeoutMs }
+      this.#terminationOptions(Date.now() + timeoutMs)
     ).catch(() => undefined)
   }
 
@@ -317,8 +347,7 @@ class ProcessHostController implements HostHandle {
   #terminateWithin(deadline: number): Promise<void> {
     if (this.#treeTermination) return this.#treeTermination
     this.#treeTermination = terminateChildProcess(this.#child, remaining(deadline), {
-      ...this.#options.processTree,
-      deadline
+      ...this.#terminationOptions(deadline)
     })
     return this.#treeTermination
   }
@@ -335,8 +364,24 @@ class ProcessHostController implements HostHandle {
     if (this.#closeEvent) return
     this.#closeEvent = event
     this.#phase = 'closed'
+    this.#closeJob()
     this.#cleanupListeners()
     this.#closed.resolve(event)
+  }
+
+  /** 为终止调用合并 Job Object owner，保留 taskkill 作为失败后的有界 fallback。 */
+  #terminationOptions(deadline: number): ProcessTreeTerminationOptions {
+    return {
+      ...this.#options.processTree,
+      ...(this.#job ? { windowsJob: this.#job } : {}),
+      deadline
+    }
+  }
+
+  /** 释放 Job Object；失败由进程树 helper 在同一预算内 fallback 清理。 */
+  #closeJob(): void {
+    if (!this.#job) return
+    try { this.#job.close() } catch { /* terminateChildProcess will use bounded taskkill fallback */ }
   }
 
   /** 从 child 和 stdout/stderr 移除本 adapter 注册的监听器。 */
@@ -400,4 +445,37 @@ function sendCommand(child: ChildProcess, command: { readonly type: 'stop' }, ti
 /** 计算 launcher shutdown 截止时间的剩余预算。 */
 function remaining(deadline: number): number {
   return Math.max(0, deadline - Date.now())
+}
+
+/** 在 Windows 上 child 返回给调用方前建立 Job Object；失败则 fail closed 并有界清理。 */
+function establishWindowsJob(
+  child: ChildProcess,
+  platform: NodeJS.Platform,
+  options: ProcessHostLauncherOptions
+): WindowsJobOwner | undefined {
+  if (platform !== 'win32') return undefined
+  // node:child_process 只暴露 PID，没有 CREATE_SUSPENDED/HANDLE seam；在父进程首轮同步 assign，尽量缩小不可避免的窗口。
+  if (child.pid === undefined) {
+    throw new Error('Host child did not expose a pid for Windows Job Object assignment')
+  }
+  try {
+    return createWindowsJobForProcess(child.pid, { bindings: options.windowsJobBindings })
+  } catch (error) {
+    throw new Error('Host process isolation could not be established', { cause: error })
+  }
+}
+
+/** 清理未能建立 Job Object 的 child，避免无保护进程继续运行。 */
+async function terminateFailedLaunch(
+  child: ChildProcess,
+  platform: NodeJS.Platform,
+  options: ProcessHostLauncherOptions
+): Promise<void> {
+  const timeoutMs = options.shutdownTimeoutMs ?? 30_000
+  await terminateChildProcess(child, timeoutMs, {
+    ...options.processTree,
+    platform,
+    windowsJob: undefined,
+    deadline: Date.now() + timeoutMs
+  }).catch(() => undefined)
 }
