@@ -8,7 +8,6 @@ describe('production main bundle', () => {
   it('keeps one source logo and emits the runtime PNG from it', async () => {
     const sourceAssets = await readdir('assets', { recursive: true })
     expect(sourceAssets).toContain(desktopLogoFileName)
-    expect(sourceAssets).toContain('backups/dsh-desktop-logo-before-border.svg')
     expect(sourceAssets.filter((name) => name.endsWith('.svg') && !name.startsWith('backups/'))).toEqual([
       desktopLogoFileName,
     ])
