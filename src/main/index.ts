@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, clipboard, ipcMain, Menu, shell } from 'electron'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { inspect } from 'node:util'
@@ -14,10 +14,16 @@ import { NullDiagnostics, RollingDiagnostics, type DiagnosticContext, type Diagn
 import { createStartupActions } from './startup-actions.js'
 import { FakeHostLauncher } from './host/fake-launcher.js'
 import { recordE2EEvent, shouldSuppressExternalOpen } from './e2e-observer.js'
+import { configureElectronRuntime } from './electron-runtime.js'
 
 const desktopLogoFileName = 'dsh-desktop-logo.png'
 
 app.setName('DeepSeek Harness Desktop')
+configureElectronRuntime({
+  platform: process.platform,
+  env: process.env,
+  removeApplicationMenu: () => Menu.setApplicationMenu(null)
+})
 if (__DSH_E2E__ && process.env.DSH_DESKTOP_TEST_USER_DATA) app.setPath('userData', process.env.DSH_DESKTOP_TEST_USER_DATA)
 assertSupportedNodeVersion(process.versions.node)
 const distRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')

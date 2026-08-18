@@ -28,6 +28,7 @@ export function requiredRuntimeAssets(target) {
     file('@deepseek-ai/dsh-web-app', 'cordis.patch.yml', 'bundle YAML'),
     file('@deepseek-ai/dsh-web-frontend', 'dist/index.html', 'Web frontend'),
     directory('@deepseek-ai/dsh-web-frontend', 'dist/assets', 'Web frontend'),
+    file('@deepseek-ai/dsh-host-directory-picker-native', 'lib/worker.cjs', 'Win32 directory picker worker'),
     file('node-pty', platform === 'linux' ? 'build/Release/pty.node' : `prebuilds/${platform}-${arch}/pty.node`, 'native addon'),
     file(`@koromix/koffi-${platform}-${arch}`, `${platform}_${arch}/koffi.node`, 'runtime-resolved carrier'),
     file(`@vscode/ripgrep-${platform}-${arch}`, platform === 'win32' ? 'bin/rg.exe' : 'bin/rg', 'runtime-resolved carrier', true)
