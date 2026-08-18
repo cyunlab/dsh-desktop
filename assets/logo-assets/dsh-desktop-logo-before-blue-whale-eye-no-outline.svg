@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1254 1254" role="img" aria-labelledby="title desc">
+  <title id="title">DeepSeek Harness Desktop</title>
+  <desc id="desc">A DeepSeek-blue whale tail rising above cyan water inside a rounded desktop application window.</desc>
+  <defs>
+    <linearGradient id="frame" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b3154"/>
+      <stop offset="1" stop-color="#08243f"/>
+    </linearGradient>
+    <radialGradient id="panel" cx="50%" cy="43%" r="68%">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#edf8ff"/>
+    </radialGradient>
+    <linearGradient id="water" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#31c8e6"/>
+      <stop offset="1" stop-color="#19b2da"/>
+    </linearGradient>
+    <clipPath id="panel-clip">
+      <rect x="178" y="258" width="898" height="778" rx="168"/>
+    </clipPath>
+  </defs>
+
+  <!-- 桌面窗口外框。 -->
+  <rect x="106" y="107" width="1042" height="1001" rx="240" fill="url(#frame)"/>
+  <rect x="178" y="258" width="898" height="778" rx="168" fill="url(#panel)"/>
+
+  <!-- 窗口控制按钮。 -->
+  <circle cx="265" cy="196" r="26" fill="#2fc4e4"/>
+  <circle cx="350" cy="196" r="26" fill="#087cf0"/>
+  <circle cx="435" cy="196" r="26" fill="#f8fbff"/>
+
+  <!-- 鲸尾轮廓取自 whale-zone-svgrepo-com.svg，并移除原素材的圆角方框。 -->
+  <g clip-path="url(#panel-clip)">
+    <g transform="translate(70 215) scale(2.55)">
+    <path fill="#4D6BFE" d="M240 310 C238 260 224 215 200 180 C175 180 145 180 122 176 C105 173 103 160 116 151 C145 132 171 121 184 139 C187 120 206 94 228 76 C241 65 249 74 246 94 C241 123 233 150 225 172 C267 211 299 261 315 310 C288 322 263 322 240 310 Z"/>
+
+    <!-- 原素材中的水花。 -->
+    <path transform="translate(-18 -35)" fill="#4D6BFE" d="M203.94 281.643c2.768.977 5.542 2.036 8.375 2.831 5.427 1.522 10.855 2.758 16.389 3.858-2.619-3.255-5.274-6.478-7.648-9.926-2.307-3.347-4.417-6.759-6.483-10.253-2.594-4.493-8.586-5.947-12.948-3.169-4.36 2.761-5.585 8.765-2.67 13.018 1.222 1.784 2.957 2.929 4.985 3.641zM214.255 256.858c2.573 1.941 4.971 4.002 7.375 6.134-.796-5.356-1.909-10.522-3.452-15.717-.962-3.202-4.604-4.911-7.685-3.613-2.858 1.206-4.226 4.61-3.018 7.466 1.142 2.717 4.581 4.055 6.78 5.73z"/>
+
+    <!-- 原素材的波浪水面，以较高的青蓝色块填充。 -->
+    <path fill="url(#water)" d="M0 270 C14 270 21 278 28 282 C35 286 41 289 48 289 C58 289 62 284 68 280 C75 275 82 270 96 270 C110 270 117 278 124 282 C131 286 136 289 144 289 C154 289 158 284 164 280 C171 275 178 270 192 270 C206 270 213 278 220 282 C227 286 232 289 240 289 C250 289 254 284 260 280 C267 275 274 270 288 270 C302 270 309 278 316 282 C323 286 328 289 336 289 C346 289 350 284 356 280 C365 274 377 270 395 270 L395 395 L0 395 Z"/>
+    </g>
+  </g>
+</svg>
