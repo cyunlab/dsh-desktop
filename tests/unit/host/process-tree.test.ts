@@ -98,4 +98,31 @@ describe('Host process tree termination', () => {
     expect(spawnProcess).toHaveBeenCalledWith('taskkill.exe', ['/pid', '4321', '/T', '/F'], expect.objectContaining({ shell: false }))
     expect(child.kill).not.toHaveBeenCalled()
   })
+
+  it.each([0, 1, Number.NaN, -1, undefined])('never uses unsafe pid %s for process-tree cleanup', async pid => {
+    /** 模拟带有危险/缺失 pid 的 child，并让安全 leader kill 立即退出。 */
+    class UnsafeChild extends EventEmitter {
+      pid = pid
+      exitCode: number | null = null
+      signalCode: NodeJS.Signals | null = null
+      kill = vi.fn(() => {
+        this.exitCode = 1
+        this.emit('exit', 1, null)
+        return true
+      })
+    }
+    const child = new UnsafeChild()
+    const spawnProcess = vi.fn()
+    const killProcess = vi.fn()
+
+    await terminateChildProcess(child as unknown as ChildProcess, 50, {
+      platform: 'win32',
+      spawnProcess,
+      killProcess
+    })
+
+    expect(spawnProcess).not.toHaveBeenCalled()
+    expect(killProcess).not.toHaveBeenCalled()
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+  })
 })

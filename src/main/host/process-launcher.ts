@@ -147,6 +147,7 @@ class ProcessHostController implements HostHandle {
   readonly #ready = deferred<ReadyMessage>()
   readonly #failed = deferred<never>()
   readonly #stopped = deferred<void>()
+  readonly #stopFailed = deferred<Error>()
   readonly #closed = deferred<HostClosedEvent>()
   readonly #readinessAbort = new AbortController()
   #phase: 'starting' | 'ready' | 'closed' = 'starting'
@@ -155,6 +156,8 @@ class ProcessHostController implements HostHandle {
   #closeEvent?: HostClosedEvent
   #treeTermination?: Promise<void>
   #job?: WindowsJobOwner
+  #stoppedReceived = false
+  #stopFailure?: Error
   #binding?: HostProcessBinding
   #origin?: string
 
@@ -182,19 +185,31 @@ class ProcessHostController implements HostHandle {
   /** 等待 child ready 和 HTTP readiness，超时只影响本次启动尝试。 */
   async waitUntilReady(paths: DesktopPaths): Promise<void> {
     const timeoutMs = this.#options.startupTimeoutMs ?? this.#options.readiness?.timeoutMs ?? 120_000
+    const deadline = Date.now() + timeoutMs
     const ready = await withTimeout(
       Promise.race([this.#ready.promise, this.#failed.promise]),
-      timeoutMs,
+      remaining(deadline),
       `Host did not become ready within ${timeoutMs} ms`
     )
-    await Promise.race([
-      waitForHttpReady(ready.origin, {
-        ...this.#options.readiness,
-        timeoutMs: this.#options.readiness?.timeoutMs ?? timeoutMs,
-        signal: this.#readinessAbort.signal
-      }),
-      this.#failed.promise
-    ])
+    const readinessTimeoutMs = Math.min(
+      this.#options.readiness?.timeoutMs ?? remaining(deadline),
+      remaining(deadline)
+    )
+    try {
+      await Promise.race([
+        waitForHttpReady(ready.origin, {
+          ...this.#options.readiness,
+          timeoutMs: readinessTimeoutMs,
+          signal: this.#readinessAbort.signal
+        }),
+        this.#failed.promise
+      ])
+    } catch (error) {
+      if (Date.now() >= deadline) {
+        throw new Error(`Host did not become ready within ${timeoutMs} ms`, { cause: error })
+      }
+      throw error
+    }
     if (this.#phase !== 'starting') throw new Error('Host exited before readiness completed')
     this.#phase = 'ready'
     void paths
@@ -250,6 +265,7 @@ class ProcessHostController implements HostHandle {
       const firstSettlement = await withTimeout(
         Promise.race([
           this.#stopped.promise.then(() => 'stopped' as const),
+          this.#stopFailed.promise.then(() => 'stop-failed' as const),
           this.#closed.promise.then(() => 'closed' as const)
         ]),
         remaining(deadline),
@@ -258,6 +274,16 @@ class ProcessHostController implements HostHandle {
       const exitSettlement = firstSettlement === 'stopped'
         ? await withTimeout(this.#closed.promise, remaining(deadline), 'Host child did not exit after stopped').catch(() => undefined)
         : firstSettlement
+      const closeEvent = this.#closeEvent as HostClosedEvent | undefined
+      if (firstSettlement === 'stop-failed' || (closeEvent !== undefined && !closeEvent.intentional)) {
+        const failure = this.#stopFailure ?? closeEvent?.error ?? new Error('Host stop failed')
+        await this.#terminateWithin(deadline).catch(() => undefined)
+        if (!this.#closeEvent) {
+          await withTimeout(this.#closed.promise, remaining(deadline), 'Host child did not report stop failure').catch(() => undefined)
+        }
+        if (!this.#closeEvent) this.#settleClosed({ intentional: false, error: failure })
+        throw failure
+      }
       if (!exitSettlement) {
         await this.#terminateWithin(deadline)
         await withTimeout(this.#closed.promise, remaining(deadline), 'Host child did not report exit').catch(() => undefined)
@@ -286,34 +312,49 @@ class ProcessHostController implements HostHandle {
       this.#ready.resolve(message)
     } else if (message.type === 'startup-failed') {
       this.#fail(deserializeHostProcessError(message.error))
+    } else if (message.type === 'stop-failed') {
+      this.#stopFailure = deserializeHostProcessError(message.error)
+      this.#stopFailed.resolve(this.#stopFailure)
     } else if (message.type === 'stopped') {
-      if (this.#intentional) this.#stopped.resolve()
+      if (this.#intentional) {
+        this.#stoppedReceived = true
+        this.#stopped.resolve()
+      }
     }
   }
 
   /** 将 child error 转换为启动失败或意外关闭结果。 */
   #onError = (error: Error): void => {
     if (this.#phase === 'starting') this.#fail(error)
-    else if (!this.#intentional) {
+    else if (!this.#intentional || !this.#stoppedReceived) {
+      if (this.#intentional) this.#stopFailure ??= error
       this.#abortReadiness(error)
       this.#startUnexpectedTermination()
-      this.#settleClosed({ intentional: false, error })
+      this.#settleClosed({ intentional: false, error: this.#stopFailure ?? error })
     }
   }
 
   /** 将 child exit 转换为启动拒绝或可观察的 Host 关闭事件。 */
   #onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
     const wasStarting = this.#phase === 'starting'
+    const stopFailure = this.#stopFailure ?? (
+      this.#intentional && !this.#stoppedReceived && (code !== null && code !== 0 || signal !== null)
+        ? new Error(`Host stop failed with ${code ?? signal ?? 'unknown'}`)
+        : undefined
+    )
+    if (stopFailure) this.#stopFailure = stopFailure
+    const intentional = this.#intentional && stopFailure === undefined
+    const exitError = stopFailure ?? new Error(`Host child exited with ${code ?? signal ?? 'unknown'}`)
     const event: HostClosedEvent = {
-      intentional: this.#intentional,
+      intentional,
       ...(code === null ? {} : { code }),
       ...(signal === null ? {} : { signal }),
-      ...(!this.#intentional
-        ? { error: new Error(`Host child exited with ${code ?? signal ?? 'unknown'}`) }
+      ...(!intentional
+        ? { error: exitError }
         : {})
     }
-    if (wasStarting) this.#fail(event.error ?? new Error('Host child exited before readiness'))
-    if (!this.#intentional) {
+    if (wasStarting) this.#fail(event.error ?? exitError)
+    if (!intentional) {
       this.#abortReadiness(event.error)
       this.#startUnexpectedTermination()
     }

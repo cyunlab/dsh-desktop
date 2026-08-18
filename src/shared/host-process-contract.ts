@@ -15,6 +15,7 @@ export interface SerializedHostProcessError {
 export type HostProcessMessage =
   | { readonly type: 'ready'; readonly origin: string; readonly binding: HostProcessBinding }
   | { readonly type: 'startup-failed'; readonly error: SerializedHostProcessError }
+  | { readonly type: 'stop-failed'; readonly error: SerializedHostProcessError }
   | { readonly type: 'stopped' }
 
 /** 主进程到 Host 子进程的最小命令协议。 */
@@ -28,6 +29,7 @@ export function parseHostProcessMessage(value: unknown): HostProcessMessage {
   if (!isRecord(value) || typeof value.type !== 'string') throw new Error('Invalid Host process message')
   if (value.type === 'ready') return parseReady(value)
   if (value.type === 'startup-failed') return parseStartupFailed(value)
+  if (value.type === 'stop-failed') return parseStopFailed(value)
   if (value.type === 'stopped') {
     assertExactKeys(value, ['type'])
     return { type: 'stopped' }
@@ -97,6 +99,29 @@ function parseStartupFailed(value: Record<string, unknown>): HostProcessMessage 
   }
   return {
     type: 'startup-failed',
+    error: Object.freeze({
+      name: value.error.name,
+      message: value.error.message,
+      ...(value.error.code === undefined ? {} : { code: value.error.code })
+    })
+  }
+}
+
+/** 校验正常 stop 阶段的受控 dispose 失败消息。 */
+function parseStopFailed(value: Record<string, unknown>): HostProcessMessage {
+  assertExactKeys(value, ['type', 'error'])
+  if (!isRecord(value.error)) throw new Error('Invalid Host stop failure')
+  assertAllowedKeys(value.error, ['name', 'message', 'code'])
+  if (typeof value.error.name !== 'string' || typeof value.error.message !== 'string') {
+    throw new Error('Host stop failure fields are invalid')
+  }
+  if (value.error.name.length === 0 || value.error.name.length > MAX_ERROR_FIELD_LENGTH) throw new Error('Host error name is invalid')
+  if (value.error.message.length > MAX_ERROR_FIELD_LENGTH) throw new Error('Host error message is invalid')
+  if (value.error.code !== undefined && typeof value.error.code !== 'string' && typeof value.error.code !== 'number') {
+    throw new Error('Host error code is invalid')
+  }
+  return {
+    type: 'stop-failed',
     error: Object.freeze({
       name: value.error.name,
       message: value.error.message,

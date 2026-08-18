@@ -26,7 +26,7 @@ export async function terminateChildProcess(
   const deadline = options.deadline ?? Date.now() + Math.max(0, timeoutMs)
   // Unix 的 leader 退出后进程组可能仍有插件后代，仍需检查并清理该组。
   if (hasExited(child) && platform !== 'win32' && !useProcessGroup) return
-  if (pid === undefined) {
+  if (pid === undefined || !isSafePid(pid)) {
     if (hasExited(child)) return
     await terminateLeader(child, deadline)
     return
@@ -61,6 +61,7 @@ async function terminateWindowsTree(
   spawnProcess: (command: string, args: string[], options: SpawnOptions) => ChildProcess,
   windowsJob?: WindowsJobOwner
 ): Promise<void> {
+  if (!isSafePid(pid)) throw new Error(`Refusing taskkill for unsafe pid ${String(pid)}`)
   let jobClosed = false
   if (windowsJob) {
     try {
@@ -105,6 +106,7 @@ function signalProcessGroup(
   signal: NodeJS.Signals,
   killProcess: (pid: number, signal?: NodeJS.Signals | number) => void
 ): boolean {
+  if (!isSafePid(pid)) return false
   try {
     killProcess(-pid, signal)
     return true
@@ -122,6 +124,7 @@ async function waitForProcessGroupGone(
   timeoutMs: number,
   killProcess: (pid: number, signal?: NodeJS.Signals | number) => void
 ): Promise<boolean> {
+  if (!isSafePid(pid)) return true
   const deadline = Date.now() + timeoutMs
   while (true) {
     try {
@@ -140,6 +143,11 @@ async function waitForProcessGroupGone(
 function hasExited(child: ChildProcess): boolean {
   return (child.exitCode !== null && child.exitCode !== undefined)
     || (child.signalCode !== null && child.signalCode !== undefined)
+}
+
+/** 只允许可安全转成负进程组/Windows taskkill 参数的真实 pid。 */
+function isSafePid(pid: number): boolean {
+  return Number.isSafeInteger(pid) && pid > 1
 }
 
 /** 在有限时间内等待 ChildProcess 退出并移除临时 listener。 */

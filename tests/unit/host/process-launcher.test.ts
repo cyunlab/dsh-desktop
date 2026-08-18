@@ -68,6 +68,7 @@ describe('ProcessHostLauncher', () => {
   /** 使用 fixture 场景启动一个真实 child，验证 launcher 的失败与清理边界。 */
   async function launchScenario(scenario: string, options: {
     startupTimeoutMs?: number
+    readinessTimeoutMs?: number
     shutdownTimeoutMs?: number
     blockStopSendCallback?: boolean
     fetch?: typeof globalThis.fetch
@@ -78,7 +79,7 @@ describe('ProcessHostLauncher', () => {
     const launcher = new ProcessHostLauncher({
       ...options,
       hostEntry,
-      readiness: { timeoutMs: options.startupTimeoutMs ?? 5_000, fetch: options.fetch },
+      readiness: { timeoutMs: options.readinessTimeoutMs ?? options.startupTimeoutMs ?? 5_000, fetch: options.fetch },
       spawnProcess: (command, args, spawnOptions) => {
         child = spawnChild(command, args, {
           ...spawnOptions,
@@ -133,6 +134,18 @@ describe('ProcessHostLauncher', () => {
     expect(request).toHaveBeenCalledOnce()
   }, 10_000)
 
+  it('shares one startup deadline between IPC ready and HTTP readiness', async () => {
+    const attempt = await launchScenario('ready-http-pending', {
+      startupTimeoutMs: 60,
+      readinessTimeoutMs: 1_000,
+      shutdownTimeoutMs: 100
+    })
+    const started = Date.now()
+    await expect(attempt.launcher.launch(attempt.paths)).rejects.toThrow(/within 60 ms/)
+    expect(Date.now() - started).toBeLessThan(500)
+    await vi.waitFor(() => expect(attempt.getChild()?.exitCode ?? attempt.getChild()?.signalCode ?? null).not.toBeNull())
+  }, 5_000)
+
   it('treats startup timeout as an attempt failure and terminates that child', async () => {
     const attempt = await launchScenario('timeout', { startupTimeoutMs: 50, shutdownTimeoutMs: 100 })
     await expect(attempt.launcher.launch(attempt.paths)).rejects.toThrow(/within 50 ms/)
@@ -168,6 +181,14 @@ describe('ProcessHostLauncher', () => {
       await hangingHandle.dispose().catch(() => undefined)
     }
   }, 15_000)
+
+  it('does not report stopped when child dispose fails and forces parent cleanup', async () => {
+    const attempt = await launchScenario('stop-failed', { shutdownTimeoutMs: 100 })
+    const handle = await attempt.launcher.launch(attempt.paths)
+    await expect(handle.dispose()).rejects.toThrow(/fixture dispose failed|Host stop failed/)
+    await expect(handle.closed).resolves.toMatchObject({ intentional: false })
+    await vi.waitFor(() => expect(attempt.getChild()?.exitCode ?? attempt.getChild()?.signalCode ?? null).not.toBeNull())
+  }, 10_000)
 
   it('terminates when the stop IPC callback never settles within the shutdown budget', async () => {
     const attempt = await launchScenario('ready', { shutdownTimeoutMs: 100, blockStopSendCallback: true })

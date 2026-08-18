@@ -12,6 +12,7 @@ class FakeHostSystem extends EventEmitter implements HostProcessSystem {
   pid = 4321
   parentDisconnectTimeoutMs?: number
   spawnProcess?: (command: string, args: string[], options: SpawnOptions) => ChildProcess
+  killProcess?: (pid: number, signal?: NodeJS.Signals | number) => void
   readonly exitCalls: number[] = []
   sendError?: Error
   holdSend = false
@@ -61,6 +62,22 @@ describe('Host child runtime', () => {
     await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce())
     expect(system.messages).toContainEqual({ type: 'stopped' })
     expect(system.exitCode).toBe(0)
+  })
+
+  it('reports dispose failure as controlled stop-failed and exits nonzero', async () => {
+    const system = new FakeHostSystem()
+    const dispose = vi.fn(async () => {
+      throw Object.assign(new Error('dispose failed'), { code: 'E_DISPOSE', stack: 'private stack' })
+    })
+    await startHostProcess(runtime(dispose), system)
+
+    system.emit('message', { type: 'stop' })
+    await vi.waitFor(() => expect(system.exitCode).toBe(1))
+    expect(system.messages).toContainEqual({
+      type: 'stop-failed',
+      error: { name: 'Error', message: 'dispose failed', code: 'E_DISPOSE' }
+    })
+    expect(system.messages).not.toContainEqual({ type: 'stopped' })
   })
 
   it('sends a redacted startup failure and exits non-zero', async () => {
@@ -150,5 +167,30 @@ describe('Host child runtime', () => {
     await vi.waitFor(() => expect(system.exitCalls).toContain(1))
     expect(dispose).toHaveBeenCalledOnce()
     expect(system.spawnProcess).toHaveBeenCalledWith('taskkill.exe', ['/PID', '4321', '/T', '/F'], expect.objectContaining({ shell: false }))
+  }, 5_000)
+
+  it('shares one parent-disconnect deadline across dispose and taskkill fallback', async () => {
+    const system = new FakeHostSystem()
+    system.platform = 'win32'
+    system.parentDisconnectTimeoutMs = 40
+    system.killProcess = vi.fn()
+    const terminator = new EventEmitter() as EventEmitter & ChildProcess & {
+      exitCode: number | null
+      signalCode: NodeJS.Signals | null
+      kill: (signal: NodeJS.Signals) => boolean
+    }
+    terminator.exitCode = null
+    terminator.signalCode = null
+    terminator.kill = vi.fn(() => true)
+    system.spawnProcess = vi.fn(() => terminator)
+    const dispose = vi.fn(() => new Promise<void>(() => {}))
+    await startHostProcess(runtime(dispose), system)
+
+    const started = Date.now()
+    system.emit('disconnect')
+    await vi.waitFor(() => expect(system.exitCalls).toContain(1))
+    expect(Date.now() - started).toBeLessThan(75)
+    expect(terminator.kill).toHaveBeenCalledWith('SIGKILL')
+    expect(system.killProcess).toHaveBeenCalledWith(4321, 'SIGKILL')
   }, 5_000)
 })

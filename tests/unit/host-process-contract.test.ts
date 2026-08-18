@@ -57,4 +57,18 @@ describe('Host process contract', () => {
     expect(parseHostProcessMessage({ type: 'startup-failed', error: { name: 'Error', message: 'plain failure' } }))
       .toEqual({ type: 'startup-failed', error: { name: 'Error', message: 'plain failure' } })
   })
+
+  it('accepts a controlled stop failure without exposing arbitrary error fields', () => {
+    expect(parseHostProcessMessage({
+      type: 'stop-failed',
+      error: { name: 'DisposeError', message: 'dispose failed', code: 'E_DISPOSE' }
+    })).toEqual({
+      type: 'stop-failed',
+      error: { name: 'DisposeError', message: 'dispose failed', code: 'E_DISPOSE' }
+    })
+    expect(() => parseHostProcessMessage({
+      type: 'stop-failed',
+      error: { name: 'DisposeError', message: 'dispose failed', stack: 'private' }
+    })).toThrow()
+  })
 })

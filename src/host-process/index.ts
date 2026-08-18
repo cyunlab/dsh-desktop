@@ -45,6 +45,7 @@ export async function startHostProcess(
   let readySent = false
   let stopping: Promise<void> | undefined
   let disconnectedStopping: Promise<void> | undefined
+  let disconnectedDeadline: number | undefined
   let parentDisconnected = false
   const pendingSendRejectors = new Set<(error: Error) => void>()
 
@@ -68,21 +69,28 @@ export async function startHostProcess(
   const shutdown = (exitCode: number, cause: HostProcessShutdownCause = { kind: 'normal' }): Promise<void> => {
     if (stopping) return stopping
     stopping = (async () => {
+      let disposeError: unknown
+      let disposeFailed = false
+      let finalExitCode = exitCode
       try {
         await handle?.dispose()
-      } catch {
-        // 退出路径不能把 child 留在 Harness 状态；原始错误通过受控协议报告。
+      } catch (error) {
+        disposeFailed = true
+        disposeError = error
+        if (cause.kind === 'normal') finalExitCode = 1
       }
       try {
         if (cause.kind === 'startup-failed' && !readySent && !parentDisconnected) {
           try { await send({ type: 'startup-failed', error: serializeHostProcessError(cause.error) }) } catch { /* parent may already be gone */ }
-        } else if (exitCode === 0 && readySent && !parentDisconnected) {
+        } else if (disposeFailed && cause.kind === 'normal' && readySent && !parentDisconnected) {
+          try { await send({ type: 'stop-failed', error: serializeHostProcessError(disposeError) }) } catch { /* parent may already be gone */ }
+        } else if (finalExitCode === 0 && readySent && !parentDisconnected) {
           try { await send({ type: 'stopped' }) } catch { /* parent may already be gone */ }
         }
       } finally {
-        system.exitCode = exitCode
+        system.exitCode = finalExitCode
         if (!parentDisconnected) system.disconnect?.()
-        system.exit(exitCode)
+        system.exit(finalExitCode)
       }
     })()
     return stopping
@@ -93,9 +101,10 @@ export async function startHostProcess(
     if (disconnectedStopping) return disconnectedStopping
     disconnectedStopping = (async () => {
       const timeoutMs = system.parentDisconnectTimeoutMs ?? 2_000
-      const disposed = await disposeWithTimeout(handle, timeoutMs)
+      const deadline = disconnectedDeadline ??= Date.now() + Math.max(0, timeoutMs)
+      const disposed = await disposeWithDeadline(handle, deadline)
       if (!disposed) {
-        await emergencyExitHostProcess(system, timeoutMs)
+        await emergencyExitHostProcess(system, remaining(deadline), deadline)
         return
       }
       system.exitCode = 0
@@ -128,8 +137,10 @@ export async function startHostProcess(
     })
     if (stopping || parentDisconnected) {
       if (parentDisconnected) {
-        const disposed = await disposeWithTimeout(handle, system.parentDisconnectTimeoutMs ?? 2_000)
-        if (!disposed) await emergencyExitHostProcess(system, system.parentDisconnectTimeoutMs ?? 2_000)
+        const timeoutMs = system.parentDisconnectTimeoutMs ?? 2_000
+        const deadline = disconnectedDeadline ??= Date.now() + Math.max(0, timeoutMs)
+        const disposed = await disposeWithDeadline(handle, deadline)
+        if (!disposed) await emergencyExitHostProcess(system, remaining(deadline), deadline)
       } else {
         await handle.dispose().catch(() => undefined)
       }
@@ -143,12 +154,13 @@ export async function startHostProcess(
 }
 
 /** 在有限时间内等待已创建 Host Handle 的 dispose，避免父 IPC 消失后悬挂。 */
-async function disposeWithTimeout(
+async function disposeWithDeadline(
   handle: Awaited<ReturnType<HostProcessRuntime['bootHarnessHost']>> | undefined,
-  timeoutMs: number
+  deadline: number
 ): Promise<boolean> {
   if (!handle) return true
   const disposal = Promise.resolve().then(() => handle.dispose()).then(() => true, () => false)
+  const timeoutMs = Math.max(0, deadline - Date.now())
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     return await Promise.race([
@@ -158,6 +170,11 @@ async function disposeWithTimeout(
   } finally {
     if (timer !== undefined) clearTimeout(timer)
   }
+}
+
+/** 计算父 IPC 断开 emergency deadline 尚余的清理预算。 */
+function remaining(deadline: number): number {
+  return Math.max(0, deadline - Date.now())
 }
 
 /** 仅在 Electron 启动的真实 Host child 中延迟加载 Harness runtime。 */

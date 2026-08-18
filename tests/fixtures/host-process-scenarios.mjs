@@ -24,7 +24,7 @@ if (scenario === 'startup-failed') {
   if (scenario === 'exit-before-ready') exitSoon(1, 10)
   else setInterval(() => {}, 1_000)
 } else {
-  const status = scenario === 'ready-http-fail' ? 503 : 200
+  const status = scenario === 'ready-http-fail' || scenario === 'ready-http-pending' ? 503 : 200
   server = createServer((_request, response) => {
     response.writeHead(status, { 'content-type': 'text/plain' })
     response.end(status === 200 ? 'ok' : 'not ready')
@@ -38,6 +38,12 @@ if (scenario === 'startup-failed') {
   process.on('message', message => {
     if (message?.type !== 'stop' || stopped || scenario === 'shutdown-timeout') return
     stopped = true
+    if (scenario === 'stop-failed') {
+      send({ type: 'stop-failed', error: { name: 'DisposeError', message: 'fixture dispose failed', code: 'E_DISPOSE' } })
+      process.disconnect?.()
+      process.exit(1)
+      return
+    }
     server.close(() => {
       send({ type: 'stopped' })
       process.disconnect?.()
