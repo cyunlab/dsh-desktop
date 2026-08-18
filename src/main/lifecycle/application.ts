@@ -60,6 +60,7 @@ export class ApplicationLifecycle {
         return
       }
       this.#handle = handle
+      this.#observeHostClosure(handle)
       if (handle.binding) this.diagnostics.assignedPort(handle.binding.port)
       this.#transition('probing', 'Checking local Web Client', this.#handle.origin)
       this.#transition('ready', 'Web Client is ready', this.#handle.origin)
@@ -135,6 +136,24 @@ export class ApplicationLifecycle {
     }
   }
   async #disposeHandle(): Promise<void> { const handle = this.#handle; this.#handle = undefined; await handle?.dispose() }
+
+  /** 将 ready 后的意外 Host 退出转换为可恢复的 failed 状态。 */
+  #observeHostClosure(handle: HostHandle): void {
+    if (!handle.closed) return
+    void handle.closed.then(event => {
+      if (event.intentional || this.#shutdownRequested || this.#handle !== handle || this.#snapshot.state !== 'ready') return
+      this.#handle = undefined
+      const error = event.error ?? new Error(`Host child exited with ${event.code ?? event.signal ?? 'unknown'}`)
+      this.diagnostics.failure('host-runtime', error)
+      this.#transition('failed', userFacingStartupError('host-startup', error))
+    }).catch(error => {
+      if (this.#shutdownRequested || this.#handle !== handle || this.#snapshot.state !== 'ready') return
+      this.#handle = undefined
+      this.diagnostics.failure('host-runtime', error)
+      this.#transition('failed', userFacingStartupError('host-startup', error))
+    })
+  }
+
   #transition(state: LifecycleState, message: string, origin?: string): void {
     this.#snapshot = Object.freeze({ state, message, ...(origin ? { origin } : {}) })
     this.diagnostics.lifecycle(this.#snapshot)

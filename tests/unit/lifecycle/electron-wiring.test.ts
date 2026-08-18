@@ -12,7 +12,7 @@ async function fixturePaths() {
   const root = await mkdtemp(path.join(tmpdir(), 'dsh wiring '))
   return {
     harnessHome: path.join(root, 'home'),
-    fallbackWorkspace: path.join(root, 'workspace'),
+    defaultWorkingDirectory: path.join(root, 'workspace'),
     logs: path.join(root, 'logs')
   }
 }

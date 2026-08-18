@@ -16,7 +16,7 @@ The single controlled window owned by Desktop. It shows the Startup page until t
 
 ### Host
 
-The in-process DeepSeek Harness Cordis runtime that exposes the loopback HTTP/API surface. One Desktop instance owns exactly one Host in the first milestone.
+The DeepSeek Harness Cordis runtime that exposes the loopback HTTP/API surface. One Desktop instance owns exactly one Host in the first milestone.
 
 ### Web Client
 
@@ -42,9 +42,9 @@ The persistent root selected by `DSH_HOME` for Harness settings, credentials, pr
 
 A durable Harness entity representing a user-selected project directory and its grouped Sessions. The Web Client manages Workspaces. A Workspace is not the Harness Home and is not necessarily the Host working directory.
 
-### Fallback workspace
+### Desktop default working directory
 
-The deterministic empty Desktop-owned directory used as the Host process working directory. It becomes a Session cwd only when creation supplies neither a Workspace nor an explicit cwd.
+The deterministic, writable Desktop-owned directory used as the initial working directory for the local Host. It becomes a Session cwd only when session creation supplies neither a Workspace nor an explicit cwd. It is not a Workspace in the Workspace Registry.
 
 ### Startup page
 

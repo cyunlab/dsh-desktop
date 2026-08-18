@@ -6,7 +6,7 @@ On Windows, macOS, and Linux, `pnpm dev` and the unpacked packaged application o
 
 ## Scope
 
-Included: one window, one in-process Host, isolated Harness Home, fallback workspace, loopback-only navigation, minimal diagnostics, unit/integration/E2E tests, three-platform unsigned packages, manual CI, and tag-created Draft Releases.
+Included: one window, one isolated Host process, isolated Harness Home, Desktop default working directory, loopback-only navigation, minimal diagnostics, unit/integration/E2E tests, three-platform unsigned packages, manual CI, and tag-created Draft Releases.
 
 Excluded: tray/background mode, updater, custom terminal, plugin marketplace, external Host, migration from `~/.dsh`, multiple windows/Hosts, launch-at-login, production signing, and a custom product renderer.
 
@@ -20,7 +20,7 @@ src/
 │   │   ├── application.ts       Application lifecycle coordinator
 │   │   ├── electron-wiring.ts   Electron lifecycle adapter
 │   │   └── startup-failure.ts   User-facing startup failure mapping
-│   ├── paths.ts                 Harness Home, fallback workspace, and logs
+│   ├── paths.ts                 Harness Home, default working directory, and logs
 │   ├── host/
 │   │   ├── launcher.ts          Narrow HostLauncher interface
 │   │   ├── harness-launcher.ts  Published-package Web composition adapter
@@ -71,11 +71,11 @@ After `app.whenReady()`:
 
 ```text
 app.getPath('userData')/deepseek-harness-desktop/harness-home
-app.getPath('userData')/deepseek-harness-desktop/fallback-workspace
+app.getPath('userData')/deepseek-harness-desktop/default-working-directory
 app.getPath('logs')
 ```
 
-Set `DSH_HOME` before importing or invoking Harness code that resolves it. Create the fallback workspace and set the Host cwd before composition. Tests replace all paths with temporary directories, including a Windows path containing spaces.
+Set `DSH_HOME` in the Host child environment before importing Harness code that resolves it. Create the Desktop default working directory before launch. Tests replace all paths with temporary directories, including a Windows path containing spaces.
 
 ### Host launch
 

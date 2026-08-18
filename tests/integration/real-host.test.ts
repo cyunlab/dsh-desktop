@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { HarnessHostLauncher } from '../../src/main/host/harness-launcher.js'
+import { ProcessHostLauncher } from '../../src/main/host/process-launcher.js'
 
 async function rpc<T>(origin: string, method: string, payload: unknown): Promise<T> {
   const response = await fetch(`${origin}/api/${method}`, {
@@ -19,11 +19,11 @@ async function rpc<T>(origin: string, method: string, payload: unknown): Promise
 }
 
 describe('published Harness Web composition', () => {
-  it('binds loopback, serves Web/API, applies Workspace cwd and fallback cwd, and disposes', async () => {
+  it('binds loopback, serves Web/API, applies Workspace cwd and default cwd, and disposes', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'DSH Real Host With Spaces '))
     const paths = {
       harnessHome: path.join(root, 'Harness Home'),
-      fallbackWorkspace: path.join(root, 'Fallback Workspace'),
+      defaultWorkingDirectory: path.join(root, 'Default Working Directory'),
       logs: path.join(root, 'Logs')
     }
     await Promise.all(Object.values(paths).map(directory => mkdir(directory, { recursive: true })))
@@ -31,7 +31,7 @@ describe('published Harness Web composition', () => {
     await mkdir(selectedWorkspace)
     const previousHome = process.env.DSH_HOME
     const previousCwd = process.cwd()
-    const handle = await new HarnessHostLauncher({ readiness: { timeoutMs: 30_000 } }).launch(paths)
+    const handle = await new ProcessHostLauncher({ readiness: { timeoutMs: 30_000 } }).launch(paths)
     try {
       const url = new URL(handle.origin)
       expect(url.hostname).toBe('127.0.0.1')
@@ -54,7 +54,7 @@ describe('published Harness Web composition', () => {
       expect(await realpath(sessions.items.find(item => item.sessionId === selected.sessionId)?.cwd ?? ''))
         .toBe(await realpath(selectedWorkspace))
       expect(await realpath(sessions.items.find(item => item.sessionId === fallback.sessionId)?.cwd ?? ''))
-        .toBe(await realpath(paths.fallbackWorkspace))
+        .toBe(await realpath(paths.defaultWorkingDirectory))
     } finally {
       await Promise.all([handle.dispose(), handle.dispose()])
     }

@@ -2,23 +2,19 @@ import { describe, expect, it, vi } from 'vitest'
 import { configureElectronRuntime } from '../../src/main/electron-runtime.js'
 
 describe('Electron runtime', () => {
-  it('removes the Windows application menu and makes spawned app executables run as Node workers', () => {
-    const env: NodeJS.ProcessEnv = {}
+  it('removes the Windows application menu without mutating process environment', () => {
     const removeApplicationMenu = vi.fn()
 
-    configureElectronRuntime({ platform: 'win32', env, removeApplicationMenu })
+    configureElectronRuntime({ platform: 'win32', removeApplicationMenu })
 
     expect(removeApplicationMenu).toHaveBeenCalledOnce()
-    expect(env.ELECTRON_RUN_AS_NODE).toBe('1')
   })
 
-  it('leaves other platform menus and process environments unchanged', () => {
-    const env: NodeJS.ProcessEnv = {}
+  it('leaves other platform menus unchanged', () => {
     const removeApplicationMenu = vi.fn()
 
-    configureElectronRuntime({ platform: 'darwin', env, removeApplicationMenu })
+    configureElectronRuntime({ platform: 'darwin', removeApplicationMenu })
 
     expect(removeApplicationMenu).not.toHaveBeenCalled()
-    expect(env.ELECTRON_RUN_AS_NODE).toBeUndefined()
   })
 })

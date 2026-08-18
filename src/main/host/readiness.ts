@@ -4,8 +4,9 @@ export interface ReadinessOptions {
   readonly fetch?: typeof globalThis.fetch
 }
 
+/** 轮询 Host HTTP surface；默认给首次 Harness 组合留出宽松启动窗口。 */
 export async function waitForHttpReady(origin: string, options: ReadinessOptions = {}): Promise<void> {
-  const timeoutMs = options.timeoutMs ?? 15_000
+  const timeoutMs = options.timeoutMs ?? 120_000
   const intervalMs = options.intervalMs ?? 100
   const request = options.fetch ?? globalThis.fetch
   const deadline = Date.now() + timeoutMs

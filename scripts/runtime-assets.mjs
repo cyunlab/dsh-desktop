@@ -24,6 +24,7 @@ export function shouldRunPackagedProbe(target, host = { platform: process.platfo
 export function requiredRuntimeAssets(target) {
   const { platform, arch } = target
   const assets = [
+    directFile('dist/host-process/index.js', 'Host child entry'),
     file('@deepseek-ai/dsh-base', 'cordis.patch.yml', 'bundle YAML'),
     file('@deepseek-ai/dsh-web-app', 'cordis.patch.yml', 'bundle YAML'),
     file('@deepseek-ai/dsh-web-frontend', 'dist/index.html', 'Web frontend'),
@@ -81,6 +82,10 @@ export async function verifyRequiredRuntimeAssets(root, target) {
 
 function file(packageName, relative, category, executable = false) {
   return { path: packagePath(packageName, relative), kind: 'file', category, executable }
+}
+
+function directFile(relative, category, executable = false) {
+  return { path: relative, kind: 'file', category, executable }
 }
 
 function directory(packageName, relative, category) {

@@ -7,7 +7,7 @@ import type { HostLauncher } from '../../../src/main/host/launcher.js'
 
 async function fixturePaths() {
   const root = await mkdtemp(path.join(tmpdir(), 'dsh lifecycle '))
-  return { harnessHome: path.join(root, 'home'), fallbackWorkspace: path.join(root, 'workspace'), logs: path.join(root, 'logs') }
+  return { harnessHome: path.join(root, 'home'), defaultWorkingDirectory: path.join(root, 'workspace'), logs: path.join(root, 'logs') }
 }
 
 describe('application lifecycle', () => {
@@ -169,6 +169,21 @@ describe('application lifecycle', () => {
     await expect(lifecycle.stop()).resolves.toBeUndefined()
     expect(lifecycle.snapshot.state).toBe('stopped')
     expect(failure).toHaveBeenCalledWith('host-shutdown-timeout', expect.any(Error))
+  })
+
+  it('moves to failed when a ready Host exits unexpectedly', async () => {
+    let reportClosed!: (event: { intentional: boolean; error?: Error }) => void
+    const closed = new Promise<{ intentional: boolean; error?: Error }>(resolve => { reportClosed = resolve })
+    const dispose = vi.fn(async () => undefined)
+    const lifecycle = new ApplicationLifecycle({
+      launch: async () => ({ origin: 'http://127.0.0.1:4567', dispose, closed })
+    }, await fixturePaths())
+
+    await lifecycle.start()
+    reportClosed({ intentional: false, error: new Error('child crashed') })
+    await vi.waitFor(() => expect(lifecycle.snapshot.state).toBe('failed'))
+    expect(dispose).not.toHaveBeenCalled()
+    await lifecycle.stop()
   })
 
   it.each(['launch rejection', 'dispose rejection'] as const)('suppresses late %s activity after bounded shutdown reaches stopped', async scenario => {
