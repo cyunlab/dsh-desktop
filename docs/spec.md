@@ -8,7 +8,7 @@ The project needs a small, self-contained Desktop milestone that proves the comp
 
 ## Solution
 
-Deliver an Electron application that ships a private, version-matched Harness runtime and uses Electron's embedded Node runtime. On launch, Desktop shows a minimal packaged startup page, creates isolated application data, starts one Host in the Electron main process using the official published Web composition, binds it only to an operating-system-assigned `127.0.0.1` port, verifies HTTP readiness, and navigates the same window to the upstream Web Client.
+Deliver an Electron application that ships a private, version-matched Harness runtime and uses Electron's embedded Node runtime. On launch, Desktop shows a minimal packaged startup page, creates isolated application data, launches one isolated Host child using the official published Web composition, binds it only to an operating-system-assigned `127.0.0.1` port, verifies HTTP readiness, and navigates the same window to the upstream Web Client. The Electron main process owns only the launch/IPC/lifecycle adapter; boot, compose, and dispose of the real Harness occur in the child.
 
 Desktop remains a lifecycle and security shell. The upstream Web Client owns Workspace selection and the normal product experience. A single Desktop instance owns a single Host, and closing the final window disposes the Host before exiting. Failures remain on the startup page with retry and redacted diagnostic actions.
 
@@ -47,7 +47,7 @@ The milestone provides manually triggered three-platform test automation and man
 29. As a maintainer, I want a semantic-version tag checked against the application version, so that release metadata cannot drift from the package.
 30. As a maintainer, I want tag builds to create only a Draft Release after every native build succeeds, so that incomplete or unreviewed artifacts are never published automatically.
 31. As a tester, I want unsigned packages clearly identified with platform launch instructions, so that development artifacts are not mistaken for production-signed releases.
-32. As a future maintainer, I want Host startup hidden behind a narrow launcher interface, so that process isolation can be introduced later without redesigning the application lifecycle.
+32. As a future maintainer, I want Host startup hidden behind a narrow launcher interface, so that process and IPC isolation remain encapsulated outside the application lifecycle.
 
 ## Implementation Decisions
 
@@ -56,8 +56,8 @@ The milestone provides manually triggered three-platform test automation and man
 - The initial published Harness runtime family is `0.1.0-rc.6`. Direct Harness dependencies use exact versions, never ranges or npm dist-tags.
 - Production builds consume published packages. The Harness git submodule is a read-only source and documentation reference outside the Desktop workspace and is never modified or used as the normal production build input.
 - The Web composition is the ordered official `dsh-base` and `dsh-web-app` bundle pair. These aggregate packages bring the standard Host and Client plugin roster transitively; Desktop does not copy their configuration or curate a reduced roster.
-- Desktop declares the public launcher/runtime packages needed to boot that composition. It does not use private submodule source paths or patch installed packages.
-- The first Host runs inside the Electron main process. Host lifecycle is accessed through a narrow launcher boundary returning the assigned origin and an idempotent disposer, preserving a later move to a utility or child process.
+- Desktop declares the public launcher/runtime packages needed by the Host child to boot that composition. The main bundle does not import or boot published Harness runtime modules.
+- The Electron main process launches a packaged Host child through a narrow launcher boundary returning the assigned origin, close signal, and an idempotent disposer. The child sets no parent process state, dynamically boots/composes the published Harness runtime, and disposes it before exit.
 - Desktop is a single-instance, one-window, one-Host application. A second launch activates the existing window.
 - The application lifecycle has explicit preparing, booting, probing, ready, failed, retrying, stopping, and stopped states. Only the main process owns transitions.
 - The startup renderer is plain HTML, CSS, and TypeScript. It receives immutable lifecycle snapshots through a narrowly scoped sandboxed preload bridge and can request only retry, copy-diagnostics, and reveal-log-directory actions.
@@ -65,7 +65,7 @@ The milestone provides manually triggered three-platform test automation and man
 - After Host readiness, navigation is limited to the exact assigned `http://127.0.0.1:<port>` origin. Other in-window navigation is blocked. Explicit external HTTP(S) links open in the system browser; untrusted schemes and popup creation are denied.
 - The Host binds `127.0.0.1` with port `0`. Desktop reads the assigned port from the Web server service after the Harness configuration tree settles and then performs a bounded HTTP readiness probe. Console output is diagnostic, not a lifecycle protocol.
 - The Web Client owns the durable multi-Workspace experience. Desktop does not require a project picker before Host startup.
-- Desktop sets a deterministic empty fallback workspace as the Host working directory. It is used as a Session cwd only when creation supplies neither a Workspace nor an explicit cwd.
+- Desktop sets a deterministic, writable default working directory as the Host's initial cwd. It is used as a Session cwd only when creation supplies neither a Workspace nor an explicit cwd, and it is not a Workspace Registry entry.
 - Desktop uses an isolated Harness Home under application data rather than the CLI default `~/.dsh`. Migration is deferred; the eventual direction is non-destructive one-time import rather than concurrent mutation of one home by separately versioned runtimes.
 - Electron's platform-standard logs directory stores bounded rolling diagnostics. Logs include versions, architecture, lifecycle timings, assigned port, navigation rejections, and failure stacks, while excluding credentials, environment dumps, prompts, conversations, tool payloads, file contents, query strings, and request bodies.
 - The product display name is `DeepSeek Harness Desktop`. Package, executable, and artifact identifiers are space-free. Development artifacts use `io.github.xlcyun.dsh-desktop` as the application ID; publisher identity must be reviewed before a public signed release.
@@ -81,7 +81,7 @@ The milestone provides manually triggered three-platform test automation and man
 - Unit seams are limited to deterministic policy and state behavior: lifecycle transitions, retry and shutdown idempotence, path selection, navigation allowlisting, diagnostic redaction, Node engine validation, and release version validation.
 - The test workflow is manually triggered and uses a non-fail-fast Windows, macOS, and Linux matrix. Each platform runs unit, integration, and Playwright Electron E2E layers. Linux GUI tests run under Xvfb.
 - E2E coverage includes startup-to-Web transition, single-instance focus, startup failure and retry, external-link handling, and final-window shutdown.
-- Integration fixtures use a temporary Harness Home and fallback workspace; Windows fixtures deliberately contain spaces.
+- Integration fixtures use a temporary Harness Home and Desktop default working directory; Windows fixtures deliberately contain spaces.
 - Packaged-runtime verification runs after electron-builder packaging and starts the Host from the packaged directory before probing the Web surface. A runtime-closure gate separately detects dependencies pruned despite dynamic bundle/plugin resolution.
 - Installer construction remains in the build workflow rather than the behavior-test workflow. Platform artifact smoke checks belong beside the native packaging jobs.
 - Exact row-for-row plugin inventory parity with the CLI is not a milestone gate. The externally visible Web startup and user journey are required; inventory parity may be added after packaging stabilizes.
@@ -101,7 +101,7 @@ The milestone provides manually triggered three-platform test automation and man
 - A custom application framework or replacement UI for the upstream Web Client.
 - Exact CLI plugin inventory parity testing.
 - Universal macOS binaries, Windows ARM64, Linux ARM64, MSI, MSIX, Store distribution, or other package formats.
-- Moving the Host into a utility or child process before the first end-to-end path is proven.
+- Replacing the isolated Host child with a utility process or a separate service.
 
 ## Further Notes
 

@@ -11,7 +11,7 @@ describe('desktop paths', () => {
     const selected = selectDesktopPaths({ getPath: name => name === 'userData' ? root : logs })
     expect(selected).toEqual({
       harnessHome: path.join(root, 'deepseek-harness-desktop', 'harness-home'),
-      fallbackWorkspace: path.join(root, 'deepseek-harness-desktop', 'fallback-workspace'),
+      defaultWorkingDirectory: path.join(root, 'deepseek-harness-desktop', 'default-working-directory'),
       logs
     })
     await prepareDesktopPaths(selected)

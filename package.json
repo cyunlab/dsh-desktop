@@ -100,7 +100,7 @@
     "executableName": "deepseek-harness-desktop",
     "artifactName": "deepseek-harness-desktop-${version}-${os}-${arch}.${ext}",
     "asar": true,
-    "asarUnpack": ["node_modules/**/*"],
+    "asarUnpack": ["node_modules/**/*", "dist/host-process/**/*"],
     "icon": "assets/dsh-desktop-logo.svg",
     "files": ["dist/**/*", "package.json"],
     "directories": { "output": "release" },

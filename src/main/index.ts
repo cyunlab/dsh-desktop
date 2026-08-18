@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { inspect } from 'node:util'
 import { ApplicationLifecycle } from './lifecycle/application.js'
 import { wireFinalWindowShutdown, wireLifecycleToWindow } from './lifecycle/electron-wiring.js'
-import { HarnessHostLauncher } from './host/harness-launcher.js'
+import { ProcessHostLauncher } from './host/process-launcher.js'
 import { prepareDesktopPaths, selectDesktopPaths } from './paths.js'
 import { assertSupportedNodeVersion } from './version-guard.js'
 import { DesktopWindow, type DesktopBrowserWindow, type DesktopBrowserWindowOptions } from './window/desktop-window.js'
@@ -21,7 +21,6 @@ const desktopLogoFileName = 'dsh-desktop-logo.png'
 app.setName('DeepSeek Harness Desktop')
 configureElectronRuntime({
   platform: process.platform,
-  env: process.env,
   removeApplicationMenu: () => Menu.setApplicationMenu(null)
 })
 if (__DSH_E2E__ && process.env.DSH_DESKTOP_TEST_USER_DATA) app.setPath('userData', process.env.DSH_DESKTOP_TEST_USER_DATA)
@@ -99,7 +98,7 @@ async function runPackagedHostProbe(): Promise<void> {
     await app.whenReady()
     const paths = selectDesktopPaths(app)
     await prepareDesktopPaths(paths)
-    const handle = await new HarnessHostLauncher({ readiness: { timeoutMs: 30_000 } }).launch(paths)
+    const handle = await new ProcessHostLauncher({ readiness: { timeoutMs: 120_000 } }).launch(paths)
     try {
       process.stdout.write(`${JSON.stringify({ probe: 'packaged-host-ready', origin: handle.origin })}\n`)
     } finally {
@@ -129,7 +128,7 @@ async function run(): Promise<void> {
   windowDiagnostics = diagnostics
   const launcher = __DSH_E2E__ && process.env.DSH_DESKTOP_TEST_HOST === 'fake'
     ? new FakeHostLauncher(Number.parseInt(process.env.DSH_DESKTOP_TEST_FAILURES ?? '0', 10) || 0)
-    : new HarnessHostLauncher()
+    : new ProcessHostLauncher()
   const lifecycle = new ApplicationLifecycle(launcher, paths, 5_000, diagnostics)
   await desktopWindow.open()
   wireLifecycleToWindow(lifecycle, desktopWindow)

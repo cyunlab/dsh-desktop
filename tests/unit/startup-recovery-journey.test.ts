@@ -28,7 +28,7 @@ const context: DiagnosticContext = {
 describe('startup failure recovery journey', () => {
   it('renders failure, exposes actions, retries through the bridge, and keeps copied/logged diagnostics redacted', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'dsh recovery journey '))
-    const paths = { harnessHome: path.join(root, 'home'), fallbackWorkspace: path.join(root, 'workspace'), logs: path.join(root, 'logs') }
+    const paths = { harnessHome: path.join(root, 'home'), defaultWorkingDirectory: path.join(root, 'workspace'), logs: path.join(root, 'logs') }
     const diagnostics = new RollingDiagnostics(paths.logs, context)
     const dispose = vi.fn(async () => undefined)
     const launch = vi.fn()

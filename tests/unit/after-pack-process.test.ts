@@ -17,9 +17,11 @@ describe.skipIf(process.platform === 'win32')('afterPack command timeout cleanup
     let pid = 0
     let childAbsent = false
     let groupAbsent = false
+    // 给 Vitest worker 线程中的子进程留出启动和输出 PID 的确定余量，再触发进程组清理。
+    const timeoutMs = 1_000
     try {
       try {
-        await runCommandWithTimeout(process.execPath, ['-e', script], {}, 150)
+        await runCommandWithTimeout(process.execPath, ['-e', script], {}, timeoutMs)
       } catch (error) {
         message = error instanceof Error ? error.message : String(error)
         group = Number(message.match(/process-group:(\d+)/)?.[1])
