@@ -6,7 +6,7 @@ const workflow = (await readFile(new URL('../../.github/workflows/build.yml', im
 describe('native build workflow contract', () => {
   it('pins every third-party action to a reviewed commit', () => {
     const actions = [...workflow.matchAll(/uses:\s+([^\s#]+)(?:\s+#\s+(v\S+))?/g)]
-    expect(actions).toHaveLength(6)
+    expect(actions).toHaveLength(7)
     for (const [, action, version] of actions) {
       expect(action).toMatch(/^[\w-]+\/[\w-]+@[0-9a-f]{40}$/)
       expect(version).toMatch(/^v\d+\.\d+\.\d+$/)
@@ -45,6 +45,7 @@ describe('native build workflow contract', () => {
 
   it('gates a draft-only tag release on all build jobs', () => {
     expect(workflow).toMatch(/draft-release:[\s\S]*if: github\.event_name == 'push'[\s\S]*needs: build/)
+    expect(workflow).toMatch(/draft-release:[\s\S]*actions\/checkout@[0-9a-f]{40}[\s\S]*node scripts\/reconcile-draft-release\.mjs/)
     expect(workflow).toContain('node scripts/verify-release-version.mjs')
     expect(workflow).toContain('node scripts/reconcile-draft-release.mjs')
     expect(workflow).not.toMatch(/gh release (?:edit|create)[^\n]*--draft=false/)
