@@ -52,4 +52,26 @@ describe('Windows Job Object process ownership', () => {
     expect(bindings.closeHandle).toHaveBeenNthCalledWith(1, 22n)
     expect(bindings.closeHandle).toHaveBeenNthCalledWith(2, 11n)
   })
+
+  it('retries a failed Job Object close, then becomes idempotent after success', () => {
+    const bindings = createFakeBindings()
+    let jobCloseAttempts = 0
+    bindings.closeHandle = vi.fn(handle => {
+      bindings.calls.push(`close:${String(handle)}`)
+      if (handle === 11n) {
+        jobCloseAttempts += 1
+        if (jobCloseAttempts === 1) return 0
+      }
+      return 1
+    })
+    bindings.getLastError = vi.fn(() => 6)
+    const owner = createWindowsJobForProcess(4321, { bindings })
+
+    expect(() => owner.close()).toThrow(/CloseHandle\(job\) failed \(6\)/)
+    expect(() => owner.close()).not.toThrow()
+    owner.close()
+    expect(bindings.closeHandle).toHaveBeenCalledTimes(3)
+    expect(bindings.closeHandle).toHaveBeenNthCalledWith(2, 11n)
+    expect(bindings.closeHandle).toHaveBeenNthCalledWith(3, 11n)
+  })
 })

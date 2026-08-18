@@ -80,8 +80,8 @@ function createIdempotentOwner(job: WindowsNativeHandle, bindings: WindowsJobBin
   return {
     close(): void {
       if (closed) return
-      closed = true
       closeRequiredHandle(job, 'CloseHandle(job)', bindings)
+      closed = true
     }
   }
 }
