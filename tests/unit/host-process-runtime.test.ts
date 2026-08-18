@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import type { ChildProcess, SpawnOptions } from 'node:child_process'
 import { describe, expect, it, vi } from 'vitest'
 import { startHostProcess, type HostProcessRuntime, type HostProcessSystem } from '../../src/host-process/index.js'
 
@@ -7,6 +8,11 @@ class FakeHostSystem extends EventEmitter implements HostProcessSystem {
   readonly messages: unknown[] = []
   connected = true
   exitCode = 0
+  platform: NodeJS.Platform = process.platform
+  pid = 4321
+  parentDisconnectTimeoutMs?: number
+  spawnProcess?: (command: string, args: string[], options: SpawnOptions) => ChildProcess
+  readonly exitCalls: number[] = []
   sendError?: Error
   holdSend = false
 
@@ -23,12 +29,13 @@ class FakeHostSystem extends EventEmitter implements HostProcessSystem {
   /** 记录退出码而不结束 Vitest 进程。 */
   exit(code = 0): never {
     this.exitCode = code
+    this.exitCalls.push(code)
     return undefined as never
   }
 }
 
 /** 创建一个可观察的 fake Harness runtime。 */
-function runtime(dispose = vi.fn(async () => undefined)): HostProcessRuntime {
+function runtime(dispose: () => Promise<void> = vi.fn(async () => undefined)): HostProcessRuntime {
   return {
     bootHarnessHost: vi.fn(async () => ({
       origin: 'http://127.0.0.1:43210',
@@ -119,4 +126,29 @@ describe('Host child runtime', () => {
     expect(dispose).toHaveBeenCalledOnce()
     expect(system.exitCode).toBe(0)
   })
+
+  it('bounds parent disconnect when Host dispose never settles and invokes emergency tree cleanup', async () => {
+    const system = new FakeHostSystem()
+    system.platform = 'win32'
+    system.parentDisconnectTimeoutMs = 25
+    const terminator = new EventEmitter() as EventEmitter & ChildProcess & {
+      exitCode: number | null
+      signalCode: NodeJS.Signals | null
+      kill: (signal: NodeJS.Signals) => boolean
+    }
+    terminator.exitCode = null
+    terminator.signalCode = null
+    terminator.kill = vi.fn(() => true)
+    system.spawnProcess = vi.fn(() => {
+      queueMicrotask(() => terminator.emit('exit', 0, null))
+      return terminator
+    })
+    const dispose = vi.fn(() => new Promise<void>(() => {}))
+
+    await startHostProcess(runtime(dispose), system)
+    system.emit('disconnect')
+    await vi.waitFor(() => expect(system.exitCalls).toContain(1))
+    expect(dispose).toHaveBeenCalledOnce()
+    expect(system.spawnProcess).toHaveBeenCalledWith('taskkill.exe', ['/PID', '4321', '/T', '/F'], expect.objectContaining({ shell: false }))
+  }, 5_000)
 })

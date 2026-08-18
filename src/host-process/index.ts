@@ -5,6 +5,7 @@ import {
   type HostProcessCommand,
   type HostProcessMessage
 } from '../shared/host-process-contract.js'
+import { emergencyExitHostProcess, type HostProcessEmergencySystem } from './emergency-exit.js'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -18,7 +19,7 @@ export interface HostProcessRuntime {
 }
 
 /** Host child 进程所需的最小 IPC/进程接口。 */
-export interface HostProcessSystem {
+export interface HostProcessSystem extends HostProcessEmergencySystem {
   readonly env: NodeJS.ProcessEnv
   cwd(): string
   readonly connected?: boolean
@@ -27,7 +28,7 @@ export interface HostProcessSystem {
   on(event: 'message', listener: (message: unknown) => void): unknown
   on(event: 'disconnect', listener: () => void): unknown
   exitCode: number
-  exit(code?: number): never
+  readonly parentDisconnectTimeoutMs?: number
 }
 
 type HostProcessShutdownCause =
@@ -43,6 +44,7 @@ export async function startHostProcess(
   let handle: Awaited<ReturnType<HostProcessRuntime['bootHarnessHost']>> | undefined
   let readySent = false
   let stopping: Promise<void> | undefined
+  let disconnectedStopping: Promise<void> | undefined
   let parentDisconnected = false
   const pendingSendRejectors = new Set<(error: Error) => void>()
 
@@ -86,12 +88,30 @@ export async function startHostProcess(
     return stopping
   }
 
+  /** 父 IPC 断开时用独立预算等待 dispose，超时后自发清理整个 child 树。 */
+  const shutdownAfterParentDisconnect = (): Promise<void> => {
+    if (disconnectedStopping) return disconnectedStopping
+    disconnectedStopping = (async () => {
+      const timeoutMs = system.parentDisconnectTimeoutMs ?? 2_000
+      const disposed = await disposeWithTimeout(handle, timeoutMs)
+      if (!disposed) {
+        await emergencyExitHostProcess(system, timeoutMs)
+        return
+      }
+      system.exitCode = 0
+      system.exit(0)
+    })()
+    return disconnectedStopping
+  }
+
   // 父进程消失时不能保留真实 Harness 及其监听器。
   system.on('disconnect', () => {
     parentDisconnected = true
     for (const reject of pendingSendRejectors) reject(new Error('Host parent IPC disconnected'))
     pendingSendRejectors.clear()
-    void shutdown(0)
+    const emergencyShutdown = shutdownAfterParentDisconnect()
+    if (!stopping) stopping = emergencyShutdown
+    void emergencyShutdown
   })
   system.on('message', message => {
     let command: HostProcessCommand
@@ -107,13 +127,36 @@ export async function startHostProcess(
       defaultWorkingDirectory: system.cwd()
     })
     if (stopping || parentDisconnected) {
-      await handle.dispose().catch(() => undefined)
+      if (parentDisconnected) {
+        const disposed = await disposeWithTimeout(handle, system.parentDisconnectTimeoutMs ?? 2_000)
+        if (!disposed) await emergencyExitHostProcess(system, system.parentDisconnectTimeoutMs ?? 2_000)
+      } else {
+        await handle.dispose().catch(() => undefined)
+      }
       return
     }
     await send({ type: 'ready', origin: handle.origin, binding: handle.binding })
     readySent = true
   } catch (error) {
     await shutdown(1, { kind: 'startup-failed', error })
+  }
+}
+
+/** 在有限时间内等待已创建 Host Handle 的 dispose，避免父 IPC 消失后悬挂。 */
+async function disposeWithTimeout(
+  handle: Awaited<ReturnType<HostProcessRuntime['bootHarnessHost']>> | undefined,
+  timeoutMs: number
+): Promise<boolean> {
+  if (!handle) return true
+  const disposal = Promise.resolve().then(() => handle.dispose()).then(() => true, () => false)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      disposal,
+      new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs)) })
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
   }
 }
 

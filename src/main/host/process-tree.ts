@@ -22,7 +22,7 @@ export async function terminateChildProcess(
   const useProcessGroup = options.useProcessGroup ?? platform !== 'win32'
   const deadline = options.deadline ?? Date.now() + Math.max(0, timeoutMs)
   // Unix 的 leader 退出后进程组可能仍有插件后代，仍需检查并清理该组。
-  if (hasExited(child) && (platform === 'win32' || !useProcessGroup)) return
+  if (hasExited(child) && platform !== 'win32' && !useProcessGroup) return
   if (pid === undefined) {
     if (hasExited(child)) return
     await terminateLeader(child, deadline)

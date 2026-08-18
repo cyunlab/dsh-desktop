@@ -75,4 +75,27 @@ describe('Host process tree termination', () => {
     }))
     expect(child.kill).toHaveBeenCalledWith('SIGKILL')
   })
+
+  it('still asks taskkill to clean descendants after a Windows leader exited', async () => {
+    class ExitedChild extends EventEmitter {
+      pid = 4321
+      exitCode: number | null = 1
+      signalCode: NodeJS.Signals | null = null
+      kill = vi.fn(() => true)
+    }
+    const terminator = new ExitedChild()
+    terminator.pid = 9999
+    const child = new ExitedChild()
+    const spawnProcess = vi.fn(() => {
+      queueMicrotask(() => terminator.emit('exit', 0, null))
+      return terminator as unknown as ChildProcess
+    })
+
+    await terminateChildProcess(child as unknown as ChildProcess, 50, {
+      platform: 'win32',
+      spawnProcess
+    })
+    expect(spawnProcess).toHaveBeenCalledWith('taskkill.exe', ['/pid', '4321', '/T', '/F'], expect.objectContaining({ shell: false }))
+    expect(child.kill).not.toHaveBeenCalled()
+  })
 })
