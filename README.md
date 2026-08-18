@@ -1,8 +1,8 @@
 <div align="center">
   <img src="./assets/dsh-desktop-logo.svg" width="160" alt="DeepSeek Harness Desktop Logo">
   <h1>DeepSeek Harness Desktop</h1>
-  <p>更开放的 DeepSeek Harness 桌面应用，将“一切皆插件”的理念进一步延伸至桌面能力。欢迎 ⭐ <a href="https://github.com/XLCYun/dsh-desktop">Star</a>！</p>
-  <p><a href="./README.en.md">English</a> · <a href="#roadmap">路线图</a> · <a href="#参与项目">参与项目</a></p>
+  <p>更开放的 DeepSeek Harness 桌面应用，所有桌面能力同样支持定制！将“一切皆插件”的理念进一步延伸至桌面。欢迎 ⭐ <a href="https://github.com/XLCYun/dsh-desktop">Star</a>！</p>
+  <p><a href="./README.en.md">English</a> · <a href="#下载">下载</a> · <a href="#roadmap">路线图</a> · <a href="#参与项目">参与项目</a></p>
 </div>
 
 ## 项目简介
@@ -16,6 +16,17 @@ DeepSeek Harness Desktop 是一款安装即用的跨平台桌面应用。用户�
 **我们希望继续发扬“一切皆插件”的理念，把桌面能力也开放为插件能力，供插件直接调用，从而拓展 DeepSeek Harness 插件的能力边界。**
 
 项目目前处于早期开发阶段。第一个可运行版本已经完成，公开发行、签名和自动更新仍在规划中。
+
+## ⬇️ 下载
+
+前往 [GitHub Releases](https://github.com/XLCYun/dsh-desktop/releases) 下载最新版本。每个 Release 提供以下四种安装包，请根据你的操作系统和处理器架构选择：
+
+| 系统 | 适用设备 | 下载 |
+| --- | --- | --- |
+| Windows | Intel / AMD 64 位 | `windows-x64` |
+| macOS | Apple 芯片（M 系列） | `macos-arm64` |
+| macOS | Intel 芯片 | `macos-x64` |
+| Linux | Intel / AMD 64 位 | `linux-x64` |
 
 ## 🧩 一切皆插件
 

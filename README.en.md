@@ -1,8 +1,8 @@
 <div align="center">
   <img src="./assets/dsh-desktop-logo.svg" width="160" alt="DeepSeek Harness Desktop Logo">
   <h1>DeepSeek Harness Desktop</h1>
-  <p>A more open DeepSeek Harness desktop app that extends the “everything is a plugin” philosophy to native desktop capabilities. Give us a ⭐ <a href="https://github.com/XLCYun/dsh-desktop">Star</a>!</p>
-  <p><a href="./README.md">简体中文</a> · <a href="#roadmap">Roadmap</a> · <a href="#contributing">Contributing</a></p>
+  <p>A more open DeepSeek Harness desktop app that extends the “everything is a plugin” philosophy to desktop capabilities, with all desktop capabilities customizable through plugins! Give us a ⭐ <a href="https://github.com/XLCYun/dsh-desktop">Star</a>!</p>
+  <p><a href="./README.md">简体中文</a> · <a href="#download">Download</a> · <a href="#roadmap">Roadmap</a> · <a href="#contributing">Contributing</a></p>
 </div>
 
 ## Overview
@@ -16,6 +16,17 @@ Desktop apps offer native capabilities that the web cannot replace, including gl
 **We want to carry forward the “everything is a plugin” philosophy by exposing desktop capabilities to plugins as well. Giving plugins direct access to them expands what DeepSeek Harness plugins can do.**
 
 This project is in early development. The first runnable milestone is complete, while public distribution, code signing, and automatic updates are still planned.
+
+## ⬇️ Download
+
+Visit [GitHub Releases](https://github.com/XLCYun/dsh-desktop/releases) to download the latest version. Each release provides the following four packages; choose the one that matches your operating system and processor architecture:
+
+| Platform | Suitable devices | Download |
+| --- | --- | --- |
+| Windows | 64-bit Intel / AMD | `windows-x64` |
+| macOS | Apple silicon (M-series) | `macos-arm64` |
+| macOS | Intel | `macos-x64` |
+| Linux | 64-bit Intel / AMD | `linux-x64` |
 
 ## 🧩 Everything is a plugin
 
