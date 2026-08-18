@@ -65,19 +65,31 @@ describe('ProcessHostLauncher', () => {
   }, 15_000)
 
   /** 使用 fixture 场景启动一个真实 child，验证 launcher 的失败与清理边界。 */
-  async function launchScenario(scenario: string, options: { startupTimeoutMs?: number; shutdownTimeoutMs?: number } = {}) {
+  async function launchScenario(scenario: string, options: {
+    startupTimeoutMs?: number
+    shutdownTimeoutMs?: number
+    blockStopSendCallback?: boolean
+    fetch?: typeof globalThis.fetch
+  } = {}) {
     const paths = await fixturePaths()
     let child: ChildProcess | undefined
     const hostEntry = fileURLToPath(new URL('../../fixtures/host-process-scenarios.mjs', import.meta.url))
     const launcher = new ProcessHostLauncher({
       ...options,
       hostEntry,
-      readiness: { timeoutMs: options.startupTimeoutMs ?? 5_000 },
+      readiness: { timeoutMs: options.startupTimeoutMs ?? 5_000, fetch: options.fetch },
       spawnProcess: (command, args, spawnOptions) => {
         child = spawnChild(command, args, {
           ...spawnOptions,
           env: { ...spawnOptions.env, DSH_HOST_SCENARIO: scenario }
         })
+        if (options.blockStopSendCallback) {
+          const originalSend = child.send.bind(child)
+          child.send = ((message: unknown, ...rest: unknown[]) => {
+            if (typeof message === 'object' && message !== null && (message as { type?: unknown }).type === 'stop') return child
+            return originalSend(message as never, ...(rest as never[]))
+          }) as typeof child.send
+        }
         return child
       }
     })
@@ -105,6 +117,19 @@ describe('ProcessHostLauncher', () => {
     const started = Date.now()
     await expect(attempt.launcher.launch(attempt.paths)).rejects.toThrow(/Host child exited|exited before readiness/)
     expect(Date.now() - started).toBeLessThan(2_000)
+  }, 10_000)
+
+  it('aborts an in-flight HTTP probe when the child fails during readiness', async () => {
+    const request = vi.fn((_origin: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason))
+    }))
+    const attempt = await launchScenario('ready-http-fail', { fetch: request })
+    await expect(attempt.launcher.launch(attempt.paths)).rejects.toThrow(/Host child exited|exited before readiness/)
+    expect(request).toHaveBeenCalledOnce()
+    const signal = request.mock.calls[0]?.[1]?.signal
+    expect(signal?.aborted).toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(request).toHaveBeenCalledOnce()
   }, 10_000)
 
   it('treats startup timeout as an attempt failure and terminates that child', async () => {
@@ -142,4 +167,13 @@ describe('ProcessHostLauncher', () => {
       await hangingHandle.dispose().catch(() => undefined)
     }
   }, 15_000)
+
+  it('terminates when the stop IPC callback never settles within the shutdown budget', async () => {
+    const attempt = await launchScenario('ready', { shutdownTimeoutMs: 100, blockStopSendCallback: true })
+    const handle = await attempt.launcher.launch(attempt.paths)
+    const started = Date.now()
+    await expect(handle.dispose()).resolves.toBeUndefined()
+    expect(Date.now() - started).toBeLessThan(500)
+    await vi.waitFor(() => expect(attempt.getChild()?.exitCode ?? attempt.getChild()?.signalCode ?? null).not.toBeNull())
+  }, 5_000)
 })

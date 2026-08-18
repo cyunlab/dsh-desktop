@@ -22,4 +22,20 @@ describe('HTTP readiness', () => {
       fetch: vi.fn(async () => { throw new Error('refused') })
     })).rejects.toThrow('within 10 ms')
   })
+
+  it('stops polling immediately when the caller aborts readiness', async () => {
+    const controller = new AbortController()
+    const request = vi.fn(async () => {
+      controller.abort(new Error('Host child exited'))
+      throw new Error('refused')
+    })
+    await expect(waitForHttpReady('http://127.0.0.1:3456', {
+      timeoutMs: 1_000,
+      intervalMs: 100,
+      fetch: request,
+      signal: controller.signal
+    })).rejects.toThrow('Host child exited')
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(request).toHaveBeenCalledOnce()
+  })
 })

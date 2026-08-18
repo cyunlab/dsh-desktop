@@ -5,6 +5,8 @@ import {
   type HostProcessCommand,
   type HostProcessMessage
 } from '../shared/host-process-contract.js'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 /** 可被测试替换的 Host child 进程运行时依赖。 */
 export interface HostProcessRuntime {
@@ -27,6 +29,10 @@ export interface HostProcessSystem {
   exitCode: number
   exit(code?: number): never
 }
+
+type HostProcessShutdownCause =
+  | { readonly kind: 'normal' }
+  | { readonly kind: 'startup-failed'; readonly error: unknown }
 
 /** 启动 child runtime；真实 Harness runtime 只在此函数内动态载入。 */
 export async function startHostProcess(
@@ -57,7 +63,7 @@ export async function startHostProcess(
   })
 
   /** 统一处理 stop、父 IPC 消失和启动异常，确保已创建的 Handle 总会 dispose。 */
-  const shutdown = (exitCode: number, startupError?: unknown): Promise<void> => {
+  const shutdown = (exitCode: number, cause: HostProcessShutdownCause = { kind: 'normal' }): Promise<void> => {
     if (stopping) return stopping
     stopping = (async () => {
       try {
@@ -66,8 +72,8 @@ export async function startHostProcess(
         // 退出路径不能把 child 留在 Harness 状态；原始错误通过受控协议报告。
       }
       try {
-        if (startupError !== undefined && !readySent && !parentDisconnected) {
-          try { await send({ type: 'startup-failed', error: serializeHostProcessError(startupError) }) } catch { /* parent may already be gone */ }
+        if (cause.kind === 'startup-failed' && !readySent && !parentDisconnected) {
+          try { await send({ type: 'startup-failed', error: serializeHostProcessError(cause.error) }) } catch { /* parent may already be gone */ }
         } else if (exitCode === 0 && readySent && !parentDisconnected) {
           try { await send({ type: 'stopped' }) } catch { /* parent may already be gone */ }
         }
@@ -107,7 +113,7 @@ export async function startHostProcess(
     await send({ type: 'ready', origin: handle.origin, binding: handle.binding })
     readySent = true
   } catch (error) {
-    await shutdown(1, error)
+    await shutdown(1, { kind: 'startup-failed', error })
   }
 }
 
@@ -122,9 +128,17 @@ async function main(): Promise<void> {
   })
 }
 
-void main().catch(error => {
-  // main() 失败可能发生在 IPC 已经不可用时，只允许受控错误流出。
-  const message = deserializeHostProcessError(serializeHostProcessError(error))
-  process.stderr.write(`${message.name}: ${message.message}\n`)
-  process.exitCode = 1
-})
+/** 只在该文件被 child_process 直接执行时启动真实 Host。 */
+function isDirectEntry(): boolean {
+  return process.argv[1] !== undefined
+    && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+}
+
+if (isDirectEntry()) {
+  void main().catch(error => {
+    // main() 失败可能发生在 IPC 已经不可用时，只允许受控错误流出。
+    const message = deserializeHostProcessError(serializeHostProcessError(error))
+    process.stderr.write(`${message.name}: ${message.message}\n`)
+    process.exitCode = 1
+  })
+}

@@ -72,6 +72,20 @@ describe('Host child runtime', () => {
     expect(system.exitCode).toBe(1)
   })
 
+  it('reports a rejected undefined value as a startup failure', async () => {
+    const system = new FakeHostSystem()
+    const failingRuntime: HostProcessRuntime = {
+      bootHarnessHost: async () => Promise.reject(undefined)
+    }
+
+    await startHostProcess(failingRuntime, system)
+    expect(system.messages).toEqual([{
+      type: 'startup-failed',
+      error: { name: 'Error', message: 'undefined' }
+    }])
+    expect(system.exitCode).toBe(1)
+  })
+
   it('disposes a created runtime when sending ready fails', async () => {
     const system = new FakeHostSystem()
     const dispose = vi.fn(async () => undefined)

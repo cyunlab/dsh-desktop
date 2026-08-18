@@ -120,6 +120,7 @@ class ProcessHostController implements HostHandle {
   readonly #failed = deferred<never>()
   readonly #stopped = deferred<void>()
   readonly #closed = deferred<HostClosedEvent>()
+  readonly #readinessAbort = new AbortController()
   #phase: 'starting' | 'ready' | 'closed' = 'starting'
   #intentional = false
   #disposePromise?: Promise<void>
@@ -159,7 +160,8 @@ class ProcessHostController implements HostHandle {
     await Promise.race([
       waitForHttpReady(ready.origin, {
         ...this.#options.readiness,
-        timeoutMs: this.#options.readiness?.timeoutMs ?? timeoutMs
+        timeoutMs: this.#options.readiness?.timeoutMs ?? timeoutMs,
+        signal: this.#readinessAbort.signal
       }),
       this.#failed.promise
     ])
@@ -171,16 +173,14 @@ class ProcessHostController implements HostHandle {
   /** 启动失败时终止本次 child 并释放所有启动监听。 */
   async abortStartup(): Promise<void> {
     if (this.#closeEvent) {
-      await this.#treeTermination
+      const deadline = Date.now() + (this.#options.shutdownTimeoutMs ?? 30_000)
+      await this.#waitForTreeTermination(deadline)
       return
     }
     this.#intentional = true
+    const deadline = Date.now() + (this.#options.shutdownTimeoutMs ?? 30_000)
     try {
-      await terminateChildProcess(
-        this.#child,
-        this.#options.shutdownTimeoutMs ?? 30_000,
-        this.#options.processTree
-      )
+      await this.#terminateWithin(deadline)
     } finally {
       this.#phase = 'closed'
       this.#cleanupListeners()
@@ -198,29 +198,39 @@ class ProcessHostController implements HostHandle {
   /** 执行一次有界的 Host child 优雅关闭。 */
   async #dispose(): Promise<void> {
     if (this.#closeEvent) {
-      await this.#treeTermination
+      const deadline = Date.now() + (this.#options.shutdownTimeoutMs ?? 30_000)
+      await this.#waitForTreeTermination(deadline)
       return
     }
     this.#intentional = true
+    const timeoutMs = this.#options.shutdownTimeoutMs ?? 30_000
+    const deadline = Date.now() + timeoutMs
     try {
-      const timeoutMs = this.#options.shutdownTimeoutMs ?? 30_000
       if (this.#phase !== 'closed' && this.#child.connected) {
-        await sendCommand(this.#child, { type: 'stop' }).catch(() => undefined)
+        const stopSent = await withTimeout(
+          sendCommand(this.#child, { type: 'stop' }, remaining(deadline)),
+          remaining(deadline),
+          'Host stop IPC did not settle within the shutdown budget'
+        ).then(() => true).catch(() => false)
+        if (!stopSent) {
+          await this.#terminateWithin(deadline)
+          return
+        }
       }
       const firstSettlement = await withTimeout(
         Promise.race([
           this.#stopped.promise.then(() => 'stopped' as const),
           this.#closed.promise.then(() => 'closed' as const)
         ]),
-        timeoutMs,
+        remaining(deadline),
         `Host shutdown exceeded ${timeoutMs} ms`
       ).catch(() => undefined)
       const exitSettlement = firstSettlement === 'stopped'
-        ? await withTimeout(this.#closed.promise, timeoutMs, 'Host child did not exit after stopped').catch(() => undefined)
+        ? await withTimeout(this.#closed.promise, remaining(deadline), 'Host child did not exit after stopped').catch(() => undefined)
         : firstSettlement
       if (!exitSettlement) {
-        await terminateChildProcess(this.#child, timeoutMs, this.#options.processTree)
-        await withTimeout(this.#closed.promise, Math.min(timeoutMs, 2_000), 'Host child did not report exit').catch(() => undefined)
+        await this.#terminateWithin(deadline)
+        await withTimeout(this.#closed.promise, remaining(deadline), 'Host child did not report exit').catch(() => undefined)
       }
     } finally {
       if (!this.#closeEvent) {
@@ -235,8 +245,8 @@ class ProcessHostController implements HostHandle {
   #onMessage = (raw: unknown): void => {
     let message: HostProcessMessage
     try { message = parseHostProcessMessage(raw) }
-    catch (error) {
-      this.#fail(new Error('Host child sent an invalid IPC message', { cause: error }))
+    catch {
+      this.#fail(new Error('Host child sent an invalid IPC message'))
       return
     }
     if (message.type === 'ready') {
@@ -255,8 +265,8 @@ class ProcessHostController implements HostHandle {
   #onError = (error: Error): void => {
     if (this.#phase === 'starting') this.#fail(error)
     else if (!this.#intentional) {
-      this.#treeTermination = terminateChildProcess(this.#child, this.#options.shutdownTimeoutMs ?? 30_000, this.#options.processTree)
-        .catch(() => undefined)
+      this.#abortReadiness(error)
+      this.#startUnexpectedTermination()
       this.#settleClosed({ intentional: false, error })
     }
   }
@@ -272,10 +282,10 @@ class ProcessHostController implements HostHandle {
         ? { error: new Error(`Host child exited with ${code ?? signal ?? 'unknown'}`) }
         : {})
     }
-    if (wasStarting) this.#failed.reject(event.error ?? new Error('Host child exited before readiness'))
+    if (wasStarting) this.#fail(event.error ?? new Error('Host child exited before readiness'))
     if (!this.#intentional) {
-      this.#treeTermination = terminateChildProcess(this.#child, this.#options.shutdownTimeoutMs ?? 30_000, this.#options.processTree)
-        .catch(() => undefined)
+      this.#abortReadiness(event.error)
+      this.#startUnexpectedTermination()
     }
     this.#settleClosed(event)
   }
@@ -283,7 +293,41 @@ class ProcessHostController implements HostHandle {
   /** 只结算一次启动失败，避免 error/exit 竞态重复处理。 */
   #fail(error: Error): void {
     if (this.#phase !== 'starting') return
+    this.#abortReadiness(error)
     this.#failed.reject(error)
+  }
+
+  /** 取消正在进行的 HTTP readiness，避免 child 失败后继续轮询。 */
+  #abortReadiness(reason?: unknown): void {
+    if (!this.#readinessAbort.signal.aborted) this.#readinessAbort.abort(reason)
+  }
+
+  /** 启动一次有界的意外 Host 进程树清理。 */
+  #startUnexpectedTermination(): void {
+    if (this.#treeTermination) return
+    const timeoutMs = this.#options.shutdownTimeoutMs ?? 30_000
+    this.#treeTermination = terminateChildProcess(
+      this.#child,
+      timeoutMs,
+      { ...this.#options.processTree, deadline: Date.now() + timeoutMs }
+    ).catch(() => undefined)
+  }
+
+  /** 按调用方截止时间启动一次强制进程树清理。 */
+  #terminateWithin(deadline: number): Promise<void> {
+    if (this.#treeTermination) return this.#treeTermination
+    this.#treeTermination = terminateChildProcess(this.#child, remaining(deadline), {
+      ...this.#options.processTree,
+      deadline
+    })
+    return this.#treeTermination
+  }
+
+  /** 在调用方的 shutdown 预算内等待已经开始的进程树清理。 */
+  async #waitForTreeTermination(deadline: number): Promise<void> {
+    if (!this.#treeTermination) return
+    await withTimeout(this.#treeTermination, remaining(deadline), 'Host process tree cleanup exceeded the shutdown budget')
+      .catch(() => undefined)
   }
 
   /** 只结算一次 closed，并清理所有 parent-side child/stream listeners。 */
@@ -297,6 +341,7 @@ class ProcessHostController implements HostHandle {
 
   /** 从 child 和 stdout/stderr 移除本 adapter 注册的监听器。 */
   #cleanupListeners(): void {
+    this.#abortReadiness(new Error('Host readiness was cancelled'))
     this.#child.off('message', this.#onMessage)
     this.#child.off('exit', this.#onExit)
     this.#child.off('error', this.#onError)
@@ -319,6 +364,7 @@ function deferred<T>(): { promise: Promise<T>; resolve(value: T): void; reject(e
 
 /** 给 readiness/关闭操作增加可配置的超时边界。 */
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  if (timeoutMs <= 0) return Promise.reject(new Error(message))
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     return await Promise.race([
@@ -331,9 +377,27 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
 }
 
 /** 向已连接 child 发送受控 stop 命令。 */
-function sendCommand(child: ChildProcess, command: { readonly type: 'stop' }): Promise<void> {
+function sendCommand(child: ChildProcess, command: { readonly type: 'stop' }, timeoutMs: number): Promise<void> {
   return new Promise((resolve, reject) => {
     if (!child.connected || !child.send) { reject(new Error('Host child IPC is disconnected')); return }
-    child.send(command, error => error ? reject(error) : resolve())
+    let settled = false
+    const finish = (error?: Error | null): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (error) reject(error)
+      else resolve()
+    }
+    const timer = setTimeout(() => finish(new Error('Host stop IPC did not settle')), Math.max(0, timeoutMs))
+    try {
+      child.send(command, finish)
+    } catch (error) {
+      finish(error as Error)
+    }
   })
+}
+
+/** 计算 launcher shutdown 截止时间的剩余预算。 */
+function remaining(deadline: number): number {
+  return Math.max(0, deadline - Date.now())
 }
