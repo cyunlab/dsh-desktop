@@ -24,4 +24,4 @@ Domain documentation uses the single-context layout. See `docs/agents/domain.md`
 - 在每一个类或函数前添加中文注释
 
 ## Subagent Handoff 开发模式
-使用 subagent + worktree + implement skill 的方式开发代码，需要给出详细的 spec 给 subagent。
+当显式要求使用此模式时：使用 subagent + worktree + implement skill 的方式开发代码，需要给出详细的 spec 给 subagent。
