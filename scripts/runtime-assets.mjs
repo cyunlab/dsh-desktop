@@ -21,6 +21,7 @@ export function shouldRunPackagedProbe(target, host = { platform: process.platfo
   return target.platform === host.platform && target.arch === host.arch
 }
 
+/** 按目标平台列出打包后必须存在的动态运行时资源。 */
 export function requiredRuntimeAssets(target) {
   const { platform, arch } = target
   const assets = [
@@ -29,7 +30,8 @@ export function requiredRuntimeAssets(target) {
     file('@deepseek-ai/dsh-web-app', 'cordis.patch.yml', 'bundle YAML'),
     file('@deepseek-ai/dsh-web-frontend', 'dist/index.html', 'Web frontend'),
     directory('@deepseek-ai/dsh-web-frontend', 'dist/assets', 'Web frontend'),
-    file('@deepseek-ai/dsh-host-directory-picker-native', 'lib/worker.cjs', 'Win32 directory picker worker'),
+    file('@deepseek-ai/dsh-workflow-worker-thread', 'lib/worker.cjs', 'workflow worker'),
+    file('@deepseek-ai/dsh-code-runtime-worker-thread', 'lib/worker.cjs', 'code runtime worker'),
     file('node-pty', platform === 'linux' ? 'build/Release/pty.node' : `prebuilds/${platform}-${arch}/pty.node`, 'native addon'),
     file(`@koromix/koffi-${platform}-${arch}`, `${platform}_${arch}/koffi.node`, 'runtime-resolved carrier'),
     file(`@vscode/ripgrep-${platform}-${arch}`, platform === 'win32' ? 'bin/rg.exe' : 'bin/rg', 'runtime-resolved carrier', true)
@@ -51,6 +53,8 @@ export function requiredRuntimeAssets(target) {
     )
   } else {
     assets.push(
+      file('@deepseek-ai/dsh-host-directory-picker-native', 'lib/worker.cjs', 'Win32 directory picker worker'),
+      file('@deepseek-ai/dsh-sandbox-windows-acl', 'lib/runner.js', 'Win32 ACL runner'),
       file('node-pty', `prebuilds/win32-${arch}/conpty.node`, 'native addon'),
       file('node-pty', `prebuilds/win32-${arch}/conpty_console_list.node`, 'native addon'),
       file(`node-addon-require-builtin-win32-${arch}-msvc`, `prebuilt/win32-${arch}-msvc-napi-v9.node`, 'native addon'),

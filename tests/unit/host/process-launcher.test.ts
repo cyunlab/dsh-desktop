@@ -1,10 +1,11 @@
-import { mkdir, mkdtemp } from 'node:fs/promises'
-import { spawn as spawnChild, type SpawnOptions } from 'node:child_process'
+import { mkdir, mkdtemp, realpath } from 'node:fs/promises'
+import { spawn as spawnChild, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { ProcessHostLauncher } from '../../../src/main/host/process-launcher.js'
+import type { HostHandle } from '../../../src/main/host/launcher.js'
 
 async function fixturePaths() {
   const root = await mkdtemp(path.join(tmpdir(), 'dsh process host '))
@@ -34,24 +35,111 @@ describe('ProcessHostLauncher', () => {
       }
     })
 
-    const handle = await launcher.launch(paths)
-    expect(invocation).toMatchObject({
-      command: process.execPath,
-      args: [fileURLToPath(new URL('../../fixtures/host-process-child.mjs', import.meta.url))],
-      options: {
-        cwd: paths.defaultWorkingDirectory,
-        env: expect.objectContaining({ DSH_HOME: paths.harnessHome, ELECTRON_RUN_AS_NODE: '1' }),
-        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-        windowsHide: true,
-        shell: false
+    let handle: HostHandle | undefined
+    try {
+      handle = await launcher.launch(paths)
+      expect(invocation).toMatchObject({
+        command: process.execPath,
+        args: [fileURLToPath(new URL('../../fixtures/host-process-child.mjs', import.meta.url))],
+        options: {
+          cwd: paths.defaultWorkingDirectory,
+          env: expect.objectContaining({ DSH_HOME: paths.harnessHome, ELECTRON_RUN_AS_NODE: '1' }),
+          stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+          windowsHide: true,
+          shell: false
+        }
+      })
+      expect(handle.origin).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
+      expect((await fetch(handle.origin)).ok).toBe(true)
+      const smoke = await (await fetch(`${handle.origin}/plugin-smoke`)).json() as { nodeMode: boolean; cwd: string }
+      expect(smoke.nodeMode).toBe(true)
+      expect(smoke.cwd).toBe(await realpath(paths.defaultWorkingDirectory))
+      await Promise.all([handle.dispose(), handle.dispose()])
+      expect(process.cwd()).toBe(parentCwd)
+      expect(process.env.DSH_HOME).toBe(parentEnv)
+      await expect(fetch(handle.origin)).rejects.toThrow()
+      expect(output.join('')).not.toContain('DSH_HOME')
+    } finally {
+      await handle?.dispose().catch(() => undefined)
+    }
+  }, 15_000)
+
+  /** 使用 fixture 场景启动一个真实 child，验证 launcher 的失败与清理边界。 */
+  async function launchScenario(scenario: string, options: { startupTimeoutMs?: number; shutdownTimeoutMs?: number } = {}) {
+    const paths = await fixturePaths()
+    let child: ChildProcess | undefined
+    const hostEntry = fileURLToPath(new URL('../../fixtures/host-process-scenarios.mjs', import.meta.url))
+    const launcher = new ProcessHostLauncher({
+      ...options,
+      hostEntry,
+      readiness: { timeoutMs: options.startupTimeoutMs ?? 5_000 },
+      spawnProcess: (command, args, spawnOptions) => {
+        child = spawnChild(command, args, {
+          ...spawnOptions,
+          env: { ...spawnOptions.env, DSH_HOST_SCENARIO: scenario }
+        })
+        return child
       }
     })
-    expect(handle.origin).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
-    expect((await fetch(handle.origin)).ok).toBe(true)
-    await Promise.all([handle.dispose(), handle.dispose()])
-    expect(process.cwd()).toBe(parentCwd)
-    expect(process.env.DSH_HOME).toBe(parentEnv)
-    await expect(fetch(handle.origin)).rejects.toThrow()
-    expect(output.join('')).not.toContain('DSH_HOME')
+    return { paths, launcher, getChild: () => child }
+  }
+
+  it.each([
+    ['invalid IPC message', 'invalid-message', /invalid IPC message/i],
+    ['startup-failed', 'startup-failed', /fixture startup failure/],
+    ['ready-before-exit', 'exit-before-ready', /exited before readiness|Host child exited/]
+  ])('rejects %s and cleans the child', async (_label, scenario, expected) => {
+    const attempt = await launchScenario(scenario)
+    await expect(attempt.launcher.launch(attempt.paths)).rejects.toThrow(expected)
+    await vi.waitFor(() => expect(attempt.getChild()?.exitCode ?? attempt.getChild()?.signalCode ?? null).not.toBeNull())
+    const child = attempt.getChild()
+    expect(child?.listenerCount('message')).toBe(0)
+    expect(child?.listenerCount('exit')).toBe(0)
+    expect(child?.listenerCount('error')).toBe(0)
+    expect(child?.stdout?.listenerCount('data')).toBe(0)
+    expect(child?.stderr?.listenerCount('data')).toBe(0)
+  }, 15_000)
+
+  it('races ready-to-HTTP probing against a child exit instead of accepting a reused port', async () => {
+    const attempt = await launchScenario('ready-http-fail')
+    const started = Date.now()
+    await expect(attempt.launcher.launch(attempt.paths)).rejects.toThrow(/Host child exited|exited before readiness/)
+    expect(Date.now() - started).toBeLessThan(2_000)
+  }, 10_000)
+
+  it('treats startup timeout as an attempt failure and terminates that child', async () => {
+    const attempt = await launchScenario('timeout', { startupTimeoutMs: 50, shutdownTimeoutMs: 100 })
+    await expect(attempt.launcher.launch(attempt.paths)).rejects.toThrow(/within 50 ms/)
+    await vi.waitFor(() => expect(attempt.getChild()?.exitCode ?? attempt.getChild()?.signalCode ?? null).not.toBeNull())
+  }, 10_000)
+
+  it('reports ready-child crashes through closed without requiring a second launch', async () => {
+    const attempt = await launchScenario('exit-after-ready')
+    const handle = await attempt.launcher.launch(attempt.paths)
+    try {
+      await expect(handle.closed).resolves.toMatchObject({ intentional: false })
+    } finally {
+      await handle.dispose().catch(() => undefined)
+    }
+  }, 10_000)
+
+  it('waits for child exit after stopped and only kills a shutdown timeout', async () => {
+    const graceful = await launchScenario('ready')
+    const gracefulHandle = await graceful.launcher.launch(graceful.paths)
+    try {
+      await expect(gracefulHandle.dispose()).resolves.toBeUndefined()
+      await vi.waitFor(() => expect(graceful.getChild()?.exitCode ?? null).toBe(0))
+    } finally {
+      await gracefulHandle.dispose().catch(() => undefined)
+    }
+
+    const hanging = await launchScenario('shutdown-timeout', { shutdownTimeoutMs: 50 })
+    const hangingHandle = await hanging.launcher.launch(hanging.paths)
+    try {
+      await expect(hangingHandle.dispose()).resolves.toBeUndefined()
+      await vi.waitFor(() => expect(hanging.getChild()?.exitCode ?? hanging.getChild()?.signalCode ?? null).not.toBeNull())
+    } finally {
+      await hangingHandle.dispose().catch(() => undefined)
+    }
   }, 15_000)
 })

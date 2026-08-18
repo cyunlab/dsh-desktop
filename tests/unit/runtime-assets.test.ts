@@ -27,6 +27,22 @@ async function completeFixture(platform: 'darwin' | 'linux' | 'win32', arch: 'ar
 }
 
 describe('required packaged runtime assets', () => {
+  it('checks dynamically referenced worker assets on every platform and Windows-only helpers on Win32', () => {
+    const darwinPaths = requiredRuntimeAssets({ platform: 'darwin', arch: 'arm64' }).map(asset => asset.path)
+    const linuxPaths = requiredRuntimeAssets({ platform: 'linux', arch: 'x64' }).map(asset => asset.path)
+    const windowsPaths = requiredRuntimeAssets({ platform: 'win32', arch: 'x64' }).map(asset => asset.path)
+    for (const platformPaths of [darwinPaths, linuxPaths, windowsPaths]) {
+      expect(platformPaths).toContain('node_modules/@deepseek-ai/dsh-workflow-worker-thread/lib/worker.cjs')
+      expect(platformPaths).toContain('node_modules/@deepseek-ai/dsh-code-runtime-worker-thread/lib/worker.cjs')
+    }
+    expect(darwinPaths).not.toContain('node_modules/@deepseek-ai/dsh-host-directory-picker-native/lib/worker.cjs')
+    expect(darwinPaths).not.toContain('node_modules/@deepseek-ai/dsh-sandbox-windows-acl/lib/runner.js')
+    expect(linuxPaths).not.toContain('node_modules/@deepseek-ai/dsh-host-directory-picker-native/lib/worker.cjs')
+    expect(linuxPaths).not.toContain('node_modules/@deepseek-ai/dsh-sandbox-windows-acl/lib/runner.js')
+    expect(windowsPaths).toContain('node_modules/@deepseek-ai/dsh-host-directory-picker-native/lib/worker.cjs')
+    expect(windowsPaths).toContain('node_modules/@deepseek-ai/dsh-sandbox-windows-acl/lib/runner.js')
+  })
+
   it.each([
     ['bundle YAML', 'node_modules/@deepseek-ai/dsh-base/cordis.patch.yml'],
     ['Web frontend', 'node_modules/@deepseek-ai/dsh-web-frontend/dist/assets'],

@@ -66,6 +66,7 @@ export function hostOrigin(binding: HostProcessBinding): string {
   return `http://127.0.0.1:${binding.port}`
 }
 
+/** 校验 ready 消息中的绑定、origin 及精确字段集合。 */
 function parseReady(value: Record<string, unknown>): HostProcessMessage {
   assertExactKeys(value, ['type', 'origin', 'binding'])
   if (typeof value.origin !== 'string' || !isRecord(value.binding)) throw new Error('Invalid Host ready message')
@@ -81,6 +82,7 @@ function parseReady(value: Record<string, unknown>): HostProcessMessage {
   }
 }
 
+/** 校验并复制启动失败消息中的受控错误字段。 */
 function parseStartupFailed(value: Record<string, unknown>): HostProcessMessage {
   assertExactKeys(value, ['type', 'error'])
   if (!isRecord(value.error)) throw new Error('Invalid Host startup failure')
@@ -103,10 +105,12 @@ function parseStartupFailed(value: Record<string, unknown>): HostProcessMessage 
   }
 }
 
+/** 判断未知值是否为不带原型约束的普通记录。 */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+/** 要求协议对象只包含给定的精确字段。 */
 function assertExactKeys(value: Record<string, unknown>, allowed: string[]): void {
   const keys = Object.keys(value).sort()
   const expected = [...allowed].sort()
@@ -122,10 +126,12 @@ function assertAllowedKeys(value: Record<string, unknown>, allowed: string[]): v
   }
 }
 
+/** 校验 loopback 端口为合法的非零整数。 */
 function isPort(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= MAX_PORT
 }
 
+/** 将错误字段限制长度并提供安全默认值。 */
 function boundedString(value: unknown, fallback: string, preserveFallback = false): string {
   const text = typeof value === 'string' ? value : fallback
   if (text.length === 0 && !preserveFallback) return 'Error'

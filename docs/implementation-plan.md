@@ -2,7 +2,7 @@
 
 ## Outcome
 
-On Windows, macOS, and Linux, `pnpm dev` and the unpacked packaged application open a local startup page, boot the pinned official Harness Web composition inside Electron's main process, wait for an OS-assigned loopback listener, and navigate the same window to the upstream Web Client. Closing the final window disposes the Host and exits.
+On Windows, macOS, and Linux, `pnpm dev` and the unpacked packaged application open a local startup page, launch a packaged Host child containing the pinned official Harness Web composition, wait for an OS-assigned loopback listener, and navigate the same window to the upstream Web Client. Electron main only launches and supervises the child; the child boots, composes, and disposes the real Harness. Closing the final window disposes the Host and exits.
 
 ## Scope
 
@@ -23,9 +23,12 @@ src/
 │   ├── paths.ts                 Harness Home, default working directory, and logs
 │   ├── host/
 │   │   ├── launcher.ts          Narrow HostLauncher interface
-│   │   ├── harness-launcher.ts  Published-package Web composition adapter
+│   │   ├── process-launcher.ts  Isolated Host child adapter
 │   │   ├── fake-launcher.ts     Fake Host adapter
 │   │   └── readiness.ts         Bounded loopback HTTP probe
+│   ├── host-process/
+│   │   ├── index.ts             Host child IPC/lifecycle entry
+│   │   └── runtime.ts           Published-package Web composition runtime
 │   ├── window/
 │   │   ├── desktop-window.ts    Controlled Desktop window implementation
 │   │   └── navigation-policy.ts Exact-origin and external-link policy
@@ -79,13 +82,12 @@ Set `DSH_HOME` in the Host child environment before importing Harness code that 
 
 ### Host launch
 
-1. Resolve the published `@deepseek-ai/dsh` package manifest as the installation anchor.
-2. Use public `@deepseek-ai/dsh-app-boot` profile APIs to initialize/load the Desktop-owned `desktop` profile from the isolated Harness Home; its contents remain the official Web composition.
-3. Compose `@deepseek-ai/dsh-base` followed by `@deepseek-ai/dsh-web-app`; do not copy their YAML or read from the submodule.
-4. Supply Web arguments equivalent to `--host 127.0.0.1 --port 0` through the published command-line provider.
-5. Boot the Cordis root and retain its context/disposer behind `HostLauncher`.
-6. Read `ctx.webServer.port`, form the exact loopback origin, and pass a bounded HTTP readiness probe.
-7. Return `{ origin, dispose }`; logs are never used as the readiness protocol.
+1. Main resolves the packaged `host-process/index.js` entry and launches it with `process.execPath`, child-only `DSH_HOME` and `ELECTRON_RUN_AS_NODE=1`, and the Desktop default working directory.
+2. The child dynamically loads the published Harness runtime, resolves the `@deepseek-ai/dsh` installation anchor, and uses public `@deepseek-ai/dsh-app-boot` profile APIs.
+3. The child composes `@deepseek-ai/dsh-base` followed by `@deepseek-ai/dsh-web-app`; it does not copy their YAML or read from the submodule.
+4. The child supplies Web arguments equivalent to `--host 127.0.0.1 --port 0`, boots the Cordis root, and reports only a validated ready IPC message.
+5. Main performs the bounded HTTP readiness probe after ready IPC, and exposes `{ origin, dispose, closed }` through `HostLauncher`.
+6. Child stop/disconnect paths dispose the Cordis root before exit; logs are never used as the readiness protocol.
 
 The adapter must use public package exports only. If the exact published version lacks a needed public seam, stop and document that incompatibility rather than importing submodule source or patching the package.
 

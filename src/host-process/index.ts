@@ -35,19 +35,43 @@ export async function startHostProcess(
 ): Promise<void> {
   if (typeof system.send !== 'function') throw new Error('Host process IPC is unavailable')
   let handle: Awaited<ReturnType<HostProcessRuntime['bootHarnessHost']>> | undefined
-  let ready = false
+  let readySent = false
   let stopping: Promise<void> | undefined
   let parentDisconnected = false
+  const pendingSendRejectors = new Set<(error: Error) => void>()
 
+  // 将 IPC 回调转换为可取消的 Promise，避免父进程断开后悬挂发送。
   const send = (message: HostProcessMessage): Promise<void> => new Promise((resolve, reject) => {
-    if (typeof system.send !== 'function') { reject(new Error('Host process IPC is unavailable')); return }
-    system.send(message, error => error ? reject(error) : resolve())
+    if (parentDisconnected || typeof system.send !== 'function') { reject(new Error('Host process IPC is unavailable')); return }
+    pendingSendRejectors.add(reject)
+    try {
+      system.send(message, error => {
+        pendingSendRejectors.delete(reject)
+        if (error) reject(error)
+        else resolve()
+      })
+    } catch (error) {
+      pendingSendRejectors.delete(reject)
+      reject(error)
+    }
   })
 
-  const disposeAndExit = async (exitCode: number): Promise<void> => {
+  /** 统一处理 stop、父 IPC 消失和启动异常，确保已创建的 Handle 总会 dispose。 */
+  const shutdown = (exitCode: number, startupError?: unknown): Promise<void> => {
     if (stopping) return stopping
     stopping = (async () => {
-      try { await handle?.dispose() } finally {
+      try {
+        await handle?.dispose()
+      } catch {
+        // 退出路径不能把 child 留在 Harness 状态；原始错误通过受控协议报告。
+      }
+      try {
+        if (startupError !== undefined && !readySent && !parentDisconnected) {
+          try { await send({ type: 'startup-failed', error: serializeHostProcessError(startupError) }) } catch { /* parent may already be gone */ }
+        } else if (exitCode === 0 && readySent && !parentDisconnected) {
+          try { await send({ type: 'stopped' }) } catch { /* parent may already be gone */ }
+        }
+      } finally {
         system.exitCode = exitCode
         if (!parentDisconnected) system.disconnect?.()
         system.exit(exitCode)
@@ -59,28 +83,16 @@ export async function startHostProcess(
   // 父进程消失时不能保留真实 Harness 及其监听器。
   system.on('disconnect', () => {
     parentDisconnected = true
-    void disposeAndExit(0)
+    for (const reject of pendingSendRejectors) reject(new Error('Host parent IPC disconnected'))
+    pendingSendRejectors.clear()
+    void shutdown(0)
   })
   system.on('message', message => {
     let command: HostProcessCommand
     try { command = parseHostProcessCommand(message) }
     catch { return }
-    if (command.type === 'stop') void stop()
+    if (command.type === 'stop') void shutdown(0)
   })
-
-  const stop = async (): Promise<void> => {
-    if (stopping) return stopping
-    stopping = (async () => {
-      try { await handle?.dispose() } finally {
-        if (ready && !parentDisconnected) {
-          try { await send({ type: 'stopped' }) } catch { /* parent may already be gone */ }
-        }
-        if (!parentDisconnected) system.disconnect?.()
-        system.exit(0)
-      }
-    })()
-    return stopping
-  }
 
   try {
     // spawn 的 cwd/env 已在 child 创建时设定；这里首次动态加载真实 Harness。
@@ -88,21 +100,26 @@ export async function startHostProcess(
       harnessHome: system.env.DSH_HOME ?? '',
       defaultWorkingDirectory: system.cwd()
     })
-    await send({ type: 'ready', origin: handle.origin, binding: handle.binding })
-    ready = true
-  } catch (error) {
-    try { await send({ type: 'startup-failed', error: serializeHostProcessError(error) }) } finally {
-      system.exitCode = 1
-      system.disconnect?.()
-      system.exit(1)
+    if (stopping || parentDisconnected) {
+      await handle.dispose().catch(() => undefined)
+      return
     }
+    await send({ type: 'ready', origin: handle.origin, binding: handle.binding })
+    readySent = true
+  } catch (error) {
+    await shutdown(1, error)
   }
 }
 
-/** 仅在 Electron 启动的真实 Host child 中加载 Harness runtime。 */
+/** 仅在 Electron 启动的真实 Host child 中延迟加载 Harness runtime。 */
 async function main(): Promise<void> {
-  const runtime = await import('./runtime.js')
-  await startHostProcess(runtime)
+  // 把动态 import 放进 boot seam，使模块解析失败也能通过 startup-failed 协议返回。
+  await startHostProcess({
+    bootHarnessHost: async paths => {
+      const runtime = await import('./runtime.js')
+      return runtime.bootHarnessHost(paths)
+    }
+  })
 }
 
 void main().catch(error => {

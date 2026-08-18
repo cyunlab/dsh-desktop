@@ -1,6 +1,23 @@
 import { createServer } from 'node:http'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import path from 'node:path'
 
-const server = createServer((_request, response) => {
+const server = createServer((request, response) => {
+  if (request.url === '/plugin-smoke') {
+    const child = spawn(process.execPath, [path.join(path.dirname(fileURLToPath(import.meta.url)), 'plugin-node-smoke.mjs')], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      shell: false
+    })
+    let output = ''
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', chunk => { output += chunk })
+    child.once('close', code => {
+      response.writeHead(code === 0 ? 200 : 500, { 'content-type': 'application/json' })
+      response.end(output)
+    })
+    return
+  }
   response.writeHead(200, { 'content-type': 'text/plain' })
   response.end('ready')
 })

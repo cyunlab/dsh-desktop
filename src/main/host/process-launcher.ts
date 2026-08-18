@@ -5,14 +5,13 @@ import path from 'node:path'
 import type { DesktopPaths } from '../paths.js'
 import {
   deserializeHostProcessError,
-  hostOrigin,
   parseHostProcessMessage,
   type HostProcessBinding,
   type HostProcessMessage
 } from '../../shared/host-process-contract.js'
 import type { HostClosedEvent, HostHandle, HostLauncher } from './launcher.js'
 import { waitForHttpReady, type ReadinessOptions } from './readiness.js'
-import { terminateChildProcess } from './process-tree.js'
+import { terminateChildProcess, type ProcessTreeTerminationOptions } from './process-tree.js'
 
 /** 生产 Host 进程 adapter 的可替换依赖和超时配置。 */
 export interface ProcessHostLauncherOptions {
@@ -23,6 +22,7 @@ export interface ProcessHostLauncherOptions {
   readonly spawnProcess?: (command: string, args: string[], options: SpawnOptions) => ChildProcess
   readonly maxDiagnosticBytes?: number
   readonly onDiagnosticOutput?: (stream: 'stdout' | 'stderr', output: string) => void
+  readonly processTree?: ProcessTreeTerminationOptions
 }
 
 /** 通过独立 Electron-as-Node child 启动真实 Harness Host。 */
@@ -49,8 +49,8 @@ export class ProcessHostLauncher implements HostLauncher {
       shell: false,
       detached: process.platform !== 'win32'
     })
-    consumeOutput(child, this.#options)
-    const controller = new ProcessHostController(child, this.#options)
+    const outputCleanup = consumeOutput(child, this.#options)
+    const controller = new ProcessHostController(child, this.#options, outputCleanup)
     try {
       await controller.waitUntilReady(paths)
       return controller
@@ -81,24 +81,33 @@ function mapAsarToUnpacked(value: string): string {
   return value.includes(marker) ? value.replace(marker, `${path.sep}app.asar.unpacked${path.sep}`) : value
 }
 
-/** 限制父进程 stdout/stderr 诊断的字节数，并持续消费管道避免 child 阻塞。 */
-function consumeOutput(child: ChildProcess, options: ProcessHostLauncherOptions): void {
+/** 绑定有界 stdout/stderr 诊断监听并返回可重复调用的清理函数。 */
+function consumeOutput(child: ChildProcess, options: ProcessHostLauncherOptions): () => void {
   const maxBytes = options.maxDiagnosticBytes ?? 8 * 1024
+  const cleanups: Array<() => void> = []
   for (const [streamName, stream] of [['stdout', child.stdout], ['stderr', child.stderr]] as const) {
     if (!stream) continue
     let bytes = 0
     let notified = false
     stream.setEncoding('utf8')
-    stream.on('data', (chunk: string) => {
+    const onData = (chunk: string): void => {
       const remaining = Math.max(0, maxBytes - bytes)
-      const text = chunk.slice(0, remaining)
+      const text = Buffer.from(chunk).subarray(0, remaining).toString('utf8')
       bytes += Buffer.byteLength(text)
       if (text && options.onDiagnosticOutput) options.onDiagnosticOutput(streamName, text)
       if (bytes >= maxBytes && !notified) {
         notified = true
         options.onDiagnosticOutput?.(streamName, '[diagnostic output truncated]')
       }
-    })
+    }
+    stream.on('data', onData)
+    cleanups.push(() => stream.off('data', onData))
+  }
+  let cleaned = false
+  return () => {
+    if (cleaned) return
+    cleaned = true
+    for (const cleanup of cleanups) cleanup()
   }
 }
 
@@ -106,23 +115,27 @@ function consumeOutput(child: ChildProcess, options: ProcessHostLauncherOptions)
 class ProcessHostController implements HostHandle {
   readonly #child: ChildProcess
   readonly #options: ProcessHostLauncherOptions
+  readonly #cleanupOutput: () => void
   readonly #ready = deferred<ReadyMessage>()
   readonly #failed = deferred<never>()
+  readonly #stopped = deferred<void>()
   readonly #closed = deferred<HostClosedEvent>()
   #phase: 'starting' | 'ready' | 'closed' = 'starting'
   #intentional = false
   #disposePromise?: Promise<void>
-  #exitEvent?: HostClosedEvent
+  #closeEvent?: HostClosedEvent
+  #treeTermination?: Promise<void>
   #binding?: HostProcessBinding
   #origin?: string
 
   /** 绑定 IPC 与 ChildProcess 事件，尚未向调用者暴露句柄。 */
-  constructor(child: ChildProcess, options: ProcessHostLauncherOptions) {
+  constructor(child: ChildProcess, options: ProcessHostLauncherOptions, cleanupOutput: () => void) {
     this.#child = child
     this.#options = options
-    child.on('message', message => this.#onMessage(message))
-    child.once('exit', (code, signal) => this.#onExit(code, signal))
-    child.once('error', error => this.#onError(error))
+    this.#cleanupOutput = cleanupOutput
+    child.on('message', this.#onMessage)
+    child.once('exit', this.#onExit)
+    child.once('error', this.#onError)
   }
 
   get origin(): string {
@@ -143,10 +156,13 @@ class ProcessHostController implements HostHandle {
       timeoutMs,
       `Host did not become ready within ${timeoutMs} ms`
     )
-    await waitForHttpReady(ready.origin, {
-      ...this.#options.readiness,
-      timeoutMs: this.#options.readiness?.timeoutMs ?? timeoutMs
-    })
+    await Promise.race([
+      waitForHttpReady(ready.origin, {
+        ...this.#options.readiness,
+        timeoutMs: this.#options.readiness?.timeoutMs ?? timeoutMs
+      }),
+      this.#failed.promise
+    ])
     if (this.#phase !== 'starting') throw new Error('Host exited before readiness completed')
     this.#phase = 'ready'
     void paths
@@ -154,11 +170,22 @@ class ProcessHostController implements HostHandle {
 
   /** 启动失败时终止本次 child 并释放所有启动监听。 */
   async abortStartup(): Promise<void> {
-    if (this.#phase === 'closed') return
+    if (this.#closeEvent) {
+      await this.#treeTermination
+      return
+    }
     this.#intentional = true
-    this.#phase = 'closed'
-    await terminateChildProcess(this.#child, this.#options.shutdownTimeoutMs ?? 30_000).catch(() => undefined)
-    this.#closed.resolve({ intentional: true })
+    try {
+      await terminateChildProcess(
+        this.#child,
+        this.#options.shutdownTimeoutMs ?? 30_000,
+        this.#options.processTree
+      )
+    } finally {
+      this.#phase = 'closed'
+      this.#cleanupListeners()
+      if (!this.#closeEvent) this.#closed.resolve({ intentional: true })
+    }
   }
 
   /** 幂等发送 stop，并等待 stopped/exit；超时后安全终止 child。 */
@@ -170,26 +197,42 @@ class ProcessHostController implements HostHandle {
 
   /** 执行一次有界的 Host child 优雅关闭。 */
   async #dispose(): Promise<void> {
-    if (this.#phase === 'closed' && this.#exitEvent) return
+    if (this.#closeEvent) {
+      await this.#treeTermination
+      return
+    }
     this.#intentional = true
-    const timeoutMs = this.#options.shutdownTimeoutMs ?? 30_000
-    if (this.#phase !== 'closed' && this.#child.connected) {
-      await sendCommand(this.#child, { type: 'stop' }).catch(() => undefined)
+    try {
+      const timeoutMs = this.#options.shutdownTimeoutMs ?? 30_000
+      if (this.#phase !== 'closed' && this.#child.connected) {
+        await sendCommand(this.#child, { type: 'stop' }).catch(() => undefined)
+      }
+      const firstSettlement = await withTimeout(
+        Promise.race([
+          this.#stopped.promise.then(() => 'stopped' as const),
+          this.#closed.promise.then(() => 'closed' as const)
+        ]),
+        timeoutMs,
+        `Host shutdown exceeded ${timeoutMs} ms`
+      ).catch(() => undefined)
+      const exitSettlement = firstSettlement === 'stopped'
+        ? await withTimeout(this.#closed.promise, timeoutMs, 'Host child did not exit after stopped').catch(() => undefined)
+        : firstSettlement
+      if (!exitSettlement) {
+        await terminateChildProcess(this.#child, timeoutMs, this.#options.processTree)
+        await withTimeout(this.#closed.promise, Math.min(timeoutMs, 2_000), 'Host child did not report exit').catch(() => undefined)
+      }
+    } finally {
+      if (!this.#closeEvent) {
+        this.#phase = 'closed'
+        this.#cleanupListeners()
+        this.#closed.resolve({ intentional: true })
+      }
     }
-    const graceful = await withTimeout(
-      this.#closed.promise,
-      timeoutMs,
-      `Host shutdown exceeded ${timeoutMs} ms`
-    ).catch(() => undefined)
-    if (!graceful || !this.#exitEvent) {
-      await terminateChildProcess(this.#child, timeoutMs)
-      await withTimeout(this.#closed.promise, Math.min(timeoutMs, 2_000), 'Host child did not report exit').catch(() => undefined)
-    }
-    if (!this.#exitEvent) this.#closed.resolve({ intentional: true })
   }
 
   /** 处理 child -> parent 协议消息并阻止未知对象进入生命周期。 */
-  #onMessage(raw: unknown): void {
+  #onMessage = (raw: unknown): void => {
     let message: HostProcessMessage
     try { message = parseHostProcessMessage(raw) }
     catch (error) {
@@ -204,35 +247,60 @@ class ProcessHostController implements HostHandle {
     } else if (message.type === 'startup-failed') {
       this.#fail(deserializeHostProcessError(message.error))
     } else if (message.type === 'stopped') {
-      if (this.#intentional && !this.#exitEvent) this.#closed.resolve({ intentional: true })
+      if (this.#intentional) this.#stopped.resolve()
     }
   }
 
   /** 将 child error 转换为启动失败或意外关闭结果。 */
-  #onError(error: Error): void {
+  #onError = (error: Error): void => {
     if (this.#phase === 'starting') this.#fail(error)
-    else if (!this.#intentional) this.#closed.resolve({ intentional: false, error })
+    else if (!this.#intentional) {
+      this.#treeTermination = terminateChildProcess(this.#child, this.#options.shutdownTimeoutMs ?? 30_000, this.#options.processTree)
+        .catch(() => undefined)
+      this.#settleClosed({ intentional: false, error })
+    }
   }
 
   /** 将 child exit 转换为启动拒绝或可观察的 Host 关闭事件。 */
-  #onExit(code: number | null, signal: NodeJS.Signals | null): void {
+  #onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
     const wasStarting = this.#phase === 'starting'
     const event: HostClosedEvent = {
       intentional: this.#intentional,
       ...(code === null ? {} : { code }),
       ...(signal === null ? {} : { signal }),
-      ...(!this.#intentional && code !== 0 ? { error: new Error(`Host child exited with ${code ?? signal ?? 'unknown'}`) } : {})
+      ...(!this.#intentional
+        ? { error: new Error(`Host child exited with ${code ?? signal ?? 'unknown'}`) }
+        : {})
     }
-    this.#exitEvent = event
     if (wasStarting) this.#failed.reject(event.error ?? new Error('Host child exited before readiness'))
-    this.#phase = 'closed'
-    this.#closed.resolve(event)
+    if (!this.#intentional) {
+      this.#treeTermination = terminateChildProcess(this.#child, this.#options.shutdownTimeoutMs ?? 30_000, this.#options.processTree)
+        .catch(() => undefined)
+    }
+    this.#settleClosed(event)
   }
 
   /** 只结算一次启动失败，避免 error/exit 竞态重复处理。 */
   #fail(error: Error): void {
     if (this.#phase !== 'starting') return
     this.#failed.reject(error)
+  }
+
+  /** 只结算一次 closed，并清理所有 parent-side child/stream listeners。 */
+  #settleClosed(event: HostClosedEvent): void {
+    if (this.#closeEvent) return
+    this.#closeEvent = event
+    this.#phase = 'closed'
+    this.#cleanupListeners()
+    this.#closed.resolve(event)
+  }
+
+  /** 从 child 和 stdout/stderr 移除本 adapter 注册的监听器。 */
+  #cleanupListeners(): void {
+    this.#child.off('message', this.#onMessage)
+    this.#child.off('exit', this.#onExit)
+    this.#child.off('error', this.#onError)
+    this.#cleanupOutput()
   }
 }
 
