@@ -174,8 +174,18 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(mut guard) = process_for_start.lock() {
                     *guard = Some(sidecar);
                 }
-                if let Ok(url) = origin.parse() {
-                    let _ = window_for_start.navigate(url);
+                let app_for_navigation = app_for_start.clone();
+                if let Err(error) = app_for_navigation.run_on_main_thread(move || {
+                    match origin.parse() {
+                        Ok(url) => {
+                            if let Err(error) = window_for_start.navigate(url) {
+                                eprintln!("failed to navigate to Harness Web UI: {error}");
+                            }
+                        }
+                        Err(error) => eprintln!("invalid Harness Web UI origin: {error}"),
+                    }
+                }) {
+                    eprintln!("failed to schedule Harness Web UI navigation: {error}");
                 }
             }
             Err(error) => eprintln!("failed to start Node sidecar: {error}"),
@@ -191,6 +201,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     stop_sidecar(process);
                     let _ = app_handle.exit(0);
                 });
+            } else {
+                let _ = app_handle.exit(0);
             }
         }
     });
