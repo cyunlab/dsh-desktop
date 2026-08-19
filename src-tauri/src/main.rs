@@ -149,7 +149,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let process = Arc::new(Mutex::new(Some(process)));
     app.manage(Arc::clone(&process));
     let app_handle = app.handle().clone();
-    let window = WebviewWindowBuilder::new(&app.handle(), "main", WebviewUrl::External(origin.parse()?))
+    let window = WebviewWindowBuilder::new(app.handle(), "main", WebviewUrl::External(origin.parse()?))
         .title("DeepSeek Harness Desktop")
         .inner_size(1200.0, 800.0)
         .build()?;

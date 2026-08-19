@@ -4,5 +4,7 @@ dist/
 release/
 node_modules/
 .pnpm-store/
+src-tauri/target/
+src-tauri/gen/
 test-results/
 .DS_Store
