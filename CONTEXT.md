@@ -69,3 +69,15 @@ An unsigned NSIS, DMG, or AppImage produced for this milestone. It is labelled a
 ### Architecture mismatch
 
 The condition in which a Desktop artifact runs through processor translation although a native artifact is available for that machine. Desktop blocks normal startup by default, while permitting an explicit one-run override for developer validation.
+
+### Harness runtime
+
+The official Node.js process that runs the Harness Host and its complete plugin graph. It is a separate runtime boundary from the Desktop shell and must provide the same Node execution semantics as the Web UI.
+
+### Node sidecar
+
+A packaged, version-matched official Node.js executable launched and supervised by Desktop to host the Harness runtime. Plugins execute inside this process rather than inside Electron or Tauri.
+
+### Desktop shell
+
+The native application layer responsible for windowing, lifecycle, packaging, and future desktop capability bridges. The shell does not define the Harness runtime semantics.

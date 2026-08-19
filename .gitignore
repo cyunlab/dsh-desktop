@@ -3,5 +3,6 @@
 dist/
 release/
 node_modules/
+.pnpm-store/
 test-results/
 .DS_Store
