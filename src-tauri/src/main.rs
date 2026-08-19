@@ -96,8 +96,16 @@ fn start_sidecar(app: &AppHandle) -> Result<(SidecarProcess, String), String> {
     let stdout = child.stdout.take().ok_or_else(|| "Node sidecar stdout unavailable".to_string())?;
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|error| format!("failed to read sidecar ready message: {error}"))?;
-    let message = parse_sidecar_message(line.trim())?;
+    let message = loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).map_err(|error| format!("failed to read sidecar ready message: {error}"))?;
+        if bytes == 0 {
+            return Err("Node sidecar exited before reporting readiness".into());
+        }
+        if let Ok(message) = parse_sidecar_message(line.trim()) {
+            break message;
+        }
+    };
     let origin = match message.clone() {
         SidecarMessage::Ready { origin } => origin,
         SidecarMessage::StartupFailed { error } => return Err(format!("{}: {}", error.name, error.message)),
