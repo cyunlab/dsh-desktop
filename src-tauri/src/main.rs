@@ -160,6 +160,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let window = WebviewWindowBuilder::new(app.handle(), "main", WebviewUrl::External(origin.parse()?))
         .title("DeepSeek Harness Desktop")
         .inner_size(1200.0, 800.0)
+        .visible(true)
+        .center()
         .build()?;
     let process_for_close = Arc::clone(&process);
     window.on_window_event(move |event| {
