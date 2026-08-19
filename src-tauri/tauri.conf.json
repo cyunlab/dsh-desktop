@@ -15,7 +15,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["../dist/assets/dsh-desktop-logo.png"],
+    "icon": ["icons/icon.ico"],
     "resources": {
       "../dist/**/*": "dist",
       "../resources/node/**/*": "node"
