@@ -116,6 +116,9 @@ fn start_sidecar(app: &AppHandle) -> Result<(SidecarProcess, String), String> {
     thread::spawn(move || {
         for line in reader.lines().flatten() {
             if let Ok(message) = parse_sidecar_message(&line) {
+                if let SidecarMessage::StopFailed { ref error } = message {
+                    eprintln!("Node sidecar stop failed: {}: {}", error.name, error.message);
+                }
                 if let Ok(mut latest) = messages.lock() {
                     *latest = Some(message);
                 }
@@ -153,16 +156,31 @@ fn stop_sidecar(mut process: SidecarProcess) {
 
 /// 创建窗口、启动 sidecar 并在关闭时回收进程。
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let (process, origin) = start_sidecar(&app.handle()).map_err(std::io::Error::other)?;
-    let process = Arc::new(Mutex::new(Some(process)));
+    let process = Arc::new(Mutex::new(None));
     app.manage(Arc::clone(&process));
     let app_handle = app.handle().clone();
-    let window = WebviewWindowBuilder::new(app.handle(), "main", WebviewUrl::External(origin.parse()?))
+    let window = WebviewWindowBuilder::new(app.handle(), "main", WebviewUrl::App("index.html".into()))
         .title("DeepSeek Harness Desktop")
         .inner_size(1200.0, 800.0)
         .visible(true)
         .center()
         .build()?;
+    let process_for_start = Arc::clone(&process);
+    let window_for_start = window.clone();
+    let app_for_start = app.handle().clone();
+    thread::spawn(move || {
+        match start_sidecar(&app_for_start) {
+            Ok((sidecar, origin)) => {
+                if let Ok(mut guard) = process_for_start.lock() {
+                    *guard = Some(sidecar);
+                }
+                if let Ok(url) = origin.parse() {
+                    let _ = window_for_start.navigate(url);
+                }
+            }
+            Err(error) => eprintln!("failed to start Node sidecar: {error}"),
+        }
+    });
     let process_for_close = Arc::clone(&process);
     window.on_window_event(move |event| {
         if let WindowEvent::CloseRequested { api, .. } = event {
