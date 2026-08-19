@@ -15,6 +15,8 @@
     "package:dir": "pnpm build && pnpm verify:runtime-closure && electron-builder --dir",
     "package:e2e": "node scripts/build.mjs --e2e && pnpm verify:runtime-closure && electron-builder --dir --config.directories.output=\"release/E2E Package With Spaces\"",
     "dev": "pnpm build && electron .",
+    "tauri:dev": "pnpm build && pnpm exec tauri dev",
+    "tauri:build": "pnpm build && pnpm exec tauri build",
     "start": "electron .",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
@@ -26,6 +28,7 @@
     "verify:release-version": "node scripts/verify-release-version.mjs"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "2.8.4",
     "@playwright/test": "1.55.0",
     "@types/js-yaml": "4.0.9",
     "@types/node": "24.10.1",
