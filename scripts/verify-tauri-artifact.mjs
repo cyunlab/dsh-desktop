@@ -421,12 +421,85 @@ async function waitForProcessGroupClosed(processGroupPid, timeoutMilliseconds = 
   throw new Error(`Bundled sidecar process group ${processGroupPid} still has live descendants`)
 }
 
+/** 通过 Windows CIM 快照读取 PID/ParentPID，不打印命令输出或环境变量。 */
+async function readWindowsProcessSnapshot(commandRunner = execFileAsync) {
+  try {
+    const result = await commandRunner('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      '$ErrorActionPreference="Stop"; Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress'
+    ], { windowsHide: true, maxBuffer: 1_000_000 })
+    const parsed = JSON.parse(result.stdout || '[]')
+    return Array.isArray(parsed) ? parsed : [parsed]
+  } catch {
+    throw new Error('Windows process snapshot is unavailable')
+  }
+}
+
+/** 返回已知 leader PID 的全部存活 descendants，按最深层优先排列。 */
+export async function collectWindowsDescendantPids(rootPid, commandRunner = execFileAsync) {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) return []
+  const snapshot = await readWindowsProcessSnapshot(commandRunner)
+  const childrenByParent = new Map()
+  for (const process of snapshot) {
+    const pid = Number(process.ProcessId)
+    const parentPid = Number(process.ParentProcessId)
+    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(parentPid) || parentPid <= 0) continue
+    const children = childrenByParent.get(parentPid) ?? []
+    children.push(pid)
+    childrenByParent.set(parentPid, children)
+  }
+  const descendants = []
+  const visited = new Set([rootPid])
+  /** 深度优先遍历确保子孙先于父进程进入强杀队列。 */
+  const visit = parentPid => {
+    for (const childPid of childrenByParent.get(parentPid) ?? []) {
+      if (visited.has(childPid)) continue
+      visited.add(childPid)
+      visit(childPid)
+      descendants.push(childPid)
+    }
+  }
+  visit(rootPid)
+  return descendants
+}
+
+/** 在 Windows leader 已退出的竞态下枚举、深度优先强杀并确认全部 descendants 消失。 */
+async function cleanupWindowsProcessTree(rootPid, commandRunner = execFileAsync) {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) return
+  let lastRemaining = []
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const descendants = await collectWindowsDescendantPids(rootPid, commandRunner)
+    const targets = [...descendants, rootPid]
+    for (const pid of targets) {
+      try {
+        await commandRunner('taskkill.exe', ['/PID', String(pid), '/F'], { windowsHide: true, maxBuffer: 64_000 })
+      } catch {
+        // leader 自然退出时 taskkill 失败是预期竞态；最终快照决定是否清理成功。
+      }
+    }
+    const remaining = await collectWindowsDescendantPids(rootPid, commandRunner)
+    lastRemaining = remaining
+    // leader 退出与 descendant 出现在 CIM 快照之间存在竞态，至少做一次延迟确认。
+    if (remaining.length === 0 && attempt > 0) return
+    await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)))
+  }
+  throw new Error(`Windows sidecar descendants still running: ${lastRemaining.join(', ')}`)
+}
+
 /** 强制终止并确认 sidecar process group，即使 leader 已先退出也不能跳过 descendant 清理。 */
 async function cleanupBundledChild(child, processGroupPid, detached) {
   let processError
   const leaderExited = child.exitCode !== null || child.signalCode !== null
   // POSIX detached group 必须始终尝试 kill(-pid)，因为 leader 退出不代表 descendant 已退出。
-  if (detached || !leaderExited) {
+  if (hostPlatform() === 'win32') {
+    try {
+      await cleanupWindowsProcessTree(processGroupPid)
+    } catch (error) {
+      processError = error
+    }
+  } else if (detached || !leaderExited) {
     try {
       await terminateProcessTree(child)
     } catch (error) {

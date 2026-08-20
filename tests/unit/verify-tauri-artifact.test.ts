@@ -2,7 +2,7 @@ import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeF
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { inspectMountedDmg, probeBundledRuntime, verifyExtractedBundleContents, verifyTauriArtifact } from '../../scripts/verify-tauri-artifact.mjs'
+import { collectWindowsDescendantPids, inspectMountedDmg, probeBundledRuntime, verifyExtractedBundleContents, verifyTauriArtifact } from '../../scripts/verify-tauri-artifact.mjs'
 import { waitForListenerClosed } from '../../scripts/smoke-node-sidecar.mjs'
 
 /** 创建带指定机器字段和可选 NSIS 标记的最小 PE 测试文件。 */
@@ -116,6 +116,43 @@ void child
 `
 }
 
+/** 返回 Windows 真实 descendant 夹具；leader 退出后 descendant 继续持有 loopback listener。 */
+function windowsLeaderExitDescendantSource(): string {
+  const descendantSource = JSON.stringify([
+    "const { appendFileSync } = require('node:fs')",
+    "const { createServer } = require('node:net')",
+    "const server = createServer()",
+    "server.listen(0, '127.0.0.1', () => appendFileSync(process.env.DSH_FIXTURE_EVENTS, 'port:' + server.address().port + '\\n'))"
+  ].join('\n'))
+  return `
+import { appendFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+const eventsFile = process.env.DSH_FIXTURE_EVENTS
+const child = spawn(process.execPath, ['--input-type=commonjs', '-e', ${descendantSource}], { windowsHide: true, stdio: 'ignore' })
+if (eventsFile) {
+  appendFileSync(eventsFile, 'pid:' + child.pid + '\\n')
+  setTimeout(() => {
+    appendFileSync(eventsFile, 'leader-exit\\n')
+    process.stdout.write(JSON.stringify({ type: 'ready', origin: 'https://example.com/' }) + '\\n')
+    process.exit(0)
+  }, 500)
+} else process.exit(0)
+`
+}
+
+/** 等待测试夹具的 descendant PID 消失，避免只凭 taskkill 返回值误判清理成功。 */
+async function waitForProcessExit(pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    try {
+      process.kill(pid, 0)
+    } catch {
+      return
+    }
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  throw new Error(`fixture process ${pid} is still running`)
+}
+
 /** 临时设置 fixture 事件文件环境，并在 probe 完成后恢复测试进程环境。 */
 async function withFixtureEvents<T>(fixture: { readonly eventsFile: string }, callback: () => Promise<T>): Promise<T> {
   const previous = process.env.DSH_FIXTURE_EVENTS
@@ -221,6 +258,48 @@ describe('Tauri artifact verification', () => {
     } finally {
       await rm(fixture.root, { recursive: true, force: true })
     }
+  })
+
+  it.skipIf(process.platform !== 'win32')('kills a Windows descendant when the sidecar leader exits first', async () => {
+    const fixture = await createRuntimeFixture(windowsLeaderExitDescendantSource())
+    try {
+      await withFixtureEvents(fixture, async () => {
+        await expect(probeBundledRuntime(fixture.contentRoot, 'win', 'x64'))
+          .rejects.toThrow('disallowed origin')
+      })
+      let events = ''
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        events = await readFile(fixture.eventsFile, 'utf8').catch(() => '')
+        if (events.includes('port:')) break
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      const pid = Number(events.match(/pid:(\d+)/)?.[1])
+      const port = events.match(/port:(\d+)/)?.[1]
+      expect(pid).toBeGreaterThan(0)
+      expect(port).toBeDefined()
+      await expect(waitForProcessExit(pid)).resolves.toBeUndefined()
+      await expect(waitForListenerClosed(`http://127.0.0.1:${port}`, 5_000)).resolves.toBeUndefined()
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('collects Windows descendants deepest-first through the injected snapshot seam', async () => {
+    const calls: Array<{ file: string; args: string[] }> = []
+    const snapshot = JSON.stringify([
+      { ProcessId: 100, ParentProcessId: 1 },
+      { ProcessId: 200, ParentProcessId: 100 },
+      { ProcessId: 300, ParentProcessId: 200 },
+      { ProcessId: 400, ParentProcessId: 100 }
+    ])
+    await expect(collectWindowsDescendantPids(100, async (file, args) => {
+      calls.push({ file, args })
+      return { stdout: snapshot }
+    })).resolves.toEqual([300, 200, 400])
+    expect(calls).toHaveLength(1)
+    expect(calls[0].file).toBe('powershell.exe')
+    expect(calls[0].args).toContain('-NoProfile')
+    expect(calls[0].args.join(' ')).not.toContain('DSH_FIXTURE_EVENTS')
   })
 
   it('rejects a remote ready origin before making an HTTP request', async () => {
