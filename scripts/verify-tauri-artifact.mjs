@@ -1,7 +1,7 @@
 import { chmod, mkdir, mkdtemp, open, readdir, realpath, rm, stat } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
 import { execFile, spawn } from 'node:child_process'
-import { arch as hostArch, tmpdir } from 'node:os'
+import { arch as hostArch, platform as hostPlatform, tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
@@ -284,6 +284,19 @@ function writeSidecarControlMessage(child, message) {
   })
 }
 
+/** 严格验证 sidecar 返回的 loopback origin，禁止凭据、远程主机、非根路径和查询片段。 */
+function parseProbeOrigin(origin) {
+  if (typeof origin !== 'string') throw new Error('Bundled sidecar ready message did not include an origin')
+  let url
+  try { url = new URL(origin) } catch { throw new Error(`Bundled sidecar returned an invalid origin: ${origin}`) }
+  const port = Number(url.port)
+  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || !Number.isInteger(port) || port < 1 || port > 65_535
+    || url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+    throw new Error(`Bundled sidecar returned a disallowed origin: ${origin}`)
+  }
+  return url.toString()
+}
+
 /** 用安装包内的官方 Node 启动真实 Harness，验证打包闭包不是静态假绿。 */
 export async function probeBundledRuntime(contentRoot, platformName, runtimeArch = hostArch()) {
   const contract = artifactContract(platformName, runtimeArch)
@@ -301,6 +314,8 @@ export async function probeBundledRuntime(contentRoot, platformName, runtimeArch
     detached: platformName !== 'win',
     windowsHide: true
   })
+  const processGroupPid = child.pid
+  const detached = platformName !== 'win'
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity })
   const protocol = createSidecarMessageReader(child, lines)
   let stderr = ''
@@ -309,29 +324,41 @@ export async function probeBundledRuntime(contentRoot, platformName, runtimeArch
   child.stderr.on('data', chunk => { stderr = `${stderr}${chunk}`.slice(-8_000) })
   try {
     const ready = await protocol.waitFor('ready')
-    origin = ready.origin
-    if (typeof origin !== 'string') throw new Error('Bundled sidecar ready message did not include an origin')
+    origin = parseProbeOrigin(ready.origin)
     const response = await fetch(origin)
     if (!response.ok) throw new Error(`Bundled Harness probe returned HTTP ${response.status}`)
     if (!response.headers.get('content-type')?.includes('text/html')) throw new Error('Bundled Harness probe did not return HTML')
+    const body = await response.text()
+    if (!body.trim() || !/(?:<!doctype\s+html|<html(?:\s|>))/i.test(body)) throw new Error('Bundled Harness probe did not return non-empty HTML')
     await writeSidecarControlMessage(child, { type: 'stop' })
     await protocol.waitFor('stopped', 20_000)
     // stopped 已经确认进入退出路径，此时关闭 verifier 持有的写端，避免 stdin 管道延迟影响 reap。
     if (!child.stdin.destroyed) child.stdin.end()
     await waitForChildExit(child, 20_000)
-    cleanupConfirmed = true
+    await waitForProcessGroupClosed(processGroupPid, 20_000, detached)
     await waitForListenerClosed(origin)
+    cleanupConfirmed = true
     console.log(`Verified packaged official Node + Harness runtime: ${contract.label}`)
   } catch (error) {
     const detail = stderr.trim()
-    try { await cleanupBundledChild(child) } catch (cleanupError) {
-      throw new Error(`${error instanceof Error ? error.message : String(error)}\nCleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`)
+    let cleanupError
+    try {
+      await cleanupBundledChild(child, processGroupPid, detached)
+    } catch (failure) {
+      cleanupError = failure
     }
-    cleanupConfirmed = true
+    let listenerError
     if (origin) {
-      try { await waitForListenerClosed(origin) } catch {}
+      try { await waitForListenerClosed(origin) } catch (failure) {
+        listenerError = failure
+      }
     }
-    throw new Error(`${error instanceof Error ? error.message : String(error)}${detail ? `\n${detail}` : ''}`)
+    cleanupConfirmed = !cleanupError && !listenerError
+    const primary = `${error instanceof Error ? error.message : String(error)}${detail ? `\n${detail}` : ''}`
+    const cleanupDetail = [cleanupError, listenerError]
+      .filter(Boolean)
+      .map(failure => failure instanceof Error ? failure.message : String(failure))
+    throw new Error(`${primary}${cleanupDetail.length > 0 ? `\nCleanup failed: ${cleanupDetail.join('; ')}` : ''}`)
   } finally {
     protocol.dispose()
     lines.close()
@@ -378,17 +405,47 @@ function waitForChildExit(child, timeoutMilliseconds) {
   })
 }
 
-/** 仅在 child 仍存活时终止进程树，避免 Windows 对已自然退出的 code 0 child 误报清理失败。 */
-async function cleanupBundledChild(child) {
-  if (child.exitCode === null && child.signalCode === null) {
+/** 在 POSIX 上等待 detached process group 中的 leader 和 descendant 全部消失。 */
+async function waitForProcessGroupClosed(processGroupPid, timeoutMilliseconds = 20_000, detached = true) {
+  if (hostPlatform() === 'win32' || !detached || processGroupPid === undefined) return
+  const started = Date.now()
+  while (Date.now() - started < timeoutMilliseconds) {
+    try {
+      process.kill(-processGroupPid, 0)
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ESRCH') return
+      throw error
+    }
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  throw new Error(`Bundled sidecar process group ${processGroupPid} still has live descendants`)
+}
+
+/** 强制终止并确认 sidecar process group，即使 leader 已先退出也不能跳过 descendant 清理。 */
+async function cleanupBundledChild(child, processGroupPid, detached) {
+  let processError
+  const leaderExited = child.exitCode !== null || child.signalCode !== null
+  // POSIX detached group 必须始终尝试 kill(-pid)，因为 leader 退出不代表 descendant 已退出。
+  if (detached || !leaderExited) {
     try {
       await terminateProcessTree(child)
     } catch (error) {
-      // kill 与 exit 事件之间存在竞态；只有确认仍存活时才把清理错误暴露给验收结果。
-      if (child.exitCode === null && child.signalCode === null) throw error
+      processError = error
     }
   }
-  await waitForChildExit(child, 20_000)
+  let exitError
+  try {
+    await waitForChildExit(child, 20_000)
+    await waitForProcessGroupClosed(processGroupPid, 20_000, detached)
+  } catch (error) {
+    exitError = error
+  }
+  if (processError || exitError) {
+    const details = [processError, exitError]
+      .filter(Boolean)
+      .map(error => error instanceof Error ? error.message : String(error))
+    throw new Error(details.join('; '))
+  }
 }
 
 /** 查找 GitHub Windows runner 或本机 PATH 中可用的 7-Zip。 */
