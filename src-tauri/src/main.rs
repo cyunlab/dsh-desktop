@@ -1287,8 +1287,17 @@ fn startup_copy_diagnostics(
             message: "Starting.".into(),
             origin: None,
         });
+    let diagnostics = build_startup_diagnostics(state.inner(), &snapshot);
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    if std::env::var_os("DSH_TEST_RECORD_FILE").is_some() {
+        record_wdio_event(serde_json::json!({
+            "event": "diagnostics-copied",
+            "diagnostics": diagnostics
+        }));
+        return Ok(());
+    }
     app.clipboard()
-        .write_text(build_startup_diagnostics(state.inner(), &snapshot))
+        .write_text(diagnostics)
         .map_err(|error| error.to_string())
 }
 
@@ -1296,6 +1305,11 @@ fn startup_copy_diagnostics(
 #[tauri::command]
 fn startup_reveal_logs(app: AppHandle, state: State<'_, Arc<RuntimeState>>) -> Result<(), String> {
     fs::create_dir_all(&state.logs_dir).map_err(|error| error.to_string())?;
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    if std::env::var_os("DSH_TEST_RECORD_FILE").is_some() {
+        record_wdio_event(serde_json::json!({ "event": "logs-opened" }));
+        return Ok(());
+    }
     app.opener()
         .open_path(state.logs_dir.to_string_lossy().to_string(), None::<String>)
         .map_err(|error| error.to_string())

@@ -93,17 +93,35 @@ async function scenarioEnvironment(scenario) {
   }
 }
 
+/** 验收一个场景退出后的进程树与 loopback listener，失败场景也必须执行。 */
+async function verifyScenarioCleanup(environment) {
+  const events = await readEvents(environment.DSH_TEST_EVENTS)
+  const records = await readEvents(environment.DSH_TEST_RECORD_FILE)
+  const pids = [...events.filter(event => event.event === 'descendant-spawned').map(event => event.pid), ...records.filter(event => event.event === 'sidecar-spawned').map(event => event.pid)].filter(Number.isInteger)
+  await waitForProcessesExit(pids)
+  for (const item of records.filter(event => event.event === 'host-ready')) await waitForListenerShutdown(item.origin)
+}
+
 /** 依次运行每个真实桌面场景，并在 runner 退出后验收 sidecar 回收。 */
 async function main() {
   prepareApplication()
   for (const scenario of selectedScenarios()) {
     const environment = await scenarioEnvironment(scenario)
-    run('pnpm', ['exec', 'wdio', 'run', 'wdio.conf.ts'], environment)
-    const events = await readEvents(environment.DSH_TEST_EVENTS)
-    const records = await readEvents(environment.DSH_TEST_RECORD_FILE)
-    const pids = [...events.filter(event => event.event === 'descendant-spawned').map(event => event.pid), ...records.filter(event => event.event === 'sidecar-spawned').map(event => event.pid)].filter(Number.isInteger)
-    await waitForProcessesExit(pids)
-    for (const item of records.filter(event => event.event === 'host-ready')) await waitForListenerShutdown(item.origin)
+    let scenarioError
+    try {
+      run('pnpm', ['exec', 'wdio', 'run', 'wdio.conf.ts'], environment)
+    } catch (error) {
+      scenarioError = error
+    } finally {
+      try {
+        await verifyScenarioCleanup(environment)
+      } catch (cleanupError) {
+        scenarioError = scenarioError
+          ? new AggregateError([scenarioError, cleanupError], `${scenario} failed and left desktop resources behind`)
+          : cleanupError
+      }
+    }
+    if (scenarioError) throw scenarioError
   }
 }
 
