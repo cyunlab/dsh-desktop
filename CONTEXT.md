@@ -8,7 +8,7 @@ DeepSeek Harness Desktop is a native application shell that owns one local Harne
 
 ### Desktop
 
-The versioned Electron application: main process, preload bridge, local startup page, packaging, and lifecycle automation. Avoid using this term for the upstream Web Client alone.
+The versioned Tauri application: native shell, local startup page, packaged official Node sidecar, and lifecycle automation. Avoid using this term for the upstream Web Client alone.
 
 ### Desktop window
 
@@ -22,13 +22,13 @@ The DeepSeek Harness Cordis runtime that exposes the loopback HTTP/API surface. 
 
 The upstream browser UI served by the Host. It owns the normal product experience, including Workspace management; Desktop does not fork or recreate it.
 
-### Web Client readiness
+### Client readiness
 
-The condition in which the Web Client app shell and its required core services have activated and the normal product surface can render. Host HTTP availability alone does not establish Web Client readiness.
+The condition in which the client app shell and its required core services have activated and the normal product surface can render. Host HTTP availability alone does not establish client readiness. The startup page uses the user-facing wording “Waiting for client to start” and does not expose the upstream Web Client term.
 
-### Web Client startup observer
+### Client startup observer
 
-The Desktop-owned, read-only observer that reports Web Client readiness or activation failure across the renderer-to-main boundary. It does not modify the Web Client or expose Desktop capabilities to it.
+The Desktop-owned, read-only observer that reports client readiness or activation failure across the renderer-to-main boundary. It does not modify the client or expose Desktop capabilities to it.
 
 ### Web composition
 
@@ -48,7 +48,15 @@ The deterministic, writable Desktop-owned directory used as the initial working 
 
 ### Startup page
 
-The packaged, sandboxed Desktop renderer shown while the Host starts or when startup fails. It is not the Web Client and exposes only the narrow lifecycle/diagnostic preload API.
+The packaged, sandboxed Desktop renderer shown while the Host starts or when startup fails. It is not the Web Client and exposes only the narrow Tauri lifecycle/diagnostic event and command API.
+
+### Desktop lifecycle
+
+The Desktop-owned finite state machine: Starting, Starting sidecar, Waiting for Web Client, Ready, Failed, and Stopping. A sidecar crash after Ready transitions back to Failed. A retry first stops the owned sidecar before starting a replacement.
+
+### Desktop navigation policy
+
+The rule set that allows the main window to load only the packaged Startup page and the current Host loopback origin. Web Client popup requests never create another Desktop WebView: HTTP(S) targets open through the operating system default browser and every other target is rejected.
 
 ### Startup recovery cycle
 
@@ -56,7 +64,7 @@ A bounded recovery attempt that first reloads a failed Web Client while preservi
 
 ### Prolonged startup
 
-A non-terminal state in which the Web Client has reported neither readiness nor activation failure after the normal waiting period. Desktop continues waiting while offering the user recovery actions; elapsed time alone does not make startup fail.
+A non-terminal state entered after 30 seconds when the Host or Web Client has not reported readiness. Desktop continues waiting indefinitely while offering user-controlled recovery actions; elapsed time alone does not make startup fail.
 
 ### Runtime closure
 
@@ -77,6 +85,10 @@ The official Node.js process that runs the Harness Host and its complete plugin 
 ### Node sidecar
 
 A packaged, version-matched official Node.js executable launched and supervised by Desktop to host the Harness runtime. Plugins execute inside this process rather than inside Electron or Tauri.
+
+### Node executable override
+
+The optional `DSH_NODE_PATH` environment variable that explicitly replaces the packaged Node sidecar executable. Without it, both development and packaged Desktop use the fixed-version official Node executable in the platform resource directory.
 
 ### Desktop shell
 
