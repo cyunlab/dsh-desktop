@@ -27,7 +27,8 @@ export function getNodeTarget(runtimePlatform = hostPlatform(), runtimeArch = ho
       archiveRoot: `node-v${NODE_VERSION}-win-x64`,
       relativeExecutable: 'node.exe',
       archiveExecutable: 'node.exe',
-      archiveKind: 'zip'
+      archiveKind: 'zip',
+      archiveSha256: '57f71ab3652e797d84acddc79c81cc9ff1c6ddb2a1974cdb83f00fee9bff4c73'
     },
     'darwin-arm64': {
       resourceName: 'macos-aarch64',
@@ -35,7 +36,8 @@ export function getNodeTarget(runtimePlatform = hostPlatform(), runtimeArch = ho
       archiveRoot: `node-v${NODE_VERSION}-darwin-arm64`,
       relativeExecutable: 'node',
       archiveExecutable: 'bin/node',
-      archiveKind: 'tar'
+      archiveKind: 'tar',
+      archiveSha256: '3f1cf157479c1480352083105e13faf9d008ede98e7e157746b6df940d197b94'
     },
     'darwin-x64': {
       resourceName: 'macos-x86_64',
@@ -43,7 +45,8 @@ export function getNodeTarget(runtimePlatform = hostPlatform(), runtimeArch = ho
       archiveRoot: `node-v${NODE_VERSION}-darwin-x64`,
       relativeExecutable: 'node',
       archiveExecutable: 'bin/node',
-      archiveKind: 'tar'
+      archiveKind: 'tar',
+      archiveSha256: 'd35e95230f46f6f0751df497c56622c6735e05d5e1fb1630996a005b9d328fe4'
     },
     'linux-x64': {
       resourceName: 'linux-x86_64',
@@ -51,7 +54,8 @@ export function getNodeTarget(runtimePlatform = hostPlatform(), runtimeArch = ho
       archiveRoot: `node-v${NODE_VERSION}-linux-x64`,
       relativeExecutable: 'node',
       archiveExecutable: 'bin/node',
-      archiveKind: 'tar'
+      archiveKind: 'tar',
+      archiveSha256: '14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647'
     }
   }[`${runtimePlatform}-${runtimeArch}`]
   if (!targets) throw new Error(`Unsupported Node sidecar target: ${runtimePlatform}-${runtimeArch}`)
@@ -71,16 +75,6 @@ export async function download(url, destination, fetchImpl = fetch) {
   const response = await fetchImpl(url)
   if (!response.ok || !response.body) throw new Error(`Download failed (${response.status}): ${url}`)
   await pipeline(response.body, createWriteStream(destination))
-}
-
-/** 从 Node 官方 SHASUMS 文件中读取目标归档的 SHA-256。 */
-export async function expectedHash(version, archiveName, fetchImpl = fetch) {
-  const response = await fetchImpl(`https://nodejs.org/dist/v${version}/SHASUMS256.txt`)
-  if (!response.ok) throw new Error(`Unable to download Node checksums (${response.status})`)
-  const text = await response.text()
-  const line = text.split(/\r?\n/).find(value => value.trimEnd().endsWith(`  ${archiveName}`))
-  if (!line) throw new Error(`Node checksum not found for ${archiveName}`)
-  return line.trim().split(/\s+/)[0].toLowerCase()
 }
 
 /** 计算归档内容的 SHA-256，用于校验缓存和新下载。 */
@@ -116,6 +110,21 @@ function isExistenceConflict(error) {
 /** 等待锁持有者释放目标，避免忙轮询。 */
 function delay(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds))
+}
+
+/** 判断锁文件记录的持有进程是否仍存活，避免调度暂停时误抢有效锁。 */
+async function lockOwnerProcessIsAlive(lockPath) {
+  const owner = await readFile(path.join(lockPath, 'owner'), 'utf8').catch(() => '')
+  const match = /^(\d+)-/.exec(owner)
+  if (!match) return false
+  const ownerPid = Number(match[1])
+  if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return false
+  try {
+    process.kill(ownerPid, 0)
+    return true
+  } catch (error) {
+    return error instanceof Error && 'code' in error && error.code === 'EPERM'
+  }
 }
 
 /** 只释放仍由当前调用者拥有的锁，避免误删后来者的锁。 */
@@ -184,6 +193,11 @@ export async function withDirectoryLock(lockPath, action, options = {}) {
         continue
       }
       if (Date.now() - lockInformation.mtimeMs >= staleMilliseconds) {
+        if (await lockOwnerProcessIsAlive(lockPath)) {
+          if (Date.now() - started >= timeoutMilliseconds) throw new Error(`Timed out waiting for Node sidecar lock: ${lockPath}`)
+          await delay(retryMilliseconds)
+          continue
+        }
         const stalePath = `${lockPath}.stale-${process.pid}-${randomUUID()}`
         try {
           await rename(lockPath, stalePath)
@@ -262,7 +276,7 @@ async function ensureCachedArchive(target, cacheRoot, fetchImpl) {
   const cacheDirectory = path.join(cacheRoot, NODE_VERSION, target.resourceName)
   const archivePath = path.join(cacheDirectory, target.archiveName)
   await mkdir(cacheDirectory, { recursive: true })
-  const expected = await expectedHash(NODE_VERSION, target.archiveName, fetchImpl)
+  const expected = target.archiveSha256
   if (await isFile(archivePath) && (await sha256(archivePath)).toLowerCase() === expected) return archivePath
   await rm(archivePath, { force: true })
   const temporary = path.join(cacheDirectory, `${target.archiveName}.${process.pid}.${randomUUID()}.part`)

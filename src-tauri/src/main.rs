@@ -500,7 +500,7 @@ fn decide_navigation(
     if (target.scheme() == "http" && target.host_str() == Some("tauri.localhost"))
         || (target.scheme() == "tauri" && target.host_str() == Some("localhost"))
     {
-        return NavigationDecision::Allow;
+        return NavigationDecision::Deny;
     }
     if host_origin.is_some_and(|origin| {
         target.origin().ascii_serialization() == origin.trim_end_matches('/')
@@ -1509,6 +1509,14 @@ mod tests {
         assert_eq!(
             decide_navigation("http://127.0.0.1:1234/", startup, host),
             NavigationDecision::Allow
+        );
+        assert_eq!(
+            decide_navigation("http://tauri.localhost/private", startup, host),
+            NavigationDecision::Deny
+        );
+        assert_eq!(
+            decide_navigation("tauri://localhost/private", startup, host),
+            NavigationDecision::Deny
         );
         assert_eq!(
             decide_navigation("https://example.com", startup, host),

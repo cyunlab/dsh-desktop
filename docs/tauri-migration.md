@@ -25,7 +25,7 @@ Desktop 使用单实例语义。重复启动只恢复并聚焦已有主窗口，
 
 ## 测试与发布
 
-CI 在 Windows x64、macOS arm64/x64 和 Linux x64 上都会先用随项目下载的固定官方 Node 启动真实 Harness，并验证 loopback HTML 响应和优雅回收。这是所有平台的运行时门禁。Tauri WebDriver E2E 只有在仓库存在实际 `tests/e2e` 测试文件时才启用：Windows/Linux 使用 `tauri-driver`，macOS 使用官方 Tauri 文档支持的 embedded `@wdio/tauri-service` provider。当前没有已提交的 E2E 实现时，CI 不伪造覆盖，仍由官方 Node + Harness smoke 作为运行时门禁。Computer Use 仅作 Windows 人工验证，不作为 CI 门禁。
+CI 在 Windows x64、macOS arm64/x64 和 Linux x64 上都会先用随项目下载的固定官方 Node 启动真实 Harness，并验证 loopback HTML 响应和优雅回收。这是所有平台的运行时门禁。三平台都强制运行已提交的真实桌面 E2E，并使用 embedded `@wdio/tauri-service` provider；Linux 通过 Xvfb 运行。Computer Use 仅作 Windows 人工验证，不作为 CI 门禁。
 
 Windows 仅构建和发布 x64 NSIS `.exe`，不构建 MSI。macOS 分别构建 arm64 与 x64 DMG，Linux 构建 x64 AppImage。CI 在每个目标平台打包官方 Node sidecar、运行 Tauri 行为测试，并保留 Harness 子模块只读校验。
 
@@ -38,6 +38,6 @@ $env:DSH_NODE_PATH = "C:\\Program Files\\nodejs\\node.exe"
 pnpm tauri:dev
 ```
 
-Node 归档缓存在 Windows 的 `%LOCALAPPDATA%\\dsh-desktop\\node`，在 macOS/Linux 的 `$XDG_CACHE_HOME/dsh-desktop/node`（未设置时为 `~/.cache/dsh-desktop/node`）。每次使用缓存前都会校验 Node 官方 `SHASUMS256.txt`，下载中的归档不会直接写入资源目录。
+Node 归档缓存在 Windows 的 `%LOCALAPPDATA%\\dsh-desktop\\node`，在 macOS/Linux 的 `$XDG_CACHE_HOME/dsh-desktop/node`（未设置时为 `~/.cache/dsh-desktop/node`）。每次使用缓存前都会按仓库内固定的官方 SHA-256 校验，下载中的归档不会直接写入资源目录。
 
 当前垂直切片只包含窗口、Host 加载和 sidecar 回收；托盘、通知及桌面能力桥不在本次范围内。

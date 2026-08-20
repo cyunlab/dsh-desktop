@@ -98,7 +98,7 @@ corepack pnpm test:integration
 corepack pnpm smoke:node-sidecar
 ```
 
-Run the configured Tauri WebDriver suite (CI enables it when `tests/e2e` exists; Windows/Linux use `tauri-driver`, macOS uses the embedded `@wdio/tauri-service` provider)
+Run the real desktop end-to-end suite. Windows, macOS, and Linux CI all use the embedded `@wdio/tauri-service` provider; Linux runs under Xvfb.
 
 ```sh
 corepack pnpm test:e2e

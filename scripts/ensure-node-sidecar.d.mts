@@ -9,6 +9,7 @@ export interface NodeTarget {
   readonly relativeExecutable: string
   readonly archiveExecutable: string
   readonly archiveKind: 'zip' | 'tar'
+  readonly archiveSha256: string
   readonly runtimePlatform: string
   readonly runtimeArch: string
 }
@@ -42,9 +43,6 @@ export function ensureNodeSidecar(options?: EnsureNodeSidecarOptions): Promise<s
 
 /** 下载归档到临时文件。 */
 export function download(url: string, destination: string, fetchImpl?: typeof fetch): Promise<void>
-
-/** 读取 Node 官方归档的 SHA-256。 */
-export function expectedHash(version: string, archiveName: string, fetchImpl?: typeof fetch): Promise<string>
 
 /** 计算本地文件 SHA-256。 */
 export function sha256(file: string): Promise<string>
