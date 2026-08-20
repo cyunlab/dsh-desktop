@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
-import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { arch as hostArch, homedir, platform as hostPlatform, tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -132,11 +132,34 @@ async function releaseDirectoryLock(lockPath, ownerToken) {
   }
 }
 
+/** 定期刷新仍属于当前调用者的锁目录，避免长时间下载被误判为陈旧锁。 */
+function startDirectoryLockHeartbeat(lockPath, ownerToken, heartbeatMilliseconds) {
+  let pending = Promise.resolve()
+  let heartbeatError
+  const timer = setInterval(() => {
+    pending = pending.then(async () => {
+      const currentOwner = await readFile(path.join(lockPath, 'owner'), 'utf8').catch(() => undefined)
+      if (currentOwner !== ownerToken) return
+      const now = new Date()
+      await utimes(lockPath, now, now)
+    }).catch(error => {
+      heartbeatError ??= error
+    })
+  }, heartbeatMilliseconds)
+  timer.unref?.()
+  return async () => {
+    clearInterval(timer)
+    await pending
+    if (heartbeatError) throw heartbeatError
+  }
+}
+
 /** 使用原子目录锁串行化同一目标，并回收超过安全时限的陈旧锁。 */
 export async function withDirectoryLock(lockPath, action, options = {}) {
   const retryMilliseconds = options.retryMilliseconds ?? LOCK_RETRY_MILLISECONDS
   const staleMilliseconds = options.staleMilliseconds ?? LOCK_STALE_MILLISECONDS
   const timeoutMilliseconds = options.timeoutMilliseconds ?? LOCK_TIMEOUT_MILLISECONDS
+  const heartbeatMilliseconds = options.heartbeatMilliseconds ?? Math.max(1, Math.min(10_000, Math.floor(staleMilliseconds / 3)))
   const started = Date.now()
   const ownerToken = `${process.pid}-${randomUUID()}`
   await mkdir(path.dirname(lockPath), { recursive: true })
@@ -174,11 +197,21 @@ export async function withDirectoryLock(lockPath, action, options = {}) {
       await delay(retryMilliseconds)
     }
   }
+  const stopHeartbeat = startDirectoryLockHeartbeat(lockPath, ownerToken, heartbeatMilliseconds)
+  let actionResult
+  let actionError
   try {
-    return await action()
+    actionResult = await action()
+  } catch (error) {
+    actionError = error
+  }
+  try {
+    await stopHeartbeat()
   } finally {
     await releaseDirectoryLock(lockPath, ownerToken)
   }
+  if (actionError) throw actionError
+  return actionResult
 }
 
 /** 递归查找归档展开后的目标可执行文件。 */

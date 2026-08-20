@@ -28,6 +28,7 @@ export interface DirectoryLockOptions {
   readonly retryMilliseconds?: number
   readonly staleMilliseconds?: number
   readonly timeoutMilliseconds?: number
+  readonly heartbeatMilliseconds?: number
 }
 
 /** 返回官方 Node 归档和资源布局。 */

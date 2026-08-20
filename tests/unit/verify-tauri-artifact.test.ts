@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { verifyTauriArtifact } from '../../scripts/verify-tauri-artifact.mjs'
+import { verifyExtractedBundleContents, verifyTauriArtifact } from '../../scripts/verify-tauri-artifact.mjs'
 
 /** 创建带指定机器字段和可选 NSIS 标记的最小 PE 测试文件。 */
 function fakePe(machine: number, marker = ''): Buffer {
@@ -15,37 +15,46 @@ function fakePe(machine: number, marker = ''): Buffer {
   return buffer
 }
 
-/** 创建包含 NSIS、官方 Node、sidecar 和 Tauri 映射的 Windows 验收夹具。 */
-async function createWindowsFixture(): Promise<{ root: string; artifact: string; bundleRoot: string }> {
+/** 创建包含真实安装目录内容的 Windows NSIS 验收夹具。 */
+async function createWindowsFixture(): Promise<{ root: string; artifact: string; bundleRoot: string; extractedRoot: string }> {
   const root = await mkdtemp(path.join(tmpdir(), 'dsh-artifact-contract-'))
   const bundleRoot = path.join(root, 'src-tauri', 'target', 'release', 'bundle')
   const artifactDirectory = path.join(bundleRoot, 'nsis')
   const artifact = path.join(artifactDirectory, 'DeepSeek Harness Desktop_1.1.1_x64-setup.exe')
-  const nodeExecutable = path.join(root, 'resources', 'node', 'windows-x86_64', 'node.exe')
-  const sidecar = path.join(root, 'dist', 'sidecar', 'index.js')
-  const application = path.join(root, 'src-tauri', 'target', 'release', 'deepseek-harness-desktop.exe')
+  const extractedRoot = path.join(root, 'extracted-installer')
+  const nodeExecutable = path.join(extractedRoot, 'resources', 'node', 'windows-x86_64', 'node.exe')
+  const sidecar = path.join(extractedRoot, 'resources', 'dist', 'sidecar', 'index.js')
+  const application = path.join(extractedRoot, 'DeepSeek Harness Desktop.exe')
   await Promise.all([artifactDirectory, path.dirname(nodeExecutable), path.dirname(sidecar), path.dirname(application)]
     .map(directory => mkdir(directory, { recursive: true })))
   await Promise.all([
     writeFile(artifact, fakePe(0x014c, 'Nullsoft NSIS')),
     writeFile(nodeExecutable, fakePe(0x8664)),
     writeFile(application, fakePe(0x8664)),
-    writeFile(sidecar, 'console.log("sidecar")'),
-    writeFile(path.join(root, 'src-tauri', 'tauri.conf.json'), JSON.stringify({
-      bundle: { resources: { '../resources/node/**/*': 'node', '../dist/**/*': 'dist' } }
-    }))
+    writeFile(sidecar, 'console.log("sidecar")')
   ])
-  return { root, artifact, bundleRoot }
+  return { root, artifact, bundleRoot, extractedRoot }
 }
 
 describe('Tauri artifact verification', () => {
-  it('checks NSIS magic, x64 staged executables, and required resource mappings', async () => {
+  it('checks NSIS magic and the actual extracted application resources', async () => {
     const fixture = await createWindowsFixture()
     await expect(verifyTauriArtifact('win', {
       projectRoot: fixture.root,
       runtimeArch: 'x64',
-      inspectContainer: false
+      containerInspector: async () => verifyExtractedBundleContents(fixture.extractedRoot, 'win', 'x64')
     })).resolves.toBe(fixture.artifact)
+  })
+
+  it('fails when the extracted installer has resources but no application executable', async () => {
+    const fixture = await createWindowsFixture()
+    const resourceOnly = path.join(fixture.root, 'resource-only')
+    await mkdir(path.join(resourceOnly, 'node', 'windows-x86_64'), { recursive: true })
+    await mkdir(path.join(resourceOnly, 'dist', 'sidecar'), { recursive: true })
+    await writeFile(path.join(resourceOnly, 'node', 'windows-x86_64', 'node.exe'), fakePe(0x8664))
+    await writeFile(path.join(resourceOnly, 'dist', 'sidecar', 'index.js'), 'sidecar')
+    await expect(verifyExtractedBundleContents(resourceOnly, 'win', 'x64'))
+      .rejects.toThrow('application executable is missing')
   })
 
   it('rejects an MSI anywhere in the complete bundle tree', async () => {
@@ -56,7 +65,7 @@ describe('Tauri artifact verification', () => {
     await expect(verifyTauriArtifact('win', {
       projectRoot: fixture.root,
       runtimeArch: 'x64',
-      inspectContainer: false
+      containerInspector: async () => verifyExtractedBundleContents(fixture.extractedRoot, 'win', 'x64')
     })).rejects.toThrow('MSI output is forbidden')
   })
 
@@ -66,7 +75,7 @@ describe('Tauri artifact verification', () => {
     await expect(verifyTauriArtifact('win', {
       projectRoot: fixture.root,
       runtimeArch: 'x64',
-      inspectContainer: false
+      containerInspector: async () => verifyExtractedBundleContents(fixture.extractedRoot, 'win', 'x64')
     })).rejects.toThrow('PE magic is missing')
   })
 })

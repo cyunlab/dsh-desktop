@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, open, readFile, readdir, rm, stat } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, open, readdir, rm, stat } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { arch as hostArch, tmpdir } from 'node:os'
 import path from 'node:path'
@@ -129,41 +129,76 @@ async function verifyContainerFormat(artifact, contract) {
   }
 }
 
-/** 检查 Tauri 资源映射和构建前资源文件。 */
-async function verifyStagedResources(root, contract) {
-  const configuration = JSON.parse(await readFile(path.join(root, 'src-tauri', 'tauri.conf.json'), 'utf8'))
-  const resources = configuration.bundle?.resources ?? {}
-  if (resources['../resources/node/**/*'] !== 'node') throw new Error('Tauri Node resource mapping is missing')
-  if (resources['../dist/**/*'] !== 'dist') throw new Error('Tauri sidecar resource mapping is missing')
-  const nodeExecutable = path.join(root, 'resources', 'node', contract.resourceName, contract.executableName)
-  const sidecarScript = path.join(root, 'dist', 'sidecar', 'index.js')
-  for (const required of [nodeExecutable, sidecarScript]) {
-    if (!(await stat(required)).isFile() || (await stat(required)).size === 0) throw new Error(`Required staged resource is missing or empty: ${required}`)
-  }
-  const nodeArchitecture = contract.platformName === 'win'
-    ? await readPeArchitecture(nodeExecutable)
+/** 使用平台可执行格式读取器验证文件架构。 */
+async function verifyExecutableArchitecture(file, contract, label) {
+  const architecture = contract.platformName === 'win'
+    ? await readPeArchitecture(file)
     : contract.platformName === 'linux'
-      ? await readElfArchitecture(nodeExecutable)
-      : await readMachOArchitecture(nodeExecutable)
-  if (nodeArchitecture !== contract.architecture) throw new Error(`Official Node architecture mismatch: expected ${contract.architecture}, found ${nodeArchitecture}`)
-  const application = path.join(root, 'src-tauri', 'target', 'release', contract.platformName === 'win' ? 'deepseek-harness-desktop.exe' : 'deepseek-harness-desktop')
-  if (await stat(application).then(information => information.isFile()).catch(() => false)) {
-    const applicationArchitecture = contract.platformName === 'win'
-      ? await readPeArchitecture(application)
-      : contract.platformName === 'linux'
-        ? await readElfArchitecture(application)
-        : await readMachOArchitecture(application)
-    if (applicationArchitecture !== contract.architecture) throw new Error(`Tauri application architecture mismatch: expected ${contract.architecture}, found ${applicationArchitecture}`)
-  }
+      ? await readElfArchitecture(file)
+      : await readMachOArchitecture(file)
+  if (architecture !== contract.architecture) throw new Error(`${label} architecture mismatch: expected ${contract.architecture}, found ${architecture}`)
 }
 
-/** 在可可靠展开的 DMG/AppImage 中再次确认打包资源存在。 */
+/** 在安装包展开目录中验证真正随包交付的 Node、sidecar 和应用程序。 */
+export async function verifyExtractedBundleContents(contentRoot, platformName, runtimeArch = hostArch()) {
+  const contract = artifactContract(platformName, runtimeArch)
+  const contents = await walkFiles(contentRoot)
+  const normalized = file => file.replaceAll('\\', '/').toLowerCase()
+  const nodeSuffix = `/node/${contract.resourceName}/${contract.executableName}`.toLowerCase()
+  const sidecarSuffix = '/dist/sidecar/index.js'
+  const nodeExecutable = contents.find(file => normalized(file).endsWith(nodeSuffix))
+  const sidecarScript = contents.find(file => normalized(file).endsWith(sidecarSuffix))
+  if (!nodeExecutable) throw new Error(`Bundled Node resource is missing from ${contract.label}`)
+  if (!sidecarScript || (await stat(sidecarScript)).size === 0) throw new Error(`Bundled sidecar resource is missing or empty from ${contract.label}`)
+  await verifyExecutableArchitecture(nodeExecutable, contract, 'Official Node')
+  let application
+  if (platformName === 'win') {
+    application = contents.find(file => normalized(file).endsWith('.exe')
+      && path.basename(file).toLowerCase().includes('deepseek')
+      && !path.basename(file).toLowerCase().includes('setup'))
+  } else if (platformName === 'mac') {
+    application = contents.find(file => normalized(file).includes('.app/contents/macos/')
+      && path.basename(file).toLowerCase().includes('deepseek'))
+  } else {
+    application = contents.find(file => normalized(file).includes('/usr/bin/')
+      && path.basename(file).toLowerCase().includes('deepseek'))
+  }
+  if (!application) throw new Error(`Bundled Tauri application executable is missing from ${contract.label}`)
+  await verifyExecutableArchitecture(application, contract, 'Tauri application')
+}
+
+/** 查找 GitHub Windows runner 或本机 PATH 中可用的 7-Zip。 */
+async function locateSevenZip(environment = process.env) {
+  const candidates = [
+    environment.ProgramFiles && path.join(environment.ProgramFiles, '7-Zip', '7z.exe'),
+    environment['ProgramFiles(x86)'] && path.join(environment['ProgramFiles(x86)'], '7-Zip', '7z.exe'),
+    environment.ChocolateyInstall && path.join(environment.ChocolateyInstall, 'bin', '7z.exe'),
+    '7z.exe',
+    '7z'
+  ].filter(Boolean)
+  for (const candidate of candidates) {
+    if (path.isAbsolute(candidate) && await stat(candidate).then(value => value.isFile()).catch(() => false)) return candidate
+    if (!path.isAbsolute(candidate)) {
+      try {
+        await execFileAsync(candidate, ['i'], { windowsHide: true })
+        return candidate
+      } catch {}
+    }
+  }
+  throw new Error('7-Zip is required to inspect the Windows NSIS installer contents')
+}
+
+/** 展开或挂载真实安装包并验证其中实际交付的文件。 */
 async function verifyInspectableContainer(artifact, contract) {
-  if (contract.platformName === 'win') return
   const inspectionRoot = await mkdtemp(path.join(tmpdir(), 'dsh-bundle-inspection-'))
   try {
     let contentRoot
-    if (contract.platformName === 'linux') {
+    if (contract.platformName === 'win') {
+      contentRoot = path.join(inspectionRoot, 'extracted')
+      await mkdir(contentRoot)
+      const sevenZip = await locateSevenZip()
+      await execFileAsync(sevenZip, ['x', '-y', `-o${contentRoot}`, artifact], { windowsHide: true })
+    } else if (contract.platformName === 'linux') {
       await chmod(artifact, 0o755)
       await execFileAsync(artifact, ['--appimage-extract'], { cwd: inspectionRoot })
       contentRoot = path.join(inspectionRoot, 'squashfs-root')
@@ -173,11 +208,7 @@ async function verifyInspectableContainer(artifact, contract) {
       await execFileAsync('hdiutil', ['attach', '-readonly', '-nobrowse', '-mountpoint', contentRoot, artifact])
     }
     try {
-      const contents = await walkFiles(contentRoot)
-      const nodeSuffix = path.join('node', contract.resourceName, contract.executableName).toLowerCase()
-      const sidecarSuffix = path.join('dist', 'sidecar', 'index.js').toLowerCase()
-      if (!contents.some(file => file.toLowerCase().endsWith(nodeSuffix))) throw new Error(`Bundled Node resource is missing from ${contract.label}`)
-      if (!contents.some(file => file.toLowerCase().endsWith(sidecarSuffix))) throw new Error(`Bundled sidecar resource is missing from ${contract.label}`)
+      await verifyExtractedBundleContents(contentRoot, contract.platformName, contract.architecture === 'aarch64' ? 'arm64' : 'x64')
     } finally {
       if (contract.platformName === 'mac') await execFileAsync('hdiutil', ['detach', contentRoot])
     }
@@ -202,8 +233,8 @@ export async function verifyTauriArtifact(platformName, options = {}) {
   const artifact = artifacts[0]
   if ((await stat(artifact)).size === 0) throw new Error(`Tauri artifact is empty: ${artifact}`)
   await verifyContainerFormat(artifact, contract)
-  await verifyStagedResources(root, contract)
-  if (options.inspectContainer !== false) await verifyInspectableContainer(artifact, contract)
+  if (options.containerInspector) await options.containerInspector(artifact, contract)
+  else await verifyInspectableContainer(artifact, contract)
   console.log(`Verified ${contract.label} artifact, architecture, and bundled resources: ${artifact}`)
   return artifact
 }

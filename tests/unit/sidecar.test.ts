@@ -71,6 +71,23 @@ describe('node sidecar seams', () => {
     await expect(stat(lockPath)).rejects.toThrow()
   })
 
+  it('keeps a long-lived active lock fresh until its owner finishes', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-node-heartbeat-lock-'))
+    const lockPath = path.join(root, 'linux-x86_64.lock')
+    const order: string[] = []
+    const first = withDirectoryLock(lockPath, async () => {
+      order.push('first-enter')
+      await new Promise(resolve => setTimeout(resolve, 100))
+      order.push('first-exit')
+    }, { retryMilliseconds: 2, staleMilliseconds: 25, heartbeatMilliseconds: 5, timeoutMilliseconds: 2_000 })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    const second = withDirectoryLock(lockPath, async () => {
+      order.push('second-enter')
+    }, { retryMilliseconds: 2, staleMilliseconds: 25, heartbeatMilliseconds: 5, timeoutMilliseconds: 2_000 })
+    await Promise.all([first, second])
+    expect(order).toEqual(['first-enter', 'first-exit', 'second-enter'])
+  })
+
   it('does not remove a successor lock after ownership changes', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'dsh-node-lock-owner-'))
     const lockPath = path.join(root, 'macos-aarch64.lock')
