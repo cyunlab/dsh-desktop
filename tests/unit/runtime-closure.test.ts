@@ -19,13 +19,28 @@ async function createEntryPackages(root: string): Promise<void> {
   }
 }
 
+/** 返回夹具中模拟 pnpm 安装的动态 sharp 原生资产路径。 */
+function fixtureAssetPath(assetPath: string, target: ReturnType<typeof runtimeTarget>, dynamicVersion = false): string {
+  if (!dynamicVersion || !['win32', 'linux'].includes(target.platform)) return assetPath
+  if (target.platform === 'win32') {
+    if (assetPath.endsWith('sharp-win32-x64-0.35.3.node')) return assetPath.replace('0.35.3.node', '0.35.9.node')
+    if (assetPath.endsWith('libvips-42.dll')) return assetPath.replace('42.dll', '43.dll')
+    if (assetPath.endsWith('libvips-cpp-8.18.3.dll')) return assetPath.replace('8.18.3', '8.19.0')
+    return assetPath
+  }
+  const sharpAddon = path.join('@img', `sharp-${target.platform}-${target.arch}`, 'lib', `sharp-${target.platform}-${target.arch}-0.35.3.node`)
+  if (assetPath === sharpAddon) return sharpAddon.replace('0.35.3.node', '0.35.9.node')
+  const libvipsRuntime = path.join('@img', `sharp-libvips-${target.platform}-${target.arch}`, 'lib', 'libvips-cpp.so.8.18.3')
+  if (assetPath === libvipsRuntime) return libvipsRuntime.replace('8.18.3', '8.19.0')
+  return assetPath
+}
+
 /** 创建包含平台原生文件清单的最小闭包夹具。 */
-async function createCompleteFixture() {
+async function createCompleteFixture(target = runtimeTarget('win32', 'x64'), dynamicVersion = false) {
   const root = await mkdtemp(path.join(tmpdir(), 'dsh-runtime-closure-test-'))
-  const target = runtimeTarget('win32', 'x64')
   await createEntryPackages(root)
   for (const asset of requiredRuntimeAssets(target)) {
-    const targetPath = path.join(root, asset.path)
+    const targetPath = path.join(root, fixtureAssetPath(asset.path, target, dynamicVersion))
     if (asset.kind === 'non-empty-directory') {
       await mkdir(targetPath, { recursive: true })
       await writeFile(path.join(targetPath, 'asset.js'), 'asset')
@@ -58,8 +73,9 @@ describe('runtime closure contract', () => {
         path.join('@img', 'sharp-libvips-darwin-arm64', 'lib', 'libvips-cpp.8.18.3.dylib')
       ]],
       [runtimeTarget('linux', 'x64'), [
-        path.join('node-pty', 'build', 'Release', 'spawn-helper'),
-        path.join('@deepseek-ai', 'node-addon-landlock-run-linux-x64', 'bin', 'landlock-run')
+        path.join('node-pty', 'build', 'Release', 'pty.node'),
+        path.join('@deepseek-ai', 'node-addon-landlock-run-linux-x64', 'bin', 'landlock-run'),
+        path.join('@img', 'sharp-libvips-linux-x64', 'lib', 'libvips-cpp.so.8.18.3')
       ]]
     ] as const
     for (const [target, paths] of expectations) {
@@ -72,6 +88,39 @@ describe('runtime closure contract', () => {
     const fixture = await createCompleteFixture()
     try {
       await expect(verifyRuntimeClosure(fixture.root, fixture.target)).resolves.toBe(true)
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  it('resolves dynamic sharp native version names on Windows too', async () => {
+    const target = runtimeTarget('win32', 'x64')
+    const fixture = await createCompleteFixture(target, true)
+    try {
+      await expect(verifyRuntimeClosure(fixture.root, target)).resolves.toBe(true)
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  // Windows 无法为模拟 Linux 文件设置 POSIX executable mode，Linux/macOS CI 会执行该夹具。
+  it.skipIf(process.platform === 'win32')('accepts the Linux pnpm sharp layout with dynamic native version names', async () => {
+    const target = runtimeTarget('linux', 'x64')
+    const fixture = await createCompleteFixture(target, true)
+    try {
+      await expect(verifyRuntimeClosure(fixture.root, target)).resolves.toBe(true)
+      expect(requiredRuntimeAssets(target).map(asset => asset.path)).not.toContain(path.join('node-pty', 'build', 'Release', 'spawn-helper'))
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the macOS node-pty spawn helper mandatory', async () => {
+    const target = runtimeTarget('darwin', 'arm64')
+    const fixture = await createCompleteFixture(target)
+    try {
+      await rm(path.join(fixture.root, 'node-pty', 'prebuilds', 'darwin-arm64', 'spawn-helper'))
+      await expect(verifyRuntimeClosure(fixture.root, target)).rejects.toThrow('spawn-helper')
     } finally {
       await rm(fixture.root, { recursive: true, force: true })
     }

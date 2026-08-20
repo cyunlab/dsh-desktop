@@ -6,7 +6,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const projectRoot = path.resolve(import.meta.dirname, '..')
-const RUNTIME_CLOSURE_VERSION = 1
+const RUNTIME_CLOSURE_VERSION = 2
 const RUNTIME_ENTRY_PACKAGES = [
   '@deepseek-ai/dsh-app-boot',
   '@deepseek-ai/dsh-base',
@@ -50,11 +50,10 @@ export function requiredRuntimeAssets(target) {
     )
   } else if (target.platform === 'linux') {
     assets.push(
-      file('node-pty', 'build/Release/spawn-helper', 'native helper', true),
       file(`node-addon-require-builtin-linux-${target.arch}-gnu`, `prebuilt/linux-${target.arch}-gnu-napi-v9.node`, 'native addon'),
       file(`@deepseek-ai/node-addon-landlock-run-linux-${target.arch}`, 'bin/landlock-run', 'native helper', true),
       file(`@img/sharp-linux-${target.arch}`, `lib/sharp-linux-${target.arch}-0.35.3.node`, 'native addon'),
-      file(`@img/sharp-libvips-linux-${target.arch}`, 'lib/libvips-cpp.8.18.3', 'native runtime')
+      file(`@img/sharp-libvips-linux-${target.arch}`, 'lib/libvips-cpp.so.8.18.3', 'native runtime')
     )
   } else {
     assets.push(
@@ -81,6 +80,83 @@ function file(packageName, relative, category, executable = false) {
 /** 创建非空目录资产描述。 */
 function directory(packageName, relative, category) {
   return { path: packagePath(packageName, relative), kind: 'non-empty-directory', category, executable: false }
+}
+
+/** 返回需要按实际安装内容解析的原生资产命名规则。 */
+function dynamicRuntimeAssetRules(target) {
+  const sharpPackage = `@img/sharp-${target.platform}-${target.arch}`
+  const sharpName = `sharp-${target.platform}-${target.arch}-`
+  const rules = [
+    {
+      packageName: sharpPackage,
+      relativeDirectory: 'lib',
+      fallback: `lib/${sharpName}0.35.3.node`,
+      matches: name => name.startsWith(sharpName) && name.endsWith('.node')
+    }
+  ]
+  if (target.platform === 'linux') {
+    rules.push({
+      packageName: `@img/sharp-libvips-linux-${target.arch}`,
+      relativeDirectory: 'lib',
+      fallback: 'lib/libvips-cpp.so.8.18.3',
+      matches: name => /^libvips-cpp\.so\.[0-9]+(?:\.[0-9]+)+$/.test(name)
+    })
+  } else if (target.platform === 'darwin') {
+    rules.push({
+      packageName: `@img/sharp-libvips-darwin-${target.arch}`,
+      relativeDirectory: 'lib',
+      fallback: 'lib/libvips-cpp.8.18.3.dylib',
+      matches: name => /^libvips-cpp\.[0-9]+(?:\.[0-9]+)+\.dylib$/.test(name)
+    })
+  } else {
+    rules.push(
+      {
+        packageName: sharpPackage,
+        relativeDirectory: 'lib',
+        fallback: 'lib/libvips-42.dll',
+        matches: name => /^libvips-[0-9]+\.dll$/.test(name)
+      },
+      {
+        packageName: sharpPackage,
+        relativeDirectory: 'lib',
+        fallback: 'lib/libvips-cpp-8.18.3.dll',
+        matches: name => /^libvips-cpp-[0-9]+(?:\.[0-9]+)+\.dll$/.test(name)
+      }
+    )
+  }
+  return rules
+}
+
+/** 查找依赖包目录中符合命名规则的普通文件。 */
+async function findPackageAssets(root, packageName, relativeDirectory, matches) {
+  const directory = path.join(root, packagePath(packageName, relativeDirectory))
+  try {
+    return (await readdir(directory, { withFileTypes: true }))
+      .filter(entry => entry.isFile() && matches(entry.name))
+      .map(entry => entry.name)
+      .sort()
+  } catch {
+    return []
+  }
+}
+
+/** 将 sharp/libvips 的动态版本文件名绑定到真实闭包资产。 */
+async function resolveRuntimeAssets(root, target) {
+  const assets = requiredRuntimeAssets(target)
+  const failures = []
+  for (const rule of dynamicRuntimeAssetRules(target)) {
+    const packageRoot = packagePath(rule.packageName)
+    const fallbackPath = path.join(packageRoot, rule.fallback)
+    const assetIndex = assets.findIndex(asset => asset.path === fallbackPath)
+    if (assetIndex < 0) continue
+    const matches = await findPackageAssets(root, rule.packageName, rule.relativeDirectory, rule.matches)
+    if (matches.length === 1) {
+      assets[assetIndex] = { ...assets[assetIndex], path: path.join(packageRoot, rule.relativeDirectory, matches[0]) }
+    } else if (matches.length > 1) {
+      failures.push(`${path.join(packageRoot, rule.relativeDirectory)} (${rule.fallback} has multiple matching native assets: ${matches.join(', ')})`)
+    }
+  }
+  return { assets, failures }
 }
 
 /** 返回生产依赖树内的标准包路径。 */
@@ -179,7 +255,8 @@ async function materializeVerifiedNodeModules(source, destination, target, worke
 /** 为 POSIX 平台补齐依赖包中被归档过程剥离的可执行位。 */
 async function ensureExecutableModes(root, target) {
   if (target.platform === 'win32') return
-  for (const asset of requiredRuntimeAssets(target).filter(item => item.executable)) {
+  const { assets } = await resolveRuntimeAssets(root, target)
+  for (const asset of assets.filter(item => item.executable)) {
     const targetPath = path.join(root, asset.path)
     if (await isFile(targetPath)) await chmod(targetPath, 0o755)
   }
@@ -285,7 +362,9 @@ export async function verifyRuntimeClosure(root, target) {
     const graph = await verifyDependencyGraph(root)
     failures.push(...graph.failures)
     failures.push(...(await verifyNoSymlinks(root)).map(filePath => `${filePath} (symlink is not portable)`))
-    for (const asset of requiredRuntimeAssets(target)) {
+    const resolved = await resolveRuntimeAssets(root, target)
+    failures.push(...resolved.failures)
+    for (const asset of resolved.assets) {
       const targetPath = path.join(root, asset.path)
       try {
         const metadata = await stat(targetPath)
