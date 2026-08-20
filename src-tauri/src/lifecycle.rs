@@ -50,7 +50,9 @@ pub fn stop_process(
     graceful_timeout: Duration,
     forced_timeout: Duration,
 ) -> Result<StopOutcome, String> {
-    if process.request_graceful_stop().is_ok() && wait_until_exited(process, graceful_timeout)? {
+    let gracefully_exited = process.request_graceful_stop().is_ok()
+        && wait_until_exited(process, graceful_timeout).unwrap_or(false);
+    if gracefully_exited {
         process.reap()?;
         return Ok(StopOutcome::Graceful);
     }
@@ -222,6 +224,10 @@ struct FakeProcess {
     force_error: bool,
     /// 是否在强制终止后仍报告存活。
     ignores_force: bool,
+    /// 是否在强杀前让退出探测返回错误。
+    probe_error_before_force: bool,
+    /// 是否在强杀后仍让退出探测返回错误。
+    probe_error_after_force: bool,
     /// 可断言的调用顺序。
     events: Arc<Mutex<Vec<&'static str>>>,
     /// 当前模拟状态。
@@ -236,6 +242,34 @@ impl FakeProcess {
             stubborn,
             force_error,
             ignores_force,
+            probe_error_before_force: false,
+            probe_error_after_force: false,
+            events: Arc::new(Mutex::new(Vec::new())),
+            state: Mutex::new(FakeProcessState::default()),
+        })
+    }
+
+    /// 创建一个优雅阶段退出探测失败、强杀后恢复正常的测试进程。
+    fn with_graceful_probe_error() -> Arc<Self> {
+        Arc::new(Self {
+            stubborn: true,
+            force_error: false,
+            ignores_force: false,
+            probe_error_before_force: true,
+            probe_error_after_force: false,
+            events: Arc::new(Mutex::new(Vec::new())),
+            state: Mutex::new(FakeProcessState::default()),
+        })
+    }
+
+    /// 创建一个始终无法确认退出状态的测试进程。
+    fn with_persistent_probe_error() -> Arc<Self> {
+        Arc::new(Self {
+            stubborn: true,
+            force_error: false,
+            ignores_force: false,
+            probe_error_before_force: true,
+            probe_error_after_force: true,
             events: Arc::new(Mutex::new(Vec::new())),
             state: Mutex::new(FakeProcessState::default()),
         })
@@ -255,6 +289,10 @@ impl ProcessControl for FakeProcess {
 
     /// 返回测试进程树是否全部退出。
     fn has_exited(&self) -> Result<bool, String> {
+        let forced = self.events.lock().unwrap().contains(&"force");
+        if (self.probe_error_before_force && !forced) || (self.probe_error_after_force && forced) {
+            return Err("graceful probe failed".into());
+        }
         Ok(self.state.lock().unwrap().exited)
     }
 
@@ -351,6 +389,28 @@ mod tests {
     #[test]
     fn force_kill_error_is_propagated() {
         let process = FakeProcess::new(true, true, false);
+        assert!(stop_process(process.as_ref(), Duration::ZERO, Duration::ZERO).is_err());
+        assert_eq!(*process.events.lock().unwrap(), ["graceful", "force"]);
+    }
+
+    /// 验证优雅阶段探测失败仍会执行强杀并在确认后完成回收。
+    #[test]
+    fn graceful_probe_error_still_forces_and_confirms_cleanup() {
+        let process = FakeProcess::with_graceful_probe_error();
+        assert_eq!(
+            stop_process(process.as_ref(), Duration::ZERO, Duration::from_millis(10)),
+            Ok(StopOutcome::Forced)
+        );
+        assert_eq!(
+            *process.events.lock().unwrap(),
+            ["graceful", "force", "reap"]
+        );
+    }
+
+    /// 验证强杀后的探测错误会作为清理失败返回，且强杀确实已经执行。
+    #[test]
+    fn post_force_probe_error_reports_cleanup_failure() {
+        let process = FakeProcess::with_persistent_probe_error();
         assert!(stop_process(process.as_ref(), Duration::ZERO, Duration::ZERO).is_err());
         assert_eq!(*process.events.lock().unwrap(), ["graceful", "force"]);
     }

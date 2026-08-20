@@ -983,10 +983,10 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
                 "Startup is taking longer than expected. You can retry when ready.",
             );
         }
-        let child_exited = process.child_has_exited().unwrap_or(true);
-        if child_exited {
-            if is_current(&state, generation)
-                && matches!(machine.observe(SidecarEvent::Exited), LifecycleAction::Fail)
+        match process.child_has_exited() {
+            Ok(true)
+                if is_current(&state, generation)
+                    && matches!(machine.observe(SidecarEvent::Exited), LifecycleAction::Fail) =>
             {
                 abort_attempt(
                     &app,
@@ -995,8 +995,20 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
                     &process,
                     DiagnosticCode::UnexpectedExit,
                 );
+                return;
             }
-            return;
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(_) => {
+                abort_attempt(
+                    &app,
+                    &state,
+                    generation,
+                    &process,
+                    DiagnosticCode::InternalFailure,
+                );
+                return;
+            }
         }
     }
 }

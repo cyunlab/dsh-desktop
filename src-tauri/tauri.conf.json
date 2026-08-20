@@ -17,8 +17,8 @@
     "targets": ["nsis", "dmg", "appimage"],
     "icon": ["icons/icon.ico"],
     "resources": {
-      "../dist/**/*": "dist",
-      "../resources/node/**/*": "node"
+      "../dist": "dist",
+      "../resources/node": "node"
     }
   }
 }
