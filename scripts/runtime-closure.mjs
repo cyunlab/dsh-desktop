@@ -148,7 +148,7 @@ function shouldCopyPath(source, sourceRoot) {
 }
 
 /** 将 hoisted 生产依赖树物化为不依赖 pnpm store 的普通目录。 */
-async function materializeNodeModules(source, destination) {
+async function materializeNodeModules(source, destination, workerLimit = 8) {
   await mkdir(destination, { recursive: true })
   const entries = (await readdir(source, { withFileTypes: true }))
     .filter(entry => !['.bin', '.pnpm', '.modules.yaml'].includes(entry.name) && !entry.name.startsWith('.pnpm-'))
@@ -163,7 +163,15 @@ async function materializeNodeModules(source, destination) {
       })
     }
   }
-  await Promise.all(Array.from({ length: Math.min(8, entries.length) }, () => worker()))
+  await Promise.all(Array.from({ length: Math.min(workerLimit, entries.length) }, () => worker()))
+}
+
+/** 物化并验证一次可移植依赖树，失败时由调用方决定是否以保守模式重试。 */
+async function materializeVerifiedNodeModules(source, destination, target, workerLimit) {
+  await rm(destination, { recursive: true, force: true })
+  await materializeNodeModules(source, destination, workerLimit)
+  await ensureExecutableModes(destination, target)
+  await verifyRuntimeClosure(destination, target)
 }
 
 /** 为 POSIX 平台补齐依赖包中被归档过程剥离的可执行位。 */
@@ -333,10 +341,13 @@ export async function prepareRuntimeClosure(options = {}) {
   const source = await ensureRuntimeCache(root, target, hash)
   const temporary = path.join(outputRoot, `.runtime-node-modules-${process.pid}-${randomUUID()}`)
   const destination = path.join(outputRoot, 'node_modules')
-  await rm(temporary, { recursive: true, force: true })
-  await materializeNodeModules(source, temporary)
-  await ensureExecutableModes(temporary, target)
-  await verifyRuntimeClosure(temporary, target)
+  try {
+    await materializeVerifiedNodeModules(source, temporary, target, 8)
+  } catch (firstError) {
+    const reason = (firstError instanceof Error ? firstError.message : String(firstError)).split('\n', 1)[0]
+    console.warn(`Parallel runtime closure copy was incomplete; retrying serially: ${reason}`)
+    await materializeVerifiedNodeModules(source, temporary, target, 1)
+  }
   await rm(destination, { recursive: true, force: true })
   await mkdir(outputRoot, { recursive: true })
   await renameDirectory(temporary, destination)

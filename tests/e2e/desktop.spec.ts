@@ -89,7 +89,7 @@ async function launchSecondInstance(): Promise<void> {
 
 describe('DeepSeek Harness Desktop Tauri behavior', () => {
   if (scenario === 'delayed-success') {
-    it('shows the startup page before loading the loopback Harness client', async () => {
+    it('shows the startup page before loading the loopback Web Client', async () => {
       const initialPage = await browser.execute(() => ({
         href: window.location.href,
         body: document.body?.innerText ?? ''

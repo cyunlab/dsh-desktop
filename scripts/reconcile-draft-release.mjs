@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
 
+/** 创建或更新指定 tag 的草稿发布，并上传经调用方确认的产物。 */
 export async function reconcileDraftRelease(options, dependencies = {}) {
   const runGh = dependencies.runGh ?? runGhCommand
   const { repository, tag, title, notesFile, artifacts } = options
@@ -27,11 +28,13 @@ export async function reconcileDraftRelease(options, dependencies = {}) {
   return 'created'
 }
 
+/** 要求 gh 命令成功，否则保留其安全错误文本。 */
 async function requireSuccess(resultPromise) {
   const result = await resultPromise
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `gh exited ${result.exitCode}`)
 }
 
+/** 以无 shell 方式运行 gh 并收集退出结果。 */
 export function runGhCommand(args) {
   return new Promise(resolve => {
     const child = spawn('gh', args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
@@ -44,6 +47,7 @@ export function runGhCommand(args) {
   })
 }
 
+/** 解析命令行参数并协调草稿发布。 */
 async function main() {
   const [tag, notesFile, ...artifacts] = process.argv.slice(2)
   const result = await reconcileDraftRelease({

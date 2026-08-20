@@ -13,4 +13,13 @@ describe('Tauri resource layout', () => {
       '../resources/node': 'node'
     })
   })
+
+  /** 验证 Tauri hook 是唯一构建入口，避免运行命令在资源扫描前重复删除 dist。 */
+  it('runs the frontend build exactly once through Tauri hooks', async () => {
+    const config = JSON.parse(await readFile(path.join(root, 'src-tauri/tauri.conf.json'), 'utf8'))
+    const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'))
+    expect(config.build).toMatchObject({ beforeDevCommand: 'pnpm build', beforeBuildCommand: 'pnpm build' })
+    expect(manifest.scripts['tauri:dev']).toBe('pnpm ensure:node-sidecar && node scripts/run-tauri.mjs dev')
+    expect(manifest.scripts['tauri:build']).toBe('pnpm ensure:node-sidecar && node scripts/run-tauri.mjs build')
+  })
 })
