@@ -172,14 +172,16 @@ fn navigate_to_startup(app: &AppHandle, state: &RuntimeState) {
     let Some(raw_url) = state.startup_url.lock().ok().and_then(|value| value.clone()) else { return };
     let Ok(url) = raw_url.parse() else { return };
     let app = app.clone();
-    let _ = app.run_on_main_thread(move || { if let Some(window) = app.get_webview_window("main") { let _ = window.navigate(url); } });
+    let app_for_task = app.clone();
+    let _ = app.run_on_main_thread(move || { if let Some(window) = app_for_task.get_webview_window("main") { let _ = window.navigate(url); } });
 }
 
 /// 将窗口导航到当前启动轮次的 Host 页面。
 fn navigate_to_host(app: &AppHandle, origin: &str) {
     let Ok(url) = origin.parse() else { return };
     let app = app.clone();
-    let _ = app.run_on_main_thread(move || { if let Some(window) = app.get_webview_window("main") { let _ = window.navigate(url); } });
+    let app_for_task = app.clone();
+    let _ = app.run_on_main_thread(move || { if let Some(window) = app_for_task.get_webview_window("main") { let _ = window.navigate(url); } });
 }
 
 /// 记录启动失败并恢复到统一启动页。
@@ -255,19 +257,19 @@ fn startup_snapshot(state: State<'_, RuntimeState>) -> LifecycleSnapshot { state
 
 /// 处理启动页的 Retry 命令。
 #[tauri::command]
-fn startup_retry(app: AppHandle, state: State<'_, RuntimeState>) -> Result<(), String> { request_retry(&app, state.inner()); Ok(()) }
+fn startup_retry(app: AppHandle, state: State<'_, Arc<RuntimeState>>) -> Result<(), String> { request_retry(&app, state.inner()); Ok(()) }
 
 /// 复制经过脱敏的当前启动诊断信息。
 #[tauri::command]
-fn startup_copy_diagnostics(app: AppHandle, state: State<'_, RuntimeState>) -> Result<(), String> {
-    let snapshot = startup_snapshot(state.clone());
+fn startup_copy_diagnostics(app: AppHandle, state: State<'_, Arc<RuntimeState>>) -> Result<(), String> {
+    let snapshot = state.snapshot.lock().map(|value| value.clone()).unwrap_or(LifecycleSnapshot { state: LifecycleState::Starting, message: "Starting.".into(), origin: None });
     let last_error = state.last_error.lock().ok().and_then(|error| error.clone()).unwrap_or_else(|| "none".into());
     app.clipboard().write_text(format!("DeepSeek Harness Desktop\nstate: {:?}\nmessage: {}\nerror: {}", snapshot.state, snapshot.message, last_error)).map_err(|error| error.to_string())
 }
 
 /// 在系统文件管理器中打开日志目录。
 #[tauri::command]
-fn startup_reveal_logs(app: AppHandle, state: State<'_, RuntimeState>) -> Result<(), String> { fs::create_dir_all(&state.logs_dir).map_err(|error| error.to_string())?; app.opener().open_path(state.logs_dir.to_string_lossy().to_string(), None::<String>).map_err(|error| error.to_string()) }
+fn startup_reveal_logs(app: AppHandle, state: State<'_, Arc<RuntimeState>>) -> Result<(), String> { fs::create_dir_all(&state.logs_dir).map_err(|error| error.to_string())?; app.opener().open_path(state.logs_dir.to_string_lossy().to_string(), None::<String>).map_err(|error| error.to_string()) }
 
 /// 创建 startup window，注册 Tauri IPC，并启动 sidecar 生命周期监督线程。
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -279,7 +281,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .on_navigation({ let app = app.handle().clone(); let state = Arc::clone(&state); move |url| { let startup_url = state.startup_url.lock().ok().and_then(|value| value.clone()).unwrap_or_default(); let host_origin = state.host_origin.lock().ok().and_then(|value| value.clone()); match decide_navigation(url.as_str(), &startup_url, host_origin.as_deref()) { NavigationDecision::Allow => true, NavigationDecision::External => { let _ = app.opener().open_url(url.to_string(), None::<String>); false }, NavigationDecision::Deny => false } } })
         .on_new_window({ let app = app.handle().clone(); move |url, _features| { if url.scheme() == "http" || url.scheme() == "https" { let _ = app.opener().open_url(url.to_string(), None::<String>); } tauri::webview::NewWindowResponse::Deny } }).build()?;
     if let Ok(url) = startup_window.url() { if let Ok(mut startup_url) = state.startup_url.lock() { *startup_url = Some(url.to_string()); } }
-    startup_window.on_window_event(move |event| { if let WindowEvent::CloseRequested { api, .. } = event { api.prevent_close(); request_shutdown(&app_handle, &state); } });
+    let state_for_close = Arc::clone(&state);
+    startup_window.on_window_event(move |event| { if let WindowEvent::CloseRequested { api, .. } = event { api.prevent_close(); request_shutdown(&app_handle, &state_for_close); } });
     start_attempt(&app.handle(), &state);
     Ok(())
 }
