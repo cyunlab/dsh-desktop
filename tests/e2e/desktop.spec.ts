@@ -2,7 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { spawn, spawnSync } from 'node:child_process'
 import { browser, expect, $ } from '@wdio/globals'
 import { applicationPath } from './support/paths.mjs'
-import { waitForPackagedStartupPage } from './support/startup-page.mjs'
+import { isPackagedStartupUrl, waitForPackagedStartupPage } from './support/startup-page.mjs'
 
 const scenario = process.env.DSH_TEST_SCENARIO ?? 'success'
 
@@ -107,7 +107,7 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
     /** 验证 WebDriver 越过 about:blank 后先看到真实启动页，再看到 loopback Web Client。 */
     it('shows the startup page before loading the loopback Web Client', async () => {
       const initialPage = await waitForPackagedStartupPage(browser)
-      expect(initialPage.url).toMatch(/^http:\/\/tauri\.localhost\//)
+      expect(isPackagedStartupUrl(initialPage.url)).toBe(true)
       expect(initialPage.state).toMatch(/Starting|Waiting|Still starting|Startup failed|Stopping/)
       expect(initialPage.message).toBeTruthy()
       const origin = await waitForHarness()
@@ -117,7 +117,9 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
   }
 
   if (scenario === 'retry') {
+    /** 先同步到真实 packaged startup page，再观察失败页和 Retry 生命周期。 */
     it('renders controlled startup failure and retries after stopping the old sidecar', async () => {
+      await waitForPackagedStartupPage(browser)
       await waitForText('#state', 'Startup failed')
       await $('#retry').waitForDisplayed()
       await $('#copy').waitForDisplayed()
@@ -143,7 +145,9 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
   }
 
   if (scenario === 'prolonged') {
+    /** 先同步到真实 packaged startup page，再观察 prolonged-startup 生命周期。 */
     it('offers Retry after prolonged startup and disables duplicate retry while stopping', async () => {
+      await waitForPackagedStartupPage(browser)
       await waitForText('#state', 'Still starting', 45_000)
       await browser.pause(1_000)
       expect(await $('#state').getText()).toContain('Still starting')

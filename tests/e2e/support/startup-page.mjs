@@ -11,7 +11,7 @@ const STARTUP_STATE_TEXT = new Set([
 
 /** 判断一个 WebDriver 页面快照是否已经提交了真实的 packaged startup page。 */
 export function isPackagedStartupPage(snapshot) {
-  return PACKAGED_STARTUP_URL.test(snapshot.url)
+  return isPackagedStartupUrl(snapshot.url)
     && snapshot.readyState === 'complete'
     && snapshot.title === 'DeepSeek Harness Desktop'
     && snapshot.state !== undefined
@@ -21,10 +21,15 @@ export function isPackagedStartupPage(snapshot) {
     && snapshot.requiredElements.every(Boolean)
 }
 
+/** 判断 URL 是否属于当前平台可用的 packaged startup page 入口。 */
+export function isPackagedStartupUrl(url) {
+  return PACKAGED_STARTUP_URL.test(url)
+}
+
 /** 读取启动页 URL、生命周期文案和必需 DOM，避免在 about:blank 上执行脚本。 */
 async function readStartupPage(browser) {
   const url = await browser.getUrl()
-  if (!PACKAGED_STARTUP_URL.test(url)) return { url, requiredElements: [] }
+  if (!isPackagedStartupUrl(url)) return { url, requiredElements: [] }
   return await browser.execute(() => ({
     url: window.location.href,
     readyState: document.readyState,

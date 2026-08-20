@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { isPackagedStartupPage, waitForPackagedStartupPage } from '../e2e/support/startup-page.mjs'
+import { isPackagedStartupPage, isPackagedStartupUrl, waitForPackagedStartupPage } from '../e2e/support/startup-page.mjs'
 
 /** 返回包含真实 packaged startup page 关键状态的测试快照。 */
 function startupSnapshot(overrides: Record<string, unknown> = {}) {
@@ -39,8 +39,35 @@ describe('packaged startup page synchronization', () => {
     expect(executeCalls).toBe(1)
   })
 
+  /** 验证 URL 检查与 WebView 导航竞态时会重新读取，而不会接受 loopback 页面快照。 */
+  it('retries when navigation races between the URL and DOM checks', async () => {
+    const snapshots = [
+      startupSnapshot({ url: 'http://127.0.0.1:4312/' }),
+      startupSnapshot({ url: 'tauri://localhost/' })
+    ]
+    let executeCalls = 0
+    const fakeBrowser = {
+      getUrl: async () => 'tauri://localhost/',
+      execute: async () => {
+        executeCalls += 1
+        return snapshots.shift()
+      },
+      waitUntil: async (condition: () => Promise<boolean>) => {
+        while (!(await condition())) {}
+      }
+    } as unknown as WebdriverIO.Browser
+
+    await expect(waitForPackagedStartupPage(fakeBrowser)).resolves.toMatchObject({ url: 'tauri://localhost/' })
+    expect(executeCalls).toBe(2)
+  })
+
   /** 验证 packaged URL、生命周期文案和必需 DOM 缺一不可。 */
   it('requires the committed packaged URL, lifecycle state, and required DOM', () => {
+    expect(isPackagedStartupUrl('http://tauri.localhost/')).toBe(true)
+    expect(isPackagedStartupUrl('http://tauri.localhost/index.html')).toBe(true)
+    expect(isPackagedStartupUrl('tauri://localhost/')).toBe(true)
+    expect(isPackagedStartupUrl('about:blank')).toBe(false)
+    expect(isPackagedStartupUrl('http://127.0.0.1:4312/')).toBe(false)
     expect(isPackagedStartupPage(startupSnapshot())).toBe(true)
     expect(isPackagedStartupPage(startupSnapshot({ url: 'http://127.0.0.1:4312/' }))).toBe(false)
     expect(isPackagedStartupPage(startupSnapshot({ state: 'Ready' }))).toBe(false)

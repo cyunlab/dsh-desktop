@@ -14,5 +14,7 @@ export interface StartupPageWaitOptions {
 
 /** 判断一个 WebDriver 页面快照是否已经提交了真实的 packaged startup page。 */
 export function isPackagedStartupPage(snapshot: StartupPageSnapshot): boolean
+/** 判断 URL 是否属于当前平台可用的 packaged startup page 入口。 */
+export function isPackagedStartupUrl(url: string): boolean
 /** 等待 embedded WebDriver 越过窗口句柄就绪点，并返回已提交的真实启动页快照。 */
 export function waitForPackagedStartupPage(browser: WebdriverIO.Browser, options?: StartupPageWaitOptions): Promise<StartupPageSnapshot>
