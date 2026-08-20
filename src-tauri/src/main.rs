@@ -253,7 +253,7 @@ fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>) {
 
 /// 返回当前启动页状态。
 #[tauri::command]
-fn startup_snapshot(state: State<'_, RuntimeState>) -> LifecycleSnapshot { state.snapshot.lock().map(|snapshot| snapshot.clone()).unwrap_or(LifecycleSnapshot { state: LifecycleState::Starting, message: "Starting.".into(), origin: None }) }
+fn startup_snapshot(state: State<'_, Arc<RuntimeState>>) -> LifecycleSnapshot { state.snapshot.lock().map(|snapshot| snapshot.clone()).unwrap_or(LifecycleSnapshot { state: LifecycleState::Starting, message: "Starting.".into(), origin: None }) }
 
 /// 处理启动页的 Retry 命令。
 #[tauri::command]

@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, readdir, rm } from 'node:fs/promises'
+import { cp, mkdir, rm } from 'node:fs/promises'
 import { build } from 'esbuild'
 import sharp from 'sharp'
 
@@ -7,17 +7,6 @@ const define = { __DSH_E2E__: JSON.stringify(e2e) }
 const desktopLogoFileName = 'dsh-desktop-logo.svg'
 const desktopLogoSource = `assets/${desktopLogoFileName}`
 const desktopLogoRuntimePath = `dist/assets/${desktopLogoFileName.replace(/\.svg$/, '.png')}`
-const e2eObserver = {
-  name: 'e2e-observer-build-variant',
-  setup(builder) {
-    if (e2e) return
-    builder.onResolve({ filter: /\/e2e-observer\.js$/ }, () => ({ path: 'disabled', namespace: 'e2e-observer' }))
-    builder.onLoad({ filter: /.*/, namespace: 'e2e-observer' }, () => ({
-      contents: 'export function recordE2EEvent() {}\nexport function shouldSuppressExternalOpen() { return false }',
-      loader: 'js'
-    }))
-  }
-}
 await rm('dist', { recursive: true, force: true })
 await Promise.all([
   build({ entryPoints: ['src/sidecar/index.ts'], outfile: 'dist/sidecar/index.js', bundle: true, platform: 'node', format: 'esm', external: ['@deepseek-ai/*', 'node-addon-require-builtin'], sourcemap: e2e, define }),
@@ -33,10 +22,3 @@ await Promise.all([
   sharp(desktopLogoSource).resize(1024, 1024).png().toFile(desktopLogoRuntimePath)
 ])
 
-async function mainArtifacts(directory) {
-  const entries = await readdir(directory, { withFileTypes: true })
-  return (await Promise.all(entries.map(entry => {
-    const target = `${directory}/${entry.name}`
-    return entry.isDirectory() ? mainArtifacts(target) : [target]
-  }))).flat()
-}
