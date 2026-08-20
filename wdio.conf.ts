@@ -1,8 +1,10 @@
 import type { Options } from '@wdio/types'
 import { applicationPath, officialNodePath } from './tests/e2e/support/paths.mjs'
+import { waitForPackagedStartupPage } from './tests/e2e/support/startup-page.mjs'
 
 const scenario = process.env.DSH_TEST_SCENARIO ?? 'success'
 const application = applicationPath()
+const startupPageScenarios = new Set(['delayed-success', 'retry', 'prolonged'])
 
 /** WebdriverIO Tauri 配置；embedded provider 在三种桌面平台使用同一套真实窗口驱动。 */
 export const config: Options.Testrunner = {
@@ -37,6 +39,10 @@ export const config: Options.Testrunner = {
   }],
   framework: 'mocha',
   reporters: ['spec'],
+  /** 在启动页敏感场景开始测试前，等待并验证 packaged 页面已完成提交。 */
+  before: async (_capabilities, _specs, browser) => {
+    if (startupPageScenarios.has(scenario)) await waitForPackagedStartupPage(browser)
+  },
   logLevel: process.env.CI ? 'warn' : 'info',
   waitforTimeout: 15_000,
   connectionRetryTimeout: 90_000,

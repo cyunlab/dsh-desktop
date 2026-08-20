@@ -2,6 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { spawn, spawnSync } from 'node:child_process'
 import { browser, expect, $ } from '@wdio/globals'
 import { applicationPath } from './support/paths.mjs'
+import { waitForPackagedStartupPage } from './support/startup-page.mjs'
 
 const scenario = process.env.DSH_TEST_SCENARIO ?? 'success'
 
@@ -103,13 +104,12 @@ async function launchSecondInstance(): Promise<void> {
 
 describe('DeepSeek Harness Desktop Tauri behavior', () => {
   if (scenario === 'delayed-success') {
+    /** 验证 WebDriver 越过 about:blank 后先看到真实启动页，再看到 loopback Web Client。 */
     it('shows the startup page before loading the loopback Web Client', async () => {
-      const initialPage = await browser.execute(() => ({
-        href: window.location.href,
-        body: document.body?.innerText ?? ''
-      })) as { href: string, body: string }
-      expect(initialPage.href).toMatch(/^http:\/\/tauri\.localhost\//)
-      expect(initialPage.body).toContain('Waiting for client to start')
+      const initialPage = await waitForPackagedStartupPage(browser)
+      expect(initialPage.url).toMatch(/^http:\/\/tauri\.localhost\//)
+      expect(initialPage.state).toMatch(/Starting|Waiting|Still starting|Startup failed|Stopping/)
+      expect(initialPage.message).toBeTruthy()
       const origin = await waitForHarness()
       expect(origin).toMatch(/^http:\/\/127\.0\.0\.1:\d+\//)
       expect(await browser.getTitle()).toContain('DeepSeek Harness Test Client')
