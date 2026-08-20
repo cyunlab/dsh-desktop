@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -12,7 +13,7 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 /// Sidecar 生命周期消息的 JSON 表示。
 #[derive(Debug, Deserialize, Clone)]
-#[serde(tag = "type")]
+#[serde(rename_all = "kebab-case", tag = "type")]
 enum SidecarMessage {
     Ready { origin: String },
     StartupFailed { error: SidecarError },
@@ -37,6 +38,25 @@ struct SidecarProcess {
 /// 解析官方 Node sidecar 的生命周期输出。
 fn parse_sidecar_message(line: &str) -> Result<SidecarMessage, String> {
     serde_json::from_str(line).map_err(|error| format!("invalid sidecar message: {error}"))
+}
+
+/// 等待 Harness 的 loopback Web server 真实开始监听，避免 WebView 在端口就绪前缓存连接失败页。
+fn wait_for_web_listener(origin: &str) -> Result<(), String> {
+    let address = origin
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("unexpected Harness origin: {origin}"))?
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid Harness origin: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("Harness Web server did not listen at {origin} within 120 seconds"));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// 返回当前构建目标使用的 Node 资源目录名。
@@ -171,24 +191,40 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     thread::spawn(move || {
         match start_sidecar(&app_for_start) {
             Ok((sidecar, origin)) => {
+                let _ = window_for_start.set_title("DeepSeek Harness Desktop — Host ready");
                 if let Ok(mut guard) = process_for_start.lock() {
                     *guard = Some(sidecar);
                 }
+                if let Err(error) = wait_for_web_listener(&origin) {
+                    let _ = window_for_start.set_title("DeepSeek Harness Desktop — Host web server failed");
+                    eprintln!("failed to wait for Harness Web server: {error}");
+                    return;
+                }
+                let _ = window_for_start.set_title(&format!("DeepSeek Harness Desktop — {origin}"));
                 let app_for_navigation = app_for_start.clone();
+                let window_for_navigation = window_for_start.clone();
                 if let Err(error) = app_for_navigation.run_on_main_thread(move || {
                     match origin.parse() {
                         Ok(url) => {
-                            if let Err(error) = window_for_start.navigate(url) {
-                                eprintln!("failed to navigate to Harness Web UI: {error}");
+                            if let Err(error) = window_for_navigation.navigate(url) {
+                                let _ = window_for_navigation.set_title("DeepSeek Harness Desktop — Host navigation failed");
+                                eprintln!("failed to navigate Harness Web UI: {error}");
                             }
                         }
-                        Err(error) => eprintln!("invalid Harness Web UI origin: {error}"),
+                        Err(error) => {
+                            let _ = window_for_navigation.set_title("DeepSeek Harness Desktop — Invalid host URL");
+                            eprintln!("invalid Harness Web UI origin: {error}");
+                        }
                     }
                 }) {
+                    let _ = window_for_start.set_title("DeepSeek Harness Desktop — Navigation scheduling failed");
                     eprintln!("failed to schedule Harness Web UI navigation: {error}");
                 }
             }
-            Err(error) => eprintln!("failed to start Node sidecar: {error}"),
+            Err(error) => {
+                let _ = window_for_start.set_title("DeepSeek Harness Desktop — Host startup failed");
+                eprintln!("failed to start Node sidecar: {error}");
+            }
         }
     });
     let process_for_close = Arc::clone(&process);
@@ -223,6 +259,13 @@ mod tests {
     fn parses_ready_message() {
         let message = parse_sidecar_message(r#"{"type":"ready","origin":"http://127.0.0.1:1234"}"#).unwrap();
         assert!(matches!(message, SidecarMessage::Ready { origin } if origin == "http://127.0.0.1:1234"));
+    }
+
+    /// 验证 sidecar 的 kebab-case 启动失败消息可解析。
+    #[test]
+    fn parses_startup_failed_message() {
+        let message = parse_sidecar_message(r#"{"type":"startup-failed","error":{"name":"Error","message":"boom"}}"#).unwrap();
+        assert!(matches!(message, SidecarMessage::StartupFailed { error } if error.message == "boom"));
     }
 
     /// 验证平台架构目录名非空。
