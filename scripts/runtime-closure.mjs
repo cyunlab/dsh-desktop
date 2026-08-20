@@ -86,12 +86,13 @@ function directory(packageName, relative, category) {
 function dynamicRuntimeAssetRules(target) {
   const sharpPackage = `@img/sharp-${target.platform}-${target.arch}`
   const sharpName = `sharp-${target.platform}-${target.arch}-`
+  const sharpAssetPattern = new RegExp(`^${sharpName}[0-9]+\\.[0-9]+\\.[0-9]+\\.node$`)
   const rules = [
     {
       packageName: sharpPackage,
       relativeDirectory: 'lib',
-      fallback: `lib/${sharpName}0.35.3.node`,
-      matches: name => name.startsWith(sharpName) && name.endsWith('.node')
+      assetMatches: asset => asset.path.startsWith(path.join(packagePath(sharpPackage), 'lib', sharpName)) && asset.path.endsWith('.node'),
+      matches: name => sharpAssetPattern.test(name)
     }
   ]
   if (target.platform === 'linux') {
@@ -146,14 +147,14 @@ async function resolveRuntimeAssets(root, target) {
   const failures = []
   for (const rule of dynamicRuntimeAssetRules(target)) {
     const packageRoot = packagePath(rule.packageName)
-    const fallbackPath = path.join(packageRoot, rule.fallback)
-    const assetIndex = assets.findIndex(asset => asset.path === fallbackPath)
+    const fallbackPath = rule.fallback ? path.join(packageRoot, rule.fallback) : undefined
+    const assetIndex = assets.findIndex(asset => rule.assetMatches?.(asset) ?? asset.path === fallbackPath)
     if (assetIndex < 0) continue
     const matches = await findPackageAssets(root, rule.packageName, rule.relativeDirectory, rule.matches)
     if (matches.length === 1) {
       assets[assetIndex] = { ...assets[assetIndex], path: path.join(packageRoot, rule.relativeDirectory, matches[0]) }
     } else if (matches.length > 1) {
-      failures.push(`${path.join(packageRoot, rule.relativeDirectory)} (${rule.fallback} has multiple matching native assets: ${matches.join(', ')})`)
+      failures.push(`${path.join(packageRoot, rule.relativeDirectory)} (${rule.fallback ?? 'dynamic native asset'} has multiple matching native assets: ${matches.join(', ')})`)
     }
   }
   return { assets, failures }

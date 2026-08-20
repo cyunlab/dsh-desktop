@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -98,6 +98,18 @@ describe('runtime closure contract', () => {
     const fixture = await createCompleteFixture(target, true)
     try {
       await expect(verifyRuntimeClosure(fixture.root, target)).resolves.toBe(true)
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a sharp native file without a semantic version', async () => {
+    const target = runtimeTarget('win32', 'x64')
+    const fixture = await createCompleteFixture(target, true)
+    const packageRoot = path.join(fixture.root, '@img', 'sharp-win32-x64', 'lib')
+    try {
+      await rename(path.join(packageRoot, 'sharp-win32-x64-0.35.9.node'), path.join(packageRoot, 'sharp-win32-x64-arbitrary.node'))
+      await expect(verifyRuntimeClosure(fixture.root, target)).rejects.toThrow('sharp-win32-x64')
     } finally {
       await rm(fixture.root, { recursive: true, force: true })
     }
