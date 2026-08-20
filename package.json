@@ -95,40 +95,5 @@
     "node-addon-require-builtin-darwin-x64": "0.1.5",
     "node-addon-require-builtin-linux-x64-gnu": "0.1.5",
     "node-addon-require-builtin-win32-x64-msvc": "0.1.5"
-  },
-  "build": {
-    "appId": "io.github.xlcyun.dsh-desktop",
-    "productName": "DeepSeek Harness Desktop",
-    "executableName": "deepseek-harness-desktop",
-    "artifactName": "deepseek-harness-desktop-${version}-${os}-${arch}.${ext}",
-    "asar": true,
-    "asarUnpack": [
-      "node_modules/**/*",
-      "dist/host-process/**/*"
-    ],
-    "icon": "assets/dsh-desktop-logo.svg",
-    "files": [
-      "dist/**/*",
-      "package.json"
-    ],
-    "directories": {
-      "output": "release"
-    },
-    "afterPack": "scripts/after-pack.mjs",
-    "win": {
-      "target": "nsis"
-    },
-    "mac": {
-      "target": "dmg"
-    },
-    "linux": {
-      "target": "AppImage"
-    },
-    "nsis": {
-      "artifactName": "deepseek-harness-desktop-${version}-windows-${arch}.${ext}"
-    },
-    "dmg": {
-      "artifactName": "deepseek-harness-desktop-${version}-macos-${arch}.${ext}"
-    }
   }
 }
