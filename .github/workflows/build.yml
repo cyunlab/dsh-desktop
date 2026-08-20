@@ -81,7 +81,13 @@ jobs:
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Build native Tauri package with the official Node sidecar
+        if: runner.os != 'Linux'
         run: pnpm package
+      - name: Diagnose Linux AppImage bundling with verbose linuxdeploy output
+        if: runner.os == 'Linux'
+        run: |
+          pnpm ensure:node-sidecar
+          pnpm exec tauri build --verbose --config src-tauri/tauri.linux.conf.json
       - name: Smoke test the official Node + Harness runtime
         run: pnpm smoke:node-sidecar
       - name: Verify the exact native Tauri artifact
