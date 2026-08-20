@@ -48,7 +48,7 @@ DeepSeek Harness Desktop aims to carry this idea onto the desktop. We want Deskt
 
 ✅ Startup recovery, redacted diagnostics, and access to the platform log directory
 
-✅ Unit, real-Host integration, and Electron end-to-end test layers
+✅ Unit, real-Host integration, and Tauri end-to-end test layers
 
 <a id="roadmap"></a>
 
@@ -95,7 +95,7 @@ corepack pnpm test
 corepack pnpm test:integration
 ```
 
-Run the full Electron end-to-end suite
+Run the full Tauri end-to-end suite
 
 ```sh
 corepack pnpm test:e2e

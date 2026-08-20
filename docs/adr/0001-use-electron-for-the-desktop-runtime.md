@@ -1,6 +1,8 @@
 # Use Electron for the desktop runtime
 
-Status: accepted
+Status: superseded by ADR 0005
+
+> This historical decision is retained for context. The supported shell is now Tauri with an official Node sidecar; do not use the Electron design below for new implementation work.
 
 DeepSeek Harness Desktop uses Electron and ships a version-matched Harness runtime with the application. Electron provides the private Node runtime needed by the published Harness packages and gives the required Windows support without modifying the read-only `deepseek-harness/` submodule. The renderer continues to use the Harness loopback HTTP/WebSocket interface with Node integration disabled; desktop-native capabilities and Harness lifecycle management stay outside the renderer.
 

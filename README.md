@@ -48,7 +48,7 @@ DeepSeek Harness Desktop 希望把这套思路继续带到桌面。我们希望 
 
 ✅ 提供启动失败恢复、脱敏诊断和日志目录入口
 
-✅ 包含单元测试、真实 Host 集成测试和 Electron 端到端测试
+✅ 包含单元测试、真实 Host 集成测试和 Tauri 端到端测试
 
 <a id="roadmap"></a>
 
@@ -95,7 +95,7 @@ corepack pnpm test
 corepack pnpm test:integration
 ```
 
-运行完整 Electron 端到端测试
+运行完整 Tauri 端到端测试
 
 ```sh
 corepack pnpm test:e2e

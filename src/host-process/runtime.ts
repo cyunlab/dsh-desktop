@@ -4,7 +4,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { PatchOptions } from '@deepseek-ai/cordis-plugin-include'
-import type { HostProcessBinding } from '../shared/host-process-contract.js'
+/** sidecar 对外只暴露 loopback 绑定；协议类型由 Rust/sidecar 边界各自实现。 */
+interface HostProcessBinding {
+  readonly host: '127.0.0.1'
+  readonly port: number
+}
 
 // Desktop owns the profile identity; its contents remain the official Web composition.
 const PROFILE_NAME = 'desktop'
@@ -36,7 +40,7 @@ export async function bootHarnessHost(paths: {
   readonly defaultWorkingDirectory: string
 }): Promise<HostRuntimeHandle> {
   const harness = await loadHarnessModules()
-  const installAnchor = resolvePublishedManifest('@deepseek-ai/dsh/package.json')
+  const installAnchor = fileURLToPath(import.meta.resolve('@deepseek-ai/dsh/package.json'))
   const profileDir = path.join(paths.harnessHome, 'profiles', PROFILE_NAME)
   harness.initProfile(profileDir, BUNDLES)
   harness.healProfilesModuleFallback(installAnchor, paths.harnessHome)
@@ -90,7 +94,7 @@ export async function bootHarnessHost(paths: {
   }
 }
 
-/** 动态导入会读取路径配置的 Harness 模块，确保其发生在 child runtime 初始化之后。 */
+/** 动态导入会读取路径配置的 Harness 模块，确保其发生在 sidecar 初始化之后。 */
 async function loadHarnessModules(): Promise<HarnessModules> {
   const [boot, cmdline, launchEnvironment] = await Promise.all([
     import('@deepseek-ai/dsh-app-boot'),
@@ -109,15 +113,3 @@ async function disposeContext(ctx: Context): Promise<void> {
   await ctx.fiber.dispose()
 }
 
-/** 解析发布包 manifest，并把 ASAR 逻辑路径映射到解包运行时。 */
-function resolvePublishedManifest(specifier: string): string {
-  return resolveRuntimeManifestPath(import.meta.resolve(specifier))
-}
-
-/** 将 Electron ASAR 中的逻辑模块路径映射到实际解包的运行时目录。 */
-export function resolveRuntimeManifestPath(resolvedUrl: string): string {
-  const manifestPath = fileURLToPath(resolvedUrl)
-  const archiveSegment = `${path.sep}app.asar${path.sep}`
-  if (!manifestPath.includes(archiveSegment)) return manifestPath
-  return manifestPath.replace(archiveSegment, `${path.sep}app.asar.unpacked${path.sep}`)
-}
