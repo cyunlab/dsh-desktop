@@ -55,7 +55,7 @@ export async function runAfterPack(context, dependencies = {}) {
 
 // 为未配置 Developer ID 的开发构建创建完整的 bundle 级临时签名，避免残留的 linker signature 被 Gatekeeper 判为损坏。
 async function sealMacBundle(context, runCommand) {
-  const appBundle = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`)
+  const appBundle = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`).replaceAll('\\', '/')
   await runCommand('/usr/bin/codesign', [
     '--force', '--deep', '--sign', '-', '--timestamp=none', appBundle
   ], {}, 60_000)
