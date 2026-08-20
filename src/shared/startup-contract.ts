@@ -5,7 +5,7 @@ export const startupChannels = {
   revealLogs: 'startup:reveal-logs'
 } as const
 
-export type LifecycleState = 'idle' | 'preparing' | 'booting' | 'probing' | 'ready' | 'failed' | 'retrying' | 'stopping' | 'stopped'
+export type LifecycleState = 'starting' | 'starting-sidecar' | 'waiting-for-client' | 'prolonged-startup' | 'ready' | 'failed' | 'stopping'
 
 export interface LifecycleSnapshot {
   readonly state: LifecycleState

@@ -15,15 +15,13 @@ export function connectStartupPage(api: StartupApi, document: StartupDocument): 
   const message = requiredElement(document, '#message')
   const actions = requiredElement(document, '#actions')
   const headings: Record<LifecycleSnapshot['state'], string> = {
-    idle: 'Waiting to start',
-    preparing: 'Preparing application data…',
-    booting: 'Starting local Host…',
-    probing: 'Checking local Web Client…',
-    ready: 'Web Client is ready',
+    starting: 'Starting…',
+    'starting-sidecar': 'Starting local Host…',
+    'waiting-for-client': 'Waiting for client to start…',
+    'prolonged-startup': 'Still starting…',
+    ready: 'Ready',
     failed: 'Startup failed',
-    retrying: 'Cleaning up before retry…',
-    stopping: 'Stopping local Host…',
-    stopped: 'Stopped'
+    stopping: 'Stopping local Host…'
   }
   const render = (snapshot: LifecycleSnapshot): void => {
     state.textContent = headings[snapshot.state]
