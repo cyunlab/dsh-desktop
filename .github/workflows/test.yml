@@ -18,8 +18,11 @@ jobs:
           - name: Linux
             os: ubuntu-24.04
             e2e-command: pnpm test:e2e:xvfb
-          - name: macOS
+          - name: macOS arm64
             os: macos-14
+            e2e-command: pnpm test:e2e
+          - name: macOS x64
+            os: macos-15-intel
             e2e-command: pnpm test:e2e
           - name: Windows
             os: windows-2022

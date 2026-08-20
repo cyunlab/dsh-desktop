@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
@@ -723,6 +724,11 @@ fn is_current_host_page(state: &RuntimeState, loaded_url: &tauri::Url) -> bool {
         && origin.is_some_and(|origin| {
             loaded_url.as_str().trim_end_matches('/') == origin.trim_end_matches('/')
         })
+}
+
+/// 仅在 WebView 完成页面加载后推进 client readiness，避免 Started 事件过早宣告 Ready。
+fn is_finished_page_load(event: PageLoadEvent) -> bool {
+    event == PageLoadEvent::Finished
 }
 
 /// 在主 WebView 确认当前 Host 页面加载完成后，才对启动页发布客户端 Ready。
@@ -1532,6 +1538,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let state = Arc::clone(&state);
                 let app = app.handle().clone();
                 move |_window, payload| {
+                    if !is_finished_page_load(payload.event()) {
+                        return;
+                    }
                     let url = payload.url();
                     let is_app_page = (url.scheme() == "http"
                         && url.host_str() == Some("tauri.localhost"))
@@ -1652,10 +1661,10 @@ fn main() {
 mod tests {
     use super::{
         build_startup_diagnostics, bundled_node_relative_path, configure_sidecar_node_path,
-        decide_navigation, is_allowed_host_origin, is_current_host_page, is_html_client_response,
-        is_packaged_startup_url, parse_loopback_address, parse_sidecar_message,
-        prepend_node_directory_to_path, DiagnosticCode, LifecycleSnapshot, LifecycleState,
-        NavigationDecision, RuntimeState, SidecarMessage,
+        decide_navigation, is_allowed_host_origin, is_current_host_page, is_finished_page_load,
+        is_html_client_response, is_packaged_startup_url, parse_loopback_address,
+        parse_sidecar_message, prepend_node_directory_to_path, DiagnosticCode, LifecycleSnapshot,
+        LifecycleState, NavigationDecision, PageLoadEvent, RuntimeState, SidecarMessage,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -1875,5 +1884,12 @@ mod tests {
             .generation
             .store(4, std::sync::atomic::Ordering::Release);
         assert!(!is_current_host_page(&state, &current));
+    }
+
+    /// 验证 WebView Started 事件不会提前满足 client readiness。
+    #[test]
+    fn client_readiness_requires_finished_page_load() {
+        assert!(!is_finished_page_load(PageLoadEvent::Started));
+        assert!(is_finished_page_load(PageLoadEvent::Finished));
     }
 }
