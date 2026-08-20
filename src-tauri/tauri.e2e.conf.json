@@ -1,0 +1,17 @@
+{
+  "identifier": "com.deepseek.harness.desktop.e2e",
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "capabilities": [{
+        "identifier": "e2e",
+        "description": "Debug-only WebdriverIO permissions for desktop behavior tests.",
+        "windows": ["main"],
+        "permissions": ["core:default", "core:window:default", "wdio:default", "wdio-webdriver:default"]
+      }]
+    }
+  },
+  "build": {
+    "beforeBuildCommand": "pnpm build -- --e2e"
+  }
+}

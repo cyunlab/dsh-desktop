@@ -15,6 +15,8 @@ tauri = { version = "2", features = [] }
 tauri-plugin-single-instance = "2.4.3"
 tauri-plugin-opener = "2.5.4"
 tauri-plugin-clipboard-manager = "2.3.2"
+tauri-plugin-wdio = { version = "1", optional = true }
+tauri-plugin-wdio-webdriver = { version = "1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -31,3 +33,4 @@ libc = "0.2"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+wdio = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver"]

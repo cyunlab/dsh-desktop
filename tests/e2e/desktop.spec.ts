@@ -1,0 +1,151 @@
+import { readFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+import { spawn } from 'node:child_process'
+import { browser, expect, $ } from '@wdio/globals'
+
+const scenario = process.env.DSH_TEST_SCENARIO ?? 'success'
+
+/** 等待元素展示目标文本，兼容启动页到 loopback 页面之间的导航。 */
+async function waitForText(selector: string, expected: string): Promise<void> {
+  await browser.waitUntil(async () => {
+    try { return (await $(selector).getText()).includes(expected) } catch { return false }
+  }, { timeout: 15_000, timeoutMsg: `${selector} did not contain ${expected}` })
+}
+
+/** 等待真实 loopback Harness 页面加载并返回当前 origin。 */
+async function waitForHarness(): Promise<string> {
+  await $('[data-testid="harness-ready"]').waitForDisplayed({ timeout: 15_000 })
+  const origin = await browser.getUrl()
+  const parsed = new URL(origin)
+  expect(parsed.protocol).toBe('http:')
+  expect(parsed.hostname).toBe('127.0.0.1')
+  expect(Number(parsed.port)).toBeGreaterThan(0)
+  return origin
+}
+
+/** 读取 sidecar fixture 写入的结构化生命周期事件。 */
+async function readEvents(): Promise<readonly Record<string, unknown>[]> {
+  const file = process.env.DSH_TEST_EVENTS
+  if (!file) return []
+  const contents = await readFile(file, 'utf8').catch(() => '')
+  return contents.split('\n').filter(Boolean).flatMap(line => {
+    try { return [JSON.parse(line) as Record<string, unknown>] } catch { return [] }
+  })
+}
+
+/** 等待 sidecar 事件落盘，避免测试在子进程关闭前读取到旧快照。 */
+async function waitForEvent(name: string): Promise<readonly Record<string, unknown>[]> {
+  await browser.waitUntil(async () => (await readEvents()).some(event => event.event === name), { timeout: 15_000, timeoutMsg: `sidecar event ${name} was not recorded` })
+  return readEvents()
+}
+
+/** 在 WebDriver 会话关闭前等待 fixture 落盘指定事件，避免依赖已退出的窗口。 */
+async function waitForDiskEvent(name: string): Promise<void> {
+  const deadline = Date.now() + 15_000
+  while (Date.now() < deadline) {
+    if ((await readEvents()).some(event => event.event === name)) return
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  throw new Error(`sidecar event ${name} was not recorded before desktop shutdown`)
+}
+
+/** 计算由 WDIO service 启动和由单实例测试直接启动的 Tauri debug 二进制路径。 */
+function applicationPath(): string {
+  const base = path.resolve('src-tauri', 'target', 'debug')
+  const candidates = process.platform === 'win32'
+    ? [path.join(base, 'deepseek-harness-desktop.exe'), path.join(base, 'deepseek-harness-desktop')]
+    : [path.join(base, 'deepseek-harness-desktop')]
+  const application = candidates.find(candidate => existsSync(candidate))
+  if (!application) throw new Error(`Tauri debug application is missing: ${candidates.join(', ')}`)
+  return application
+}
+
+/** 启动第二个相同 Tauri 进程并等待单实例插件将其转发退出。 */
+async function launchSecondInstance(): Promise<void> {
+  const second = spawn(applicationPath(), [], { env: process.env, stdio: 'ignore', windowsHide: true })
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => { second.kill(); reject(new Error('second Tauri instance did not exit')) }, 15_000)
+    second.once('error', error => { clearTimeout(timer); reject(error) })
+    second.once('exit', () => { clearTimeout(timer); resolve() })
+  })
+}
+
+describe('DeepSeek Harness Desktop Tauri behavior', () => {
+  if (scenario === 'delayed-success') {
+    it('shows the startup page before loading the loopback Harness client', async () => {
+      const initialPage = await browser.execute(() => ({
+        href: window.location.href,
+        body: document.body?.innerText ?? ''
+      })) as { href: string, body: string }
+      expect(initialPage.href).toMatch(/^http:\/\/tauri\.localhost\//)
+      expect(initialPage.body).toContain('Waiting for client to start')
+      const origin = await waitForHarness()
+      expect(origin).toMatch(/^http:\/\/127\.0\.0\.1:\d+\//)
+      expect(await browser.getTitle()).toContain('DeepSeek Harness Test Client')
+    })
+  }
+
+  if (scenario === 'retry') {
+    it('renders controlled startup failure and retries after stopping the old sidecar', async () => {
+      await waitForText('#state', 'Startup failed')
+      await $('#retry').waitForDisplayed()
+      await $('#copy').waitForDisplayed()
+      await $('#logs').waitForDisplayed()
+      await $('#retry').click()
+      await waitForHarness()
+      const events = await waitForEvent('ready')
+      const names = events.map(event => event.event)
+      expect(names).toContain('startup-failed')
+      expect(names.indexOf('stopped')).toBeGreaterThan(names.indexOf('startup-failed'))
+      expect(names.indexOf('ready')).toBeGreaterThan(names.indexOf('stopped'))
+    })
+  }
+
+  if (scenario === 'prolonged') {
+    it('offers Retry after prolonged startup and disables duplicate retry while stopping', async () => {
+      await waitForText('#state', 'Still starting')
+      await $('#retry').waitForDisplayed()
+      expect(await $('#retry').isEnabled()).toBe(true)
+      await $('#retry').click()
+      expect(await $('#retry').isEnabled()).toBe(false)
+      await waitForHarness()
+    })
+  }
+
+  if (scenario === 'crash-after-ready') {
+    it('returns to the failure page when a ready sidecar crashes', async () => {
+      await waitForHarness()
+      await waitForText('#state', 'Startup failed')
+      const events = await waitForEvent('crashed')
+      expect(events.map(event => event.event)).toContain('crashed')
+    })
+  }
+
+  if (scenario === 'success') {
+    it('keeps external and non-http popup requests out of the Desktop WebView', async () => {
+      const origin = await waitForHarness()
+      await browser.execute(() => window.open('https://example.com/dsh-e2e', '_blank'))
+      await browser.execute(() => window.open('file:///dsh-e2e-private', '_blank'))
+      await browser.pause(500)
+      expect(await browser.getWindowHandles()).toHaveLength(1)
+      expect(await browser.getUrl()).toBe(origin)
+    })
+
+    it('focuses the existing Desktop without starting another Host on a second launch', async () => {
+      const origin = await waitForHarness()
+      await launchSecondInstance()
+      await browser.pause(500)
+      expect(await browser.getWindowHandles()).toHaveLength(1)
+      expect(await browser.getUrl()).toBe(origin)
+      const events = await waitForEvent('ready')
+      expect(events.filter(event => event.event === 'ready')).toHaveLength(1)
+    })
+  }
+
+  /** 在每个桌面行为场景结束时销毁 WebView，验收 Tauri 侧的 sidecar 回收。 */
+  after(async () => {
+    await browser.closeWindow()
+    await waitForDiskEvent('server-closed')
+  })
+})

@@ -10,7 +10,7 @@ const desktopLogoRuntimePath = `dist/assets/${desktopLogoFileName.replace(/\.svg
 await rm('dist', { recursive: true, force: true })
 await Promise.all([
   build({ entryPoints: ['src/sidecar/index.ts'], outfile: 'dist/sidecar/index.js', bundle: true, platform: 'node', format: 'esm', external: ['@deepseek-ai/*', 'node-addon-require-builtin'], sourcemap: e2e, define }),
-  build({ entryPoints: ['src/startup/index.ts'], outfile: 'dist/startup/index.js', bundle: true, platform: 'browser', format: 'esm', sourcemap: true, external: ['@tauri-apps/api/*'] })
+  build({ entryPoints: ['src/startup/index.ts'], outfile: 'dist/startup/index.js', bundle: true, platform: 'browser', format: 'esm', sourcemap: true, external: ['@tauri-apps/api/*'], define })
 ])
 // Tauri only ships the sidecar and startup assets; the Electron main artifact gate is obsolete.
 await mkdir('dist/startup', { recursive: true })

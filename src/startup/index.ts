@@ -3,6 +3,10 @@ import { listen } from '@tauri-apps/api/event'
 import type { LifecycleSnapshot, StartupApi } from '../shared/startup-contract.js'
 import { connectStartupPage } from './controller.js'
 
+declare const __DSH_E2E__: boolean
+
+if (__DSH_E2E__) await import('@wdio/tauri-plugin')
+
 const api: StartupApi = {
   getSnapshot: () => invoke<LifecycleSnapshot>('startup_snapshot'),
   onSnapshot(listener) {
