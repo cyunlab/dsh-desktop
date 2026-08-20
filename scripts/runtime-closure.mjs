@@ -163,7 +163,9 @@ async function materializeNodeModules(source, destination, workerLimit = 8) {
       })
     }
   }
-  await Promise.all(Array.from({ length: Math.min(workerLimit, entries.length) }, () => worker()))
+  const results = await Promise.allSettled(Array.from({ length: Math.min(workerLimit, entries.length) }, () => worker()))
+  const failures = results.filter(result => result.status === 'rejected').map(result => result.reason)
+  if (failures.length > 0) throw new AggregateError(failures, 'runtime closure copy failed')
 }
 
 /** 物化并验证一次可移植依赖树，失败时由调用方决定是否以保守模式重试。 */
@@ -342,15 +344,19 @@ export async function prepareRuntimeClosure(options = {}) {
   const temporary = path.join(outputRoot, `.runtime-node-modules-${process.pid}-${randomUUID()}`)
   const destination = path.join(outputRoot, 'node_modules')
   try {
-    await materializeVerifiedNodeModules(source, temporary, target, 8)
-  } catch (firstError) {
-    const reason = (firstError instanceof Error ? firstError.message : String(firstError)).split('\n', 1)[0]
-    console.warn(`Parallel runtime closure copy was incomplete; retrying serially: ${reason}`)
-    await materializeVerifiedNodeModules(source, temporary, target, 1)
+    try {
+      await materializeVerifiedNodeModules(source, temporary, target, 8)
+    } catch (firstError) {
+      const reason = (firstError instanceof Error ? firstError.message : String(firstError)).split('\n', 1)[0]
+      console.warn(`Parallel runtime closure copy was incomplete; retrying serially: ${reason}`)
+      await materializeVerifiedNodeModules(source, temporary, target, 1)
+    }
+    await rm(destination, { recursive: true, force: true })
+    await mkdir(outputRoot, { recursive: true })
+    await renameDirectory(temporary, destination)
+  } finally {
+    await rm(temporary, { recursive: true, force: true })
   }
-  await rm(destination, { recursive: true, force: true })
-  await mkdir(outputRoot, { recursive: true })
-  await renameDirectory(temporary, destination)
   return destination
 }
 
