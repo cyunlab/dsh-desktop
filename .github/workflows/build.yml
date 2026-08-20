@@ -81,13 +81,10 @@ jobs:
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Build native Tauri package with the official Node sidecar
-        if: runner.os != 'Linux'
         run: pnpm package
-      - name: Diagnose Linux AppImage bundling with verbose linuxdeploy output
-        if: runner.os == 'Linux'
-        run: |
-          pnpm ensure:node-sidecar
-          pnpm exec tauri build --verbose --config src-tauri/tauri.linux.conf.json
+        env:
+          # Ubuntu 24.04 system libraries use DT_RELR; linuxdeploy's bundled strip cannot parse it.
+          NO_STRIP: ${{ runner.os == 'Linux' && 'true' || '' }}
       - name: Smoke test the official Node + Harness runtime
         run: pnpm smoke:node-sidecar
       - name: Verify the exact native Tauri artifact
