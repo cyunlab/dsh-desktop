@@ -20,21 +20,10 @@ const e2eObserver = {
 }
 await rm('dist', { recursive: true, force: true })
 await Promise.all([
-  build({ entryPoints: ['src/main/index.ts'], outfile: 'dist/main/index.js', bundle: true, platform: 'node', format: 'esm', external: ['electron', '@deepseek-ai/*', 'node-addon-require-builtin'], sourcemap: e2e, define, minifySyntax: true, plugins: [e2eObserver] }),
-  build({ entryPoints: ['src/host-process/index.ts'], outfile: 'dist/host-process/index.js', bundle: true, platform: 'node', format: 'esm', external: ['electron', '@deepseek-ai/*', 'node-addon-require-builtin'], sourcemap: e2e, define }),
-  build({ entryPoints: ['src/sidecar/index.ts'], outfile: 'dist/sidecar/index.js', bundle: true, platform: 'node', format: 'esm', external: ['electron', '@deepseek-ai/*', 'node-addon-require-builtin'], sourcemap: e2e, define }),
-  build({ entryPoints: ['src/preload/startup.ts'], outfile: 'dist/preload/startup.cjs', bundle: true, platform: 'node', format: 'cjs', external: ['electron'], sourcemap: true }),
+  build({ entryPoints: ['src/sidecar/index.ts'], outfile: 'dist/sidecar/index.js', bundle: true, platform: 'node', format: 'esm', external: ['@deepseek-ai/*', 'node-addon-require-builtin'], sourcemap: e2e, define }),
   build({ entryPoints: ['src/startup/index.ts'], outfile: 'dist/startup/index.js', bundle: true, platform: 'browser', format: 'esm', sourcemap: true, external: ['@tauri-apps/api/*'] })
 ])
-if (!e2e) {
-  const forbiddenMarkers = ['DSH_DESKTOP_TEST_HOST', 'DSH_DESKTOP_TEST_FAILURES', 'DSH_DESKTOP_TEST_USER_DATA', 'DSH_DESKTOP_TEST_EVENTS', 'Synthetic Host startup failure']
-  for (const artifact of await mainArtifacts('dist/main')) {
-    const contents = await readFile(artifact, 'utf8')
-    for (const forbidden of forbiddenMarkers) {
-      if (contents.includes(forbidden)) throw new Error(`production main artifact ${artifact} contains E2E hook: ${forbidden}`)
-    }
-  }
-}
+// Tauri only ships the sidecar and startup assets; the Electron main artifact gate is obsolete.
 await mkdir('dist/startup', { recursive: true })
 await mkdir('dist/assets', { recursive: true })
 await Promise.all([
