@@ -485,6 +485,17 @@ fn is_allowed_host_origin(origin: &str) -> bool {
         && url.fragment().is_none()
 }
 
+/// 判断 URL 是否是 Tauri 在不同 WebView 平台使用的精确打包启动入口。
+fn is_packaged_startup_url(target: &tauri::Url) -> bool {
+    let packaged_origin = (target.scheme() == "http"
+        && target.host_str() == Some("tauri.localhost"))
+        || (target.scheme() == "tauri" && target.host_str() == Some("localhost"));
+    packaged_origin
+        && matches!(target.path(), "/" | "/index.html")
+        && target.query().is_none()
+        && target.fragment().is_none()
+}
+
 /// 对窗口导航作出允许、交给系统浏览器或拒绝的决定。
 fn decide_navigation(
     raw_url: &str,
@@ -497,6 +508,9 @@ fn decide_navigation(
     let Ok(target) = raw_url.parse::<tauri::Url>() else {
         return NavigationDecision::Deny;
     };
+    if is_packaged_startup_url(&target) {
+        return NavigationDecision::Allow;
+    }
     if (target.scheme() == "http" && target.host_str() == Some("tauri.localhost"))
         || (target.scheme() == "tauri" && target.host_str() == Some("localhost"))
     {
@@ -1466,8 +1480,9 @@ fn main() {
 mod tests {
     use super::{
         build_startup_diagnostics, bundled_node_relative_path, decide_navigation,
-        is_allowed_host_origin, parse_loopback_address, parse_sidecar_message, DiagnosticCode,
-        LifecycleSnapshot, LifecycleState, NavigationDecision, RuntimeState, SidecarMessage,
+        is_allowed_host_origin, is_packaged_startup_url, parse_loopback_address,
+        parse_sidecar_message, DiagnosticCode, LifecycleSnapshot, LifecycleState,
+        NavigationDecision, RuntimeState, SidecarMessage,
     };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -1532,6 +1547,12 @@ mod tests {
             decide_navigation("tauri://localhost/private", startup, host),
             NavigationDecision::Deny
         );
+        assert!(is_packaged_startup_url(
+            &"http://tauri.localhost/".parse().unwrap()
+        ));
+        assert!(is_packaged_startup_url(
+            &"tauri://localhost/index.html".parse().unwrap()
+        ));
         assert_eq!(
             decide_navigation("https://example.com", startup, host),
             NavigationDecision::External
