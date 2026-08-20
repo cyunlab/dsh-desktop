@@ -29,7 +29,16 @@ describe('native build workflow contract', () => {
   it('builds the Tauri package through the public package command', () => {
     expect(workflow).toContain('pnpm package')
     expect(workflow).toContain('Build native Tauri package with the official Node sidecar')
+    expect(workflow).toContain('Smoke test the official Node + Harness runtime')
+    expect(workflow).toContain('pnpm smoke:node-sidecar')
+    expect(workflow).toContain('verify-tauri-artifact.mjs')
     expect(workflow).not.toContain('electron-builder')
+  })
+
+  it('installs the Linux Tauri system dependencies before packaging', () => {
+    expect(workflow).toContain('libwebkit2gtk-4.1-dev')
+    expect(workflow).toContain('libayatana-appindicator3-dev')
+    expect(workflow).toContain('patchelf')
   })
 
   it.each([

@@ -45,6 +45,22 @@ jobs:
       - name: Install frozen dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Install Linux Tauri and WebView test dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            file \
+            libayatana-appindicator3-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            patchelf \
+            xvfb
+
       - name: Install stable Rust toolchain
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
@@ -74,21 +90,39 @@ jobs:
         shell: bash
         run: set -o pipefail; pnpm test:integration 2>&1 | tee artifacts/integration.log
 
-      - name: Run packaged Tauri E2E tests
+      - name: Download the fixed official Node sidecar and build the runtime
+        id: runtime_build
+        continue-on-error: true
+        timeout-minutes: 15
+        shell: bash
+        run: set -o pipefail; { pnpm ensure:node-sidecar && pnpm build; } 2>&1 | tee artifacts/runtime-build.log
+
+      - name: Run real official Node + Harness smoke test
+        id: smoke
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: bash
+        run: set -o pipefail; pnpm smoke:node-sidecar 2>&1 | tee artifacts/smoke.log
+
+      - name: Install tauri-driver for supported WebDriver platforms
+        if: runner.os != 'macOS' && hashFiles('tests/e2e/**') != ''
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: bash
+        run: cargo install tauri-driver --locked 2>&1 | tee artifacts/tauri-driver.log
+
+      - name: Run Tauri WebDriver E2E when a checked-in suite exists
         id: e2e
-        if: runner.os != 'Linux'
+        if: hashFiles('tests/e2e/**') != ''
         continue-on-error: true
         timeout-minutes: 30
         shell: bash
         run: set -o pipefail; pnpm test:e2e 2>&1 | tee artifacts/e2e.log
 
-      - name: Run packaged Tauri E2E tests under Xvfb
-        id: e2e_linux
-        if: runner.os == 'Linux'
-        continue-on-error: true
-        timeout-minutes: 30
+      - name: Keep the official Node smoke gate when no E2E suite is present
+        if: runner.os == 'macOS'
         shell: bash
-        run: set -o pipefail; pnpm test:e2e:xvfb 2>&1 | tee artifacts/e2e.log
+        run: echo 'No checked-in Tauri E2E suite is present yet; the official Node + Harness smoke test remains the runtime gate. When tests/e2e is added, macOS uses the embedded Tauri WebDriver provider.'
 
       - name: Verify the Harness submodule stayed unchanged
         id: harness_guard
@@ -123,17 +157,13 @@ jobs:
           TYPECHECK_OUTCOME: ${{ steps.typecheck.outcome }}
           UNIT_OUTCOME: ${{ steps.unit.outcome }}
           INTEGRATION_OUTCOME: ${{ steps.integration.outcome }}
+          RUNTIME_BUILD_OUTCOME: ${{ steps.runtime_build.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
           E2E_OUTCOME: ${{ steps.e2e.outcome }}
-          E2E_LINUX_OUTCOME: ${{ steps.e2e_linux.outcome }}
           HARNESS_GUARD_OUTCOME: ${{ steps.harness_guard.outcome }}
           SANITIZE_OUTCOME: ${{ steps.sanitize.outcome }}
         run: |
-          outcomes="$TYPECHECK_OUTCOME $UNIT_OUTCOME $INTEGRATION_OUTCOME $HARNESS_GUARD_OUTCOME $SANITIZE_OUTCOME"
-          if [ "$RUNNER_OS" = Linux ]; then
-            outcomes="$outcomes $E2E_LINUX_OUTCOME"
-          else
-            outcomes="$outcomes $E2E_OUTCOME"
-          fi
+          outcomes="$TYPECHECK_OUTCOME $UNIT_OUTCOME $INTEGRATION_OUTCOME $RUNTIME_BUILD_OUTCOME $SMOKE_OUTCOME $E2E_OUTCOME $HARNESS_GUARD_OUTCOME $SANITIZE_OUTCOME"
           case " $outcomes " in
             *" failure "*|*" cancelled "*) exit 1 ;;
           esac

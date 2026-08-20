@@ -48,7 +48,7 @@ DeepSeek Harness Desktop 希望把这套思路继续带到桌面。我们希望 
 
 ✅ 提供启动失败恢复、脱敏诊断和日志目录入口
 
-✅ 包含单元测试、真实 Host 集成测试和 Tauri 端到端测试
+✅ 包含单元测试、真实 Host 集成测试和每个平台的官方 Node + Harness smoke 验证
 
 <a id="roadmap"></a>
 
@@ -93,9 +93,10 @@ corepack pnpm typecheck
 corepack pnpm build
 corepack pnpm test
 corepack pnpm test:integration
+corepack pnpm smoke:node-sidecar
 ```
 
-运行完整 Tauri 端到端测试
+运行已配置的 Tauri WebDriver 端到端测试（存在 `tests/e2e` 测试文件时由 CI 启用；Windows/Linux 使用 `tauri-driver`，macOS 使用 embedded `@wdio/tauri-service` provider）
 
 ```sh
 corepack pnpm test:e2e
@@ -109,7 +110,7 @@ corepack pnpm test:e2e
 corepack pnpm package
 ```
 
-产物会写入 `release/`。
+产物会写入 `src-tauri/target/release/bundle/`。
 
 | 平台 | 架构 | 格式 |
 | --- | --- | --- |

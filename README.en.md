@@ -48,7 +48,7 @@ DeepSeek Harness Desktop aims to carry this idea onto the desktop. We want Deskt
 
 ✅ Startup recovery, redacted diagnostics, and access to the platform log directory
 
-✅ Unit, real-Host integration, and Tauri end-to-end test layers
+✅ Unit, real-Host integration, and an official Node + Harness smoke gate on every target platform
 
 <a id="roadmap"></a>
 
@@ -79,6 +79,8 @@ Desktop owns the application lifecycle, security boundary, and operating-system 
 
 Use Node.js 24 with Corepack enabled. The repository pins pnpm 11.7.0.
 
+The first `pnpm dev` or `pnpm package` run downloads the fixed official Node 24 sidecar for the current target into `resources/node/<platform-arch>/node` (or `node.exe` on Windows). Existing executables are reused. Set `DSH_NODE_PATH` only when you intentionally need a runtime override; it never disables shipping the official sidecar.
+
 ```sh
 git clone --recurse-submodules https://github.com/XLCYun/dsh-desktop.git
 cd dsh-desktop
@@ -93,9 +95,10 @@ corepack pnpm typecheck
 corepack pnpm build
 corepack pnpm test
 corepack pnpm test:integration
+corepack pnpm smoke:node-sidecar
 ```
 
-Run the full Tauri end-to-end suite
+Run the configured Tauri WebDriver suite (CI enables it when `tests/e2e` exists; Windows/Linux use `tauri-driver`, macOS uses the embedded `@wdio/tauri-service` provider)
 
 ```sh
 corepack pnpm test:e2e
@@ -109,7 +112,7 @@ Build on the native target platform.
 corepack pnpm package
 ```
 
-Artifacts are written to `release/`.
+Artifacts are written to `src-tauri/target/release/bundle/`.
 
 | Platform | Architecture | Format |
 | --- | --- | --- |

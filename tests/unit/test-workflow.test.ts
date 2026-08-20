@@ -53,8 +53,13 @@ describe('manual Desktop behavior workflow', () => {
     expect(contents).toContain('pnpm typecheck')
     expect(contents).toContain('pnpm test 2>&1')
     expect(contents).toContain('pnpm test:integration')
+    expect(contents).toContain('pnpm ensure:node-sidecar')
+    expect(contents).toContain('pnpm build')
+    expect(contents).toContain('pnpm smoke:node-sidecar 2>&1')
+    expect(contents).toContain("hashFiles('tests/e2e/**') != ''")
+    expect(contents).toContain('cargo install tauri-driver --locked')
+    expect(contents).toContain('embedded Tauri WebDriver provider')
     expect(contents).toContain('pnpm test:e2e 2>&1')
-    expect(contents).toContain('pnpm test:e2e:xvfb')
   })
 
   it('retains bounded diagnostics without building installer artifacts', async () => {
@@ -64,6 +69,6 @@ describe('manual Desktop behavior workflow', () => {
     expect(contents).toContain('path: sanitized-artifacts/')
     expect(contents).not.toMatch(/^\s+path: (?:artifacts|test-results)\//m)
     expect(contents).toContain('retention-days: 7')
-    expect(contents).not.toMatch(/pnpm (?:package|build)|electron-builder/)
+    expect(contents).not.toMatch(/pnpm package|electron-builder/)
   })
 })

@@ -25,17 +25,19 @@ Desktop 使用单实例语义。重复启动只恢复并聚焦已有主窗口，
 
 ## 测试与发布
 
-跨平台端到端测试使用 `tauri-driver` 和 WebDriver 客户端，覆盖启动、Host 加载、启动失败及重试、sidecar 回收、单实例、外链交接和 Windows WebView2 loopback 加载。Computer Use 仅作 Windows 人工验证，不作为 CI 门禁。
+CI 在 Windows x64、macOS arm64/x64 和 Linux x64 上都会先用随项目下载的固定官方 Node 启动真实 Harness，并验证 loopback HTML 响应和优雅回收。这是所有平台的运行时门禁。Tauri WebDriver E2E 只有在仓库存在实际 `tests/e2e` 测试文件时才启用：Windows/Linux 使用 `tauri-driver`，macOS 使用官方 Tauri 文档支持的 embedded `@wdio/tauri-service` provider。当前没有已提交的 E2E 实现时，CI 不伪造覆盖，仍由官方 Node + Harness smoke 作为运行时门禁。Computer Use 仅作 Windows 人工验证，不作为 CI 门禁。
 
 Windows 仅构建和发布 x64 NSIS `.exe`，不构建 MSI。macOS 分别构建 arm64 与 x64 DMG，Linux 构建 x64 AppImage。CI 在每个目标平台打包官方 Node sidecar、运行 Tauri 行为测试，并保留 Harness 子模块只读校验。
 
 ## 本地运行
 
-需要 Rust、Cargo 和 Tauri CLI。安装官方 Node 后可通过 `DSH_NODE_PATH` 指定可执行文件：
+需要 Rust、Cargo 和 Tauri CLI。首次运行 `pnpm tauri:dev` 或 `pnpm tauri:build` 会为当前平台下载固定版本官方 Node 到 `resources/node/<platform-arch>/node(.exe)`；已有完整可执行文件时不会重复下载。若只想临时使用其他 Node，可通过 `DSH_NODE_PATH` 覆盖运行时路径：
 
 ```powershell
 $env:DSH_NODE_PATH = "C:\\Program Files\\nodejs\\node.exe"
 pnpm tauri:dev
 ```
+
+Node 归档缓存在 Windows 的 `%LOCALAPPDATA%\\dsh-desktop\\node`，在 macOS/Linux 的 `$XDG_CACHE_HOME/dsh-desktop/node`（未设置时为 `~/.cache/dsh-desktop/node`）。每次使用缓存前都会校验 Node 官方 `SHASUMS256.txt`，下载中的归档不会直接写入资源目录。
 
 当前垂直切片只包含窗口、Host 加载和 sidecar 回收；托盘、通知及桌面能力桥不在本次范围内。

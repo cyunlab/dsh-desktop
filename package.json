@@ -15,6 +15,7 @@
     "package:e2e": "pnpm tauri:build",
     "dev": "pnpm tauri:dev",
     "ensure:node-sidecar": "node scripts/ensure-node-sidecar.mjs",
+    "smoke:node-sidecar": "node scripts/smoke-node-sidecar.mjs",
     "tauri:dev": "pnpm ensure:node-sidecar && pnpm build && node scripts/run-tauri.mjs dev",
     "tauri:build": "pnpm ensure:node-sidecar && pnpm build && node scripts/run-tauri.mjs build",
     "start": "pnpm tauri:dev",

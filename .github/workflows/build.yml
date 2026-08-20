@@ -63,11 +63,30 @@ jobs:
           cache: pnpm
       - name: Install exact locked dependencies
         run: pnpm install --frozen-lockfile
+      - name: Install Linux Tauri build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            file \
+            libayatana-appindicator3-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            patchelf
       - name: Install stable Rust toolchain
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Build native Tauri package with the official Node sidecar
         run: pnpm package
+      - name: Smoke test the official Node + Harness runtime
+        run: pnpm smoke:node-sidecar
+      - name: Verify the exact native Tauri artifact
+        shell: bash
+        run: node scripts/verify-tauri-artifact.mjs "${{ matrix.platform }}"
       - name: Upload desktop artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
