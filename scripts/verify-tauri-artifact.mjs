@@ -1,9 +1,11 @@
 import { chmod, mkdir, mkdtemp, open, readdir, rm, stat } from 'node:fs/promises'
-import { execFile } from 'node:child_process'
+import { createInterface } from 'node:readline'
+import { execFile, spawn } from 'node:child_process'
 import { arch as hostArch, tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
+import { terminateProcessTree, waitForListenerClosed } from './smoke-node-sidecar.mjs'
 
 const execFileAsync = promisify(execFile)
 const projectRoot = path.resolve(import.meta.dirname, '..')
@@ -167,6 +169,105 @@ export async function verifyExtractedBundleContents(contentRoot, platformName, r
   await verifyExecutableArchitecture(application, contract, 'Tauri application')
 }
 
+/** 在真实安装包内容中定位随包交付的官方 Node 和 sidecar。 */
+async function locateBundledRuntime(contentRoot, contract) {
+  const contents = await walkFiles(contentRoot)
+  const normalized = file => file.replaceAll('\\', '/').toLowerCase()
+  const nodeSuffix = `/node/${contract.resourceName}/${contract.executableName}`.toLowerCase()
+  const sidecarSuffix = '/dist/sidecar/index.js'
+  const nodeExecutable = contents.find(file => normalized(file).endsWith(nodeSuffix))
+  const sidecarScript = contents.find(file => normalized(file).endsWith(sidecarSuffix))
+  if (!nodeExecutable || !sidecarScript) throw new Error(`Bundled runtime files cannot be located in ${contract.label}`)
+  return { nodeExecutable, sidecarScript }
+}
+
+/** 等待官方 Node sidecar 输出指定生命周期消息，并保留最后一段错误输出。 */
+function waitForSidecarMessage(child, lines, expected, timeoutMilliseconds = 90_000) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => finishReject(new Error(`Bundled sidecar did not report ${expected} within ${timeoutMilliseconds}ms`)), timeoutMilliseconds)
+    const finishResolve = value => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const finishReject = error => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(error)
+    }
+    lines.on('line', line => {
+      let message
+      try { message = JSON.parse(line) } catch { return }
+      if (message.type === expected) finishResolve(message)
+      else if (message.type === 'startup-failed') finishReject(new Error(`Bundled Harness startup failed: ${message.error?.message ?? 'unknown error'}`))
+    })
+    child.once('error', finishReject)
+    child.once('exit', code => {
+      if (!settled) finishReject(new Error(`Bundled sidecar exited before ${expected} with code ${code ?? 'unknown'}`))
+    })
+  })
+}
+
+/** 用安装包内的官方 Node 启动真实 Harness，验证打包闭包不是静态假绿。 */
+export async function probeBundledRuntime(contentRoot, platformName, runtimeArch = hostArch()) {
+  const contract = artifactContract(platformName, runtimeArch)
+  const { nodeExecutable, sidecarScript } = await locateBundledRuntime(contentRoot, contract)
+  const workDirectory = await mkdtemp(path.join(tmpdir(), 'dsh-artifact-runtime-probe-'))
+  const environment = { ...process.env, DSH_HOME: path.join(workDirectory, 'harness-home') }
+  delete environment.DSH_NODE_PATH
+  for (const name of Object.keys(environment)) {
+    if (name.startsWith('DSH_TEST_')) delete environment[name]
+  }
+  const child = spawn(nodeExecutable, [sidecarScript], {
+    cwd: workDirectory,
+    env: environment,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    detached: platformName !== 'win',
+    windowsHide: true
+  })
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity })
+  let stderr = ''
+  let origin
+  child.stderr.on('data', chunk => { stderr = `${stderr}${chunk}`.slice(-8_000) })
+  try {
+    const ready = await waitForSidecarMessage(child, lines, 'ready')
+    origin = ready.origin
+    if (typeof origin !== 'string') throw new Error('Bundled sidecar ready message did not include an origin')
+    const response = await fetch(origin)
+    if (!response.ok) throw new Error(`Bundled Harness probe returned HTTP ${response.status}`)
+    if (!response.headers.get('content-type')?.includes('text/html')) throw new Error('Bundled Harness probe did not return HTML')
+    child.stdin.write('{"type":"stop"}\n')
+    await waitForSidecarMessage(child, lines, 'stopped', 20_000)
+    await waitForChildExit(child, 20_000)
+    await waitForListenerClosed(origin)
+    console.log(`Verified packaged official Node + Harness runtime: ${contract.label}`)
+  } catch (error) {
+    const detail = stderr.trim()
+    try { await terminateProcessTree(child) } catch (cleanupError) {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}\nCleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`)
+    }
+    if (origin) {
+      try { await waitForListenerClosed(origin) } catch {}
+    }
+    throw new Error(`${error instanceof Error ? error.message : String(error)}${detail ? `\n${detail}` : ''}`)
+  } finally {
+    lines.close()
+    await rm(workDirectory, { recursive: true, force: true })
+  }
+}
+
+/** 等待 child process 确认退出，防止产物验收留下 Harness。 */
+function waitForChildExit(child, timeoutMilliseconds) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Bundled sidecar did not exit within ${timeoutMilliseconds}ms`)), timeoutMilliseconds)
+    child.once('exit', () => { clearTimeout(timer); resolve() })
+  })
+}
+
 /** 查找 GitHub Windows runner 或本机 PATH 中可用的 7-Zip。 */
 async function locateSevenZip(environment = process.env) {
   const candidates = [
@@ -209,6 +310,7 @@ async function verifyInspectableContainer(artifact, contract) {
     }
     try {
       await verifyExtractedBundleContents(contentRoot, contract.platformName, contract.architecture === 'aarch64' ? 'arm64' : 'x64')
+      await probeBundledRuntime(contentRoot, contract.platformName, contract.architecture === 'aarch64' ? 'arm64' : 'x64')
     } finally {
       if (contract.platformName === 'mac') await execFileAsync('hdiutil', ['detach', contentRoot])
     }

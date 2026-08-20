@@ -1,6 +1,7 @@
 import { cp, mkdir, rm } from 'node:fs/promises'
 import { build } from 'esbuild'
 import sharp from 'sharp'
+import { prepareRuntimeClosure } from './runtime-closure.mjs'
 
 const e2e = process.argv.slice(2).includes('--e2e')
 const define = { __DSH_E2E__: JSON.stringify(e2e) }
@@ -21,4 +22,5 @@ await Promise.all([
   cp(desktopLogoSource, `dist/assets/${desktopLogoFileName}`),
   sharp(desktopLogoSource).resize(1024, 1024).png().toFile(desktopLogoRuntimePath)
 ])
+await prepareRuntimeClosure({ projectRoot: process.cwd(), outputRoot: 'dist' })
 

@@ -13,6 +13,12 @@ Tauri Rust
 
 sidecar stdout 使用逐行 JSON 传输最小生命周期事件：`ready`、`startup-failed`、`stopped`、`stop-failed`。业务请求仍由 Harness Host 的 loopback HTTP/WebSocket 处理，不通过 Rust 复制一套业务协议。窗口关闭时 Rust 发送 `{"type":"stop"}`，等待有限时间后终止进程树。
 
+## 发布 runtime closure
+
+`scripts/build.mjs` 会在生成 `dist/sidecar/index.js` 后，为当前目标平台执行一次 pnpm production install，并使用 hoisted 布局生成可移植的 `dist/node_modules`。安装包只携带这个已经物化的依赖树，不携带 pnpm store、workspace symlink、构建机路径或开发依赖；随包的 sidecar 因此可以由官方 Node 在没有仓库 `node_modules` 的安装目录中直接启动。依赖安装缓存位于被 `.gitignore` 忽略的 `node_modules/.dsh-runtime-closure/<platform>-<arch>`，锁文件或目标平台变化会使缓存失效。
+
+runtime closure 校验会遍历 Harness 的必需依赖和 Cordis patch 动态插件，检查 Web 前端、node-pty、koffi、ripgrep、sharp、Node-API addon 及平台 helper；缺失或残留 symlink 会让构建失败。`scripts/verify-tauri-artifact.mjs` 还会从真实 NSIS、DMG 或 AppImage 解包后的内容找到随包官方 Node，启动真实 sidecar/Harness，访问 loopback HTML 并优雅停止。这一步禁止只验证仓库目录或系统 Node 的假绿。
+
 Desktop 只保有一个主窗口。Web Client 请求创建 popup 时，Desktop 不创建第二个 WebView；`http` 与 `https` 目标交由操作系统默认浏览器打开，其他协议一律拒绝。主窗口只允许加载受控的启动页及当前 sidecar 报告的 loopback origin。
 
 ## 生命周期与恢复
