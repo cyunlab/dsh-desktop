@@ -41,6 +41,10 @@ describe('native build workflow contract', () => {
     expect(workflow).toContain('patchelf')
   })
 
+  it('disables linuxdeploy stripping for the Linux AppImage build', () => {
+    expect(workflow).toMatch(/Build native Tauri package with the official Node sidecar[\s\S]*NO_STRIP: \$\{\{ runner\.os == 'Linux' && 'true' \|\| '' \}\}/)
+  })
+
   it.each([
     ['windows-2025', 'win', 'x64', 'nsis/*.exe'],
     ['macos-15', 'mac', 'arm64', 'dmg/*.dmg'],
