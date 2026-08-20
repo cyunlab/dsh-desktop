@@ -24,7 +24,6 @@
     "test:e2e:xvfb": "xvfb-run --auto-servernum pnpm test:e2e",
     "test:behavior": "pnpm test && pnpm test:integration && pnpm test:e2e",
     "typecheck": "tsc --noEmit",
-    "verify:runtime-closure": "node scripts/verify-runtime-closure.mjs --app-dir . --graph-only",
     "verify:release-version": "node scripts/verify-release-version.mjs"
   },
   "devDependencies": {
