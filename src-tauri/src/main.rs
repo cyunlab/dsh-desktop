@@ -10,10 +10,11 @@ use lifecycle::{
     ProcessControl, ReadinessWaitError, SidecarEvent,
 };
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs;
 #[cfg(all(debug_assertions, feature = "wdio"))]
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -455,6 +456,8 @@ struct RuntimeState {
     /// 串行化 spawn、Retry 和 shutdown，避免旧进程尚未回收时创建替代 Host。
     lifecycle_gate: Mutex<()>,
     host_origin: Mutex<Option<String>>,
+    /// 当前 Host origin 所属的启动轮次，防止旧页面加载误报新轮次 Ready。
+    host_generation: Mutex<Option<u64>>,
     startup_url: Mutex<Option<String>>,
     generation: AtomicU64,
     retrying: AtomicBool,
@@ -677,7 +680,7 @@ fn is_current(state: &RuntimeState, generation: u64) -> bool {
         && state.generation.load(Ordering::Acquire) == generation
 }
 
-/// 将带可选尾斜杠的 Harness HTTP origin 转换为 TCP 探测地址。
+/// 将带可选尾斜杠的 Harness HTTP origin 转换为 HTTP 探测地址。
 fn parse_loopback_address(origin: &str) -> Result<SocketAddr, ReadinessWaitError> {
     origin
         .strip_prefix("http://")
@@ -687,19 +690,129 @@ fn parse_loopback_address(origin: &str) -> Result<SocketAddr, ReadinessWaitError
         .map_err(|_| ReadinessWaitError::ProbeFailed)
 }
 
-/// 等待 Harness loopback listener；等待超过 30 秒只进入可恢复状态，不自动失败。
+/// 将当前轮次的 Host origin 与 generation 一起保存，供页面加载回调进行竞态校验。
+fn set_host_origin(state: &RuntimeState, generation: u64, origin: String) {
+    if !is_current(state, generation) {
+        return;
+    }
+    if let Ok(mut current) = state.host_origin.lock() {
+        *current = Some(origin);
+    }
+    if let Ok(mut current) = state.host_generation.lock() {
+        *current = Some(generation);
+    }
+}
+
+/// 判断实际完成加载的页面是否属于当前启动轮次等待中的 Host 客户端。
+fn is_current_host_page(state: &RuntimeState, loaded_url: &tauri::Url) -> bool {
+    let generation = state.generation.load(Ordering::Acquire);
+    let origin = state
+        .host_origin
+        .lock()
+        .ok()
+        .and_then(|value| value.clone());
+    let origin_generation = state.host_generation.lock().ok().and_then(|value| *value);
+    let waiting_for_client = state.snapshot.lock().ok().is_some_and(|snapshot| {
+        matches!(
+            snapshot.state,
+            LifecycleState::WaitingForClient | LifecycleState::ProlongedStartup
+        )
+    });
+    origin_generation == Some(generation)
+        && waiting_for_client
+        && origin.is_some_and(|origin| {
+            loaded_url.as_str().trim_end_matches('/') == origin.trim_end_matches('/')
+        })
+}
+
+/// 在主 WebView 确认当前 Host 页面加载完成后，才对启动页发布客户端 Ready。
+fn mark_client_page_loaded(app: &AppHandle, state: &RuntimeState, loaded_url: &tauri::Url) {
+    if !is_current_host_page(state, loaded_url) {
+        return;
+    }
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    record_wdio_event(serde_json::json!({
+        "event": "client-page-loaded",
+        "url": loaded_url.as_str()
+    }));
+    transition(app, state, LifecycleState::Ready, "Ready.");
+}
+
+/// 判断 loopback HTTP 响应是否确认可提供 HTML 客户端页面。
+fn is_html_client_response(response: &[u8]) -> bool {
+    let Ok(response) = std::str::from_utf8(response) else {
+        return false;
+    };
+    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let mut lines = headers.lines();
+    let Some(status) = lines.next() else {
+        return false;
+    };
+    let successful_status = status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| (200..300).contains(&code));
+    successful_status
+        && lines.any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("content-type")
+                    && value.trim().to_ascii_lowercase().starts_with("text/html")
+            })
+        })
+        && !body.trim().is_empty()
+}
+
+/// 通过一次受限的 HTTP GET 确认根页面可服务，而非仅确认 TCP 端口被监听。
+fn probe_client_page(address: SocketAddr) -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(500)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: {address}\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = Vec::with_capacity(4096);
+    let mut buffer = [0_u8; 4096];
+    while response.len() < 64 * 1024 {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break
+            }
+            Err(_) => return false,
+        }
+    }
+    is_html_client_response(&response)
+}
+
+/// 等待 Harness 根页面可通过 HTTP 提供 HTML；超过 30 秒只进入可恢复状态，不自动失败。
 fn wait_for_web_listener(
     app: &AppHandle,
     state: &RuntimeState,
     generation: u64,
     process: &Arc<SidecarProcess>,
     origin: &str,
+    attempt_started: Instant,
 ) -> Result<(), ReadinessWaitError> {
     let address = parse_loopback_address(origin)?;
     wait_for_readiness(
         || is_current(state, generation),
         || process.child_has_exited(),
-        || Ok(TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok()),
+        || Ok(probe_client_page(address)),
+        attempt_started,
         PROLONGED_STARTUP_AFTER,
         Duration::from_millis(100),
         || {
@@ -711,6 +824,44 @@ fn wait_for_web_listener(
             );
         },
     )
+}
+
+/// 将官方 Node 所在目录置于 PATH 首位，保证插件 spawn("node") 复用同一官方运行时。
+fn prepend_node_directory_to_path(
+    node_path: &Path,
+    inherited_path: Option<OsString>,
+) -> Result<OsString, DiagnosticCode> {
+    let node_directory = node_path.parent().ok_or(DiagnosticCode::NodeUnavailable)?;
+    let paths = std::iter::once(node_directory.to_path_buf()).chain(
+        inherited_path
+            .as_deref()
+            .map(std::env::split_paths)
+            .into_iter()
+            .flatten(),
+    );
+    std::env::join_paths(paths).map_err(|_| DiagnosticCode::SpawnFailed)
+}
+
+/// 向 sidecar Command 写入去重后的 PATH；Windows 同时清除 PATH 与 Path 等大小写变体。
+fn configure_sidecar_node_path(
+    command: &mut Command,
+    node_path: &Path,
+) -> Result<(), DiagnosticCode> {
+    let inherited_path = std::env::vars_os().find_map(|(name, value)| {
+        name.to_string_lossy()
+            .eq_ignore_ascii_case("path")
+            .then_some(value)
+    });
+    let path = prepend_node_directory_to_path(node_path, inherited_path)?;
+    command.env_remove("PATH");
+    command.env_remove("Path");
+    for (name, _) in
+        std::env::vars_os().filter(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("path"))
+    {
+        command.env_remove(name);
+    }
+    command.env("PATH", path);
+    Ok(())
 }
 
 /// 启动一个官方 Node sidecar，并返回共享进程句柄与生命周期消息通道。
@@ -739,7 +890,7 @@ fn spawn_sidecar(
         .app_data_dir()
         .map_err(|_| DiagnosticCode::AppDataUnavailable)?;
     fs::create_dir_all(&harness_home).map_err(|_| DiagnosticCode::AppDataUnavailable)?;
-    let mut command = Command::new(node_path);
+    let mut command = Command::new(&node_path);
     command
         .arg(script)
         .current_dir(&harness_home)
@@ -747,13 +898,18 @@ fn spawn_sidecar(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    configure_sidecar_node_path(&mut command, &node_path)?;
     #[cfg(windows)]
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().map_err(|_| DiagnosticCode::SpawnFailed)?;
     #[cfg(all(debug_assertions, feature = "wdio"))]
-    record_wdio_event(serde_json::json!({ "event": "sidecar-spawned", "pid": child.id() }));
+    record_wdio_event(serde_json::json!({
+        "event": "sidecar-spawned",
+        "pid": child.id(),
+        "nodePathPrepended": true
+    }));
     let pid = child.id();
     let ownership = match ProcessOwnership::attach(pid) {
         Ok(ownership) => ownership,
@@ -894,6 +1050,9 @@ fn fail_attempt(app: &AppHandle, state: &RuntimeState, generation: u64, code: Di
     if let Ok(mut origin) = state.host_origin.lock() {
         *origin = None;
     }
+    if let Ok(mut origin_generation) = state.host_generation.lock() {
+        *origin_generation = None;
+    }
     if let Ok(mut last_error) = state.last_error.lock() {
         *last_error = Some(code);
     }
@@ -950,6 +1109,12 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
         LifecycleState::StartingSidecar,
         "Starting local Host.",
     );
+    let attempt_started = state
+        .attempt_started
+        .lock()
+        .ok()
+        .and_then(|started| *started)
+        .unwrap_or_else(Instant::now);
     let (process, receiver) = match spawn_sidecar(&app, &state, generation) {
         Ok(result) => result,
         Err(error) => {
@@ -963,7 +1128,6 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
         LifecycleState::WaitingForClient,
         "Waiting for client to start.",
     );
-    let started = Instant::now();
     let mut machine = LifecycleMachine::new();
     loop {
         if !is_current(&state, generation) {
@@ -984,12 +1148,15 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
                     }
                     match machine.observe(SidecarEvent::Ready(origin.clone())) {
                         LifecycleAction::Ready(origin) => {
-                            if let Ok(mut current) = state.host_origin.lock() {
-                                *current = Some(origin.clone());
-                            }
-                            if let Err(error) =
-                                wait_for_web_listener(&app, &state, generation, &process, &origin)
-                            {
+                            set_host_origin(&state, generation, origin.clone());
+                            if let Err(error) = wait_for_web_listener(
+                                &app,
+                                &state,
+                                generation,
+                                &process,
+                                &origin,
+                                attempt_started,
+                            ) {
                                 match error {
                                     ReadinessWaitError::Cancelled => {}
                                     ReadinessWaitError::ProcessExited => abort_attempt(
@@ -1011,9 +1178,8 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
                             }
                             #[cfg(all(debug_assertions, feature = "wdio"))]
                             record_wdio_event(
-                                serde_json::json!({ "event": "host-ready", "origin": origin }),
+                                serde_json::json!({ "event": "client-page-served", "origin": origin }),
                             );
-                            transition(&app, &state, LifecycleState::Ready, "Ready.");
                             navigate_to_host(&app, &origin);
                         }
                         LifecycleAction::Fail => {
@@ -1067,7 +1233,7 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
                 }
             }
         }
-        if started.elapsed() >= PROLONGED_STARTUP_AFTER
+        if attempt_started.elapsed() >= PROLONGED_STARTUP_AFTER
             && state
                 .snapshot
                 .lock()
@@ -1119,6 +1285,9 @@ fn start_attempt(app: &AppHandle, state: &Arc<RuntimeState>) {
     }
     if let Ok(mut origin) = state.host_origin.lock() {
         *origin = None;
+    }
+    if let Ok(mut origin_generation) = state.host_generation.lock() {
+        *origin_generation = None;
     }
     transition(app, state, LifecycleState::Starting, "Starting.");
     let app = app.clone();
@@ -1341,6 +1510,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         process: Mutex::new(None),
         lifecycle_gate: Mutex::new(()),
         host_origin: Mutex::new(None),
+        host_generation: Mutex::new(None),
         startup_url: Mutex::new(None),
         generation: AtomicU64::new(0),
         retrying: AtomicBool::new(false),
@@ -1360,6 +1530,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             .center()
             .on_page_load({
                 let state = Arc::clone(&state);
+                let app = app.handle().clone();
                 move |_window, payload| {
                     let url = payload.url();
                     let is_app_page = (url.scheme() == "http"
@@ -1375,6 +1546,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                             "url": url.as_str()
                         }));
                     }
+                    mark_client_page_loaded(&app, &state, url);
                 }
             })
             .on_navigation({
@@ -1479,12 +1651,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_startup_diagnostics, bundled_node_relative_path, decide_navigation,
-        is_allowed_host_origin, is_packaged_startup_url, parse_loopback_address,
-        parse_sidecar_message, DiagnosticCode, LifecycleSnapshot, LifecycleState,
+        build_startup_diagnostics, bundled_node_relative_path, configure_sidecar_node_path,
+        decide_navigation, is_allowed_host_origin, is_current_host_page, is_html_client_response,
+        is_packaged_startup_url, parse_loopback_address, parse_sidecar_message,
+        prepend_node_directory_to_path, DiagnosticCode, LifecycleSnapshot, LifecycleState,
         NavigationDecision, RuntimeState, SidecarMessage,
     };
+    use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Mutex;
     /// 验证生命周期 ready 消息可解析。
@@ -1524,6 +1699,68 @@ mod tests {
         assert_eq!(
             parse_loopback_address("http://127.0.0.1:1234/").unwrap(),
             "127.0.0.1:1234".parse().unwrap()
+        );
+    }
+
+    /// 验证只有成功的 HTML 根页面响应才会通过客户端页面 readiness 探测。
+    #[test]
+    fn validates_html_client_response() {
+        assert!(is_html_client_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html></html>"
+        ));
+        assert!(!is_html_client_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}"
+        ));
+        assert!(!is_html_client_response(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n\r\n<html></html>"
+        ));
+    }
+
+    /// 验证官方 Node 所在目录始终位于继承 PATH 的首位。
+    #[test]
+    fn prepends_official_node_directory_to_path() {
+        let node = PathBuf::from("desktop/resources/node/current/node");
+        let inherited =
+            std::env::join_paths([PathBuf::from("system-node"), PathBuf::from("tools")]).unwrap();
+        let configured = prepend_node_directory_to_path(&node, Some(inherited)).unwrap();
+        let configured = std::env::split_paths(&configured).collect::<Vec<_>>();
+        assert_eq!(
+            configured.first(),
+            Some(&node.parent().unwrap().to_path_buf())
+        );
+        assert!(configured.contains(&PathBuf::from("system-node")));
+    }
+
+    /// 验证没有继承 PATH 时仍只提供官方 Node 所在目录。
+    #[test]
+    fn creates_node_path_without_inherited_path() {
+        let node = PathBuf::from("desktop/resources/node/current/node");
+        let configured = prepend_node_directory_to_path(&node, None::<OsString>).unwrap();
+        assert_eq!(
+            std::env::split_paths(&configured).collect::<Vec<_>>(),
+            vec![node.parent().unwrap().to_path_buf()]
+        );
+    }
+
+    /// 验证 Command 仅保留一个前置官方 Node 目录的 PATH 覆盖，作为 Windows 大小写兼容回归保护。
+    #[test]
+    fn command_path_override_prefers_official_node_directory() {
+        let node = PathBuf::from("desktop/resources/node/current/node");
+        let mut command = Command::new("test-program");
+        configure_sidecar_node_path(&mut command, &node).unwrap();
+        let values = command
+            .get_envs()
+            .filter_map(|(name, value)| {
+                name.to_string_lossy()
+                    .eq_ignore_ascii_case("path")
+                    .then_some(value)
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            std::env::split_paths(values[0]).next(),
+            Some(node.parent().unwrap().to_path_buf())
         );
     }
     /// 验证启动页、当前 Host 和外链导航边界。
@@ -1586,6 +1823,7 @@ mod tests {
             process: Mutex::new(None),
             lifecycle_gate: Mutex::new(()),
             host_origin: Mutex::new(None),
+            host_generation: Mutex::new(None),
             startup_url: Mutex::new(None),
             generation: AtomicU64::new(1),
             retrying: AtomicBool::new(false),
@@ -1605,5 +1843,37 @@ mod tests {
         assert!(!diagnostics.contains("example.test"));
         assert!(!diagnostics.contains("token"));
         assert!(!diagnostics.contains("alice"));
+    }
+
+    /// 验证旧轮次或非等待状态的 Host 页面加载不会将桌面端误标为 Ready。
+    #[test]
+    fn only_current_waiting_host_page_is_client_ready() {
+        let state = RuntimeState {
+            snapshot: Mutex::new(LifecycleSnapshot {
+                state: LifecycleState::WaitingForClient,
+                message: "ignored".into(),
+                origin: Some("http://127.0.0.1:1234/".into()),
+            }),
+            process: Mutex::new(None),
+            lifecycle_gate: Mutex::new(()),
+            host_origin: Mutex::new(Some("http://127.0.0.1:1234/".into())),
+            host_generation: Mutex::new(Some(3)),
+            startup_url: Mutex::new(None),
+            generation: AtomicU64::new(3),
+            retrying: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            attempt_started: Mutex::new(None),
+            node_path_status: Mutex::new("bundled".into()),
+            logs_dir: PathBuf::from("logs"),
+            last_error: Mutex::new(None),
+        };
+        let current = "http://127.0.0.1:1234/".parse().unwrap();
+        let stale = "http://127.0.0.1:4321/".parse().unwrap();
+        assert!(is_current_host_page(&state, &current));
+        assert!(!is_current_host_page(&state, &stale));
+        state
+            .generation
+            .store(4, std::sync::atomic::Ordering::Release);
+        assert!(!is_current_host_page(&state, &current));
     }
 }

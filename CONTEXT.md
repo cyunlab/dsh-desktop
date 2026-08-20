@@ -24,7 +24,7 @@ The upstream browser UI served by the Host. It owns the normal product experienc
 
 ### Client readiness
 
-The condition in which the client app shell and its required core services have activated and the normal product surface can render. Host HTTP availability alone does not establish client readiness. The startup page uses the user-facing wording “Waiting for client to start” and does not expose the upstream Web Client term.
+The condition in which the client app shell and its required core services have activated and the normal product surface can render. Desktop first probes the reported loopback root with HTTP and requires a successful HTML response before navigating; it reports `Ready` only after the controlled main WebView completes loading that current-attempt Host page. A TCP listener or Host lifecycle message alone does not establish client readiness. The startup page uses the user-facing wording “Waiting for client to start” and does not expose the upstream Web Client term.
 
 ### Client startup observer
 
@@ -84,7 +84,7 @@ The official Node.js process that runs the Harness Host and its complete plugin 
 
 ### Node sidecar
 
-A packaged, version-matched official Node.js executable launched and supervised by Desktop to host the Harness runtime. Plugins execute inside this process rather than inside Electron or Tauri.
+A packaged, version-matched official Node.js executable launched and supervised by Desktop to host the Harness runtime. Its directory is placed first in the sidecar `PATH`, so plugin calls such as `spawn("node")` resolve to that same official runtime rather than a system installation. Plugins execute inside this process rather than inside Electron or Tauri.
 
 ### Node executable override
 

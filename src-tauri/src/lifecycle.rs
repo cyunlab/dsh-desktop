@@ -90,16 +90,16 @@ pub enum ReadinessWaitError {
     ProbeFailed,
 }
 
-/// 等待 listener 就绪，同时观察取消、子进程退出和 prolonged 状态。
+/// 从同一启动轮次的绝对起点等待 readiness，同时观察取消、子进程退出和 prolonged 状态。
 pub fn wait_for_readiness(
     mut is_current: impl FnMut() -> bool,
     mut child_exited: impl FnMut() -> Result<bool, String>,
     mut listener_ready: impl FnMut() -> Result<bool, String>,
+    attempt_started: Instant,
     prolonged_after: Duration,
     poll_interval: Duration,
     mut on_prolonged: impl FnMut(),
 ) -> Result<(), ReadinessWaitError> {
-    let started = Instant::now();
     let mut prolonged = false;
     loop {
         if !is_current() {
@@ -111,7 +111,7 @@ pub fn wait_for_readiness(
         if listener_ready().map_err(|_| ReadinessWaitError::ProbeFailed)? {
             return Ok(());
         }
-        if !prolonged && started.elapsed() >= prolonged_after {
+        if !prolonged && attempt_started.elapsed() >= prolonged_after {
             prolonged = true;
             on_prolonged();
         }
@@ -329,7 +329,7 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// 验证启动失败事件会进入失败动作并忽略迟到事件。
     #[test]
@@ -470,11 +470,36 @@ mod tests {
                 Ok(current >= 2)
             },
             || Ok(false),
+            Instant::now(),
             Duration::from_secs(30),
             Duration::ZERO,
             || {},
         );
         assert_eq!(result, Err(ReadinessWaitError::ProcessExited));
         assert_eq!(probes.get(), 2);
+    }
+
+    /// 验证 readiness 探测沿用启动轮次的绝对开始时间，不会在 sidecar ready 后重置 prolonged 计时。
+    #[test]
+    fn readiness_uses_the_attempt_start_time_for_prolonged_state() {
+        let probes = Rc::new(Cell::new(0));
+        let probes_for_readiness = Rc::clone(&probes);
+        let prolonged = Rc::new(Cell::new(false));
+        let prolonged_for_callback = Rc::clone(&prolonged);
+        let result = wait_for_readiness(
+            || true,
+            || Ok(false),
+            move || {
+                let current = probes_for_readiness.get() + 1;
+                probes_for_readiness.set(current);
+                Ok(current >= 2)
+            },
+            Instant::now() - Duration::from_secs(1),
+            Duration::from_millis(30),
+            Duration::ZERO,
+            move || prolonged_for_callback.set(true),
+        );
+        assert_eq!(result, Ok(()));
+        assert!(prolonged.get());
     }
 }

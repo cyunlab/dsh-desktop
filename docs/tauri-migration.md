@@ -9,7 +9,7 @@ Tauri Rust
             └─ loopback Web UI
 ```
 
-开发与打包模式默认都读取固定版本的 `resources/node/<platform-arch>/node(.exe)`，不会依赖 PATH 或用户机器上的 Node 安装。`DSH_NODE_PATH` 是唯一的显式覆盖入口。开发和构建命令会下载该固定版本，已存在且完整时不会重复下载。sidecar 的工作目录是 Tauri 应用数据目录，`DSH_HOME` 也指向该目录。
+开发与打包模式默认都读取固定版本的 `resources/node/<platform-arch>/node(.exe)`，不会依赖 PATH 或用户机器上的 Node 安装。`DSH_NODE_PATH` 是唯一的显式覆盖入口。Rust 启动 sidecar 时会将解析出的 Node 所在目录置于该进程 `PATH` 的首位（Windows 会规范化 `PATH`/`Path` 大小写），因此插件 `spawn("node")` 也始终得到同一官方运行时。开发和构建命令会下载该固定版本，已存在且完整时不会重复下载。sidecar 的工作目录是 Tauri 应用数据目录，`DSH_HOME` 也指向该目录。
 
 sidecar stdout 使用逐行 JSON 传输最小生命周期事件：`ready`、`startup-failed`、`stopped`、`stop-failed`。业务请求仍由 Harness Host 的 loopback HTTP/WebSocket 处理，不通过 Rust 复制一套业务协议。窗口关闭时 Rust 发送 `{"type":"stop"}`，等待有限时间后终止进程树。
 
@@ -17,7 +17,7 @@ Desktop 只保有一个主窗口。Web Client 请求创建 popup 时，Desktop �
 
 ## 生命周期与恢复
 
-启动页与 Rust shell 只通过 Tauri event/command 通信，不读取 sidecar stdin/stdout，也不直接访问文件系统。Desktop 生命周期为 `Starting`、`Starting sidecar`、`Waiting for client to start`、`Ready`、`Failed`、`Stopping`。等待 30 秒后进入非终态的“启动时间较长”，继续无限等待；仅用户 Retry 或明确的启动错误才会中止本轮启动。sidecar 在 Ready 后意外退出时必须进入 Failed。启动页不向用户暴露上游 Web Client 这一内部术语。
+启动页与 Rust shell 只通过 Tauri event/command 通信，不读取 sidecar stdin/stdout，也不直接访问文件系统。Desktop 生命周期为 `Starting`、`Starting sidecar`、`Waiting for client to start`、`Ready`、`Failed`、`Stopping`。sidecar 的 `ready` 消息只表示已报告 Host origin：Rust 还会请求该 origin 的根 HTML，确认页面可服务后才导航；仅当主 WebView 完成当前轮次 Host 页面加载后才发布 Desktop `Ready`。等待 30 秒从同一启动轮次开始的绝对时间计算，且进入非终态的“启动时间较长”后继续无限等待；仅用户 Retry 或明确的启动错误才会中止本轮启动。sidecar 在 Ready 后意外退出时必须进入 Failed。启动页不向用户暴露上游 Web Client 这一内部术语。
 
 失败页提供 Retry、Copy diagnostics 和 Open logs。Retry 必须先向已有 sidecar 请求停止，等待有限时间；超时后终止其进程树，随后才能创建新的 sidecar。诊断只包含版本、平台与架构、sidecar 路径状态、生命周期时间和脱敏错误；不得记录环境变量、凭据、会话、提示词、工具参数、工作区内容、URL 查询或 HTTP 请求体。
 
