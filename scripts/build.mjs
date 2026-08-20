@@ -10,9 +10,9 @@ const desktopLogoRuntimePath = `dist/assets/${desktopLogoFileName.replace(/\.svg
 await rm('dist', { recursive: true, force: true })
 await Promise.all([
   build({ entryPoints: ['src/sidecar/index.ts'], outfile: 'dist/sidecar/index.js', bundle: true, platform: 'node', format: 'esm', external: ['@deepseek-ai/*', 'node-addon-require-builtin'], sourcemap: e2e, define }),
-  build({ entryPoints: ['src/startup/index.ts'], outfile: 'dist/startup/index.js', bundle: true, platform: 'browser', format: 'esm', sourcemap: true, external: ['@tauri-apps/api/*'], define })
+  build({ entryPoints: ['src/startup/index.ts'], outfile: 'dist/startup/index.js', bundle: true, platform: 'browser', format: 'esm', sourcemap: true, define })
 ])
-// Tauri only ships the sidecar and startup assets; the Electron main artifact gate is obsolete.
+// Tauri 仅打包 sidecar 与启动页资源，桌面主程序由 Rust 构建。
 await mkdir('dist/startup', { recursive: true })
 await mkdir('dist/assets', { recursive: true })
 await Promise.all([

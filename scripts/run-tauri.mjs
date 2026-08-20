@@ -17,12 +17,12 @@ function withCargoPath(environment) {
 function run() {
   const [command, ...args] = process.argv.slice(2)
   if (!command) throw new Error('Tauri command is required')
-  const pnpm = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
-  const child = spawn(pnpm, ['exec', 'tauri', command, ...args], {
+  const pnpmEntry = process.env.npm_execpath
+  if (!pnpmEntry) throw new Error('Tauri launcher must be run from a pnpm script')
+  const child = spawn(process.execPath, [pnpmEntry, 'exec', 'tauri', command, ...args], {
     cwd: process.cwd(),
     env: withCargoPath(process.env),
-    stdio: 'inherit',
-    shell: process.platform === 'win32'
+    stdio: 'inherit'
   })
   child.once('error', error => { throw error })
   child.once('exit', code => { process.exitCode = code ?? 1 })

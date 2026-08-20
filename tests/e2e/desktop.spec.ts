@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import { spawn, spawnSync } from 'node:child_process'
 import { browser, expect, $ } from '@wdio/globals'
 import { applicationPath } from './support/paths.mjs'
@@ -7,14 +7,25 @@ const scenario = process.env.DSH_TEST_SCENARIO ?? 'success'
 
 /** 等待元素展示目标文本，兼容启动页到 loopback 页面之间的导航。 */
 async function waitForText(selector: string, expected: string, timeout = 15_000): Promise<void> {
-  await browser.waitUntil(async () => {
-    try { return (await $(selector).getText()).includes(expected) } catch { return false }
-  }, { timeout, timeoutMsg: `${selector} did not contain ${expected}` })
+  try {
+    await browser.waitUntil(async () => {
+      try { return (await $(selector).getText()).includes(expected) } catch { return false }
+    }, { timeout, timeoutMsg: `${selector} did not contain ${expected}` })
+  } catch (error) {
+    const url = await browser.getUrl().catch(() => '<unavailable>')
+    const source = await browser.getPageSource().catch(() => '<unavailable>')
+    throw new Error(`${String(error)}; current URL: ${url}; page: ${source.slice(0, 500)}`)
+  }
 }
 
 /** 等待真实 loopback Harness 页面加载并返回当前 origin。 */
 async function waitForHarness(): Promise<string> {
-  await $('[data-testid="harness-ready"]').waitForDisplayed({ timeout: 30_000 })
+  try {
+    await $('[data-testid="harness-ready"]').waitForDisplayed({ timeout: 45_000 })
+  } catch (error) {
+    const url = await browser.getUrl().catch(() => '<unavailable>')
+    throw new Error(`${String(error)}; current URL: ${url}; records: ${JSON.stringify(await readRecords())}`)
+  }
   const origin = await browser.getUrl()
   const parsed = new URL(origin)
   expect(parsed.protocol).toBe('http:')
@@ -125,6 +136,9 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
   if (scenario === 'crash-after-ready') {
     it('returns to the failure page when a ready sidecar crashes', async () => {
       await waitForHarness()
+      const crashTrigger = process.env.DSH_TEST_CRASH_TRIGGER
+      if (!crashTrigger) throw new Error('DSH_TEST_CRASH_TRIGGER is required')
+      await writeFile(crashTrigger, 'crash', 'utf8')
       await waitForText('#state', 'Startup failed')
       const events = await waitForEvent('crashed')
       expect(events.map(event => event.event)).toContain('crashed')

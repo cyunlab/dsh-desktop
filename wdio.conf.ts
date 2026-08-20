@@ -18,7 +18,7 @@ export const config: Options.Testrunner = {
       statusPollTimeout: 15_000,
       // 调试构建捕获 Rust stderr，便于诊断窗口导航和 sidecar 生命周期。
       captureBackendLogs: true,
-      // 服务在 Windows 上即使使用内置 provider 仍会执行兼容性探测，保持自动下载可以让 CI 无需手工安装驱动。
+      // Windows provider 会校验 WebView2 匹配的驱动，由服务自动下载并缓存。
       autoDownloadEdgeDriver: true,
       env: {
         DSH_NODE_PATH: process.env.DSH_NODE_PATH ?? officialNodePath(),

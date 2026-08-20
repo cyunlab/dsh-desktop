@@ -640,6 +640,8 @@ fn transition(
     lifecycle: LifecycleState,
     message: impl Into<String>,
 ) {
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    record_wdio_event(serde_json::json!({ "event": "lifecycle-transition", "state": lifecycle }));
     publish_snapshot(
         app,
         state,
@@ -661,6 +663,16 @@ fn is_current(state: &RuntimeState, generation: u64) -> bool {
         && state.generation.load(Ordering::Acquire) == generation
 }
 
+/// 将带可选尾斜杠的 Harness HTTP origin 转换为 TCP 探测地址。
+fn parse_loopback_address(origin: &str) -> Result<SocketAddr, ReadinessWaitError> {
+    origin
+        .strip_prefix("http://")
+        .ok_or(ReadinessWaitError::ProbeFailed)?
+        .trim_end_matches('/')
+        .parse::<SocketAddr>()
+        .map_err(|_| ReadinessWaitError::ProbeFailed)
+}
+
 /// 等待 Harness loopback listener；等待超过 30 秒只进入可恢复状态，不自动失败。
 fn wait_for_web_listener(
     app: &AppHandle,
@@ -669,11 +681,7 @@ fn wait_for_web_listener(
     process: &Arc<SidecarProcess>,
     origin: &str,
 ) -> Result<(), ReadinessWaitError> {
-    let address = origin
-        .strip_prefix("http://")
-        .ok_or(ReadinessWaitError::ProbeFailed)?
-        .parse::<SocketAddr>()
-        .map_err(|_| ReadinessWaitError::ProbeFailed)?;
+    let address = parse_loopback_address(origin)?;
     wait_for_readiness(
         || is_current(state, generation),
         || process.child_has_exited(),
@@ -826,19 +834,40 @@ fn navigate_to_startup(app: &AppHandle, state: &RuntimeState) {
     let app_for_task = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(window) = app_for_task.get_webview_window("main") {
-            let _ = window.navigate(url);
+            if window.url().is_ok_and(|current| current == url) {
+                return;
+            }
+            let result = window.navigate(url.clone());
+            #[cfg(not(all(debug_assertions, feature = "wdio")))]
+            let _ = result;
+            #[cfg(all(debug_assertions, feature = "wdio"))]
+            record_wdio_event(serde_json::json!({
+                "event": "startup-navigation",
+                "url": url.as_str(),
+                "ok": result.is_ok()
+            }));
         }
     });
 }
 
 /// 将窗口导航到当前启动轮次的 Host 页面。
 fn navigate_to_host(app: &AppHandle, origin: &str) {
-    let Ok(url) = origin.parse() else { return };
+    let Ok(url) = origin.parse::<tauri::Url>() else {
+        return;
+    };
     let app = app.clone();
     let app_for_task = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(window) = app_for_task.get_webview_window("main") {
-            let _ = window.navigate(url);
+            let result = window.navigate(url.clone());
+            #[cfg(not(all(debug_assertions, feature = "wdio")))]
+            let _ = result;
+            #[cfg(all(debug_assertions, feature = "wdio"))]
+            record_wdio_event(serde_json::json!({
+                "event": "host-navigation",
+                "url": url.as_str(),
+                "ok": result.is_ok()
+            }));
         }
     });
 }
@@ -1301,6 +1330,25 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             .inner_size(1200.0, 800.0)
             .visible(true)
             .center()
+            .on_page_load({
+                let state = Arc::clone(&state);
+                move |_window, payload| {
+                    let url = payload.url();
+                    let is_app_page = (url.scheme() == "http"
+                        && url.host_str() == Some("tauri.localhost"))
+                        || (url.scheme() == "tauri" && url.host_str() == Some("localhost"));
+                    if is_app_page {
+                        if let Ok(mut startup_url) = state.startup_url.lock() {
+                            *startup_url = Some(url.to_string());
+                        }
+                        #[cfg(all(debug_assertions, feature = "wdio"))]
+                        record_wdio_event(serde_json::json!({
+                            "event": "startup-page-loaded",
+                            "url": url.as_str()
+                        }));
+                    }
+                }
+            })
             .on_navigation({
                 let app = app.handle().clone();
                 let state = Arc::clone(&state);
@@ -1336,11 +1384,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 }
             })
             .build()?;
-    if let Ok(url) = startup_window.url() {
-        if let Ok(mut startup_url) = state.startup_url.lock() {
-            *startup_url = Some(url.to_string());
-        }
-    }
     let state_for_close = Arc::clone(&state);
     startup_window.on_window_event(move |event| match event {
         WindowEvent::CloseRequested { api, .. } => {
@@ -1409,8 +1452,8 @@ fn main() {
 mod tests {
     use super::{
         build_startup_diagnostics, bundled_node_relative_path, decide_navigation,
-        is_allowed_host_origin, parse_sidecar_message, DiagnosticCode, LifecycleSnapshot,
-        LifecycleState, NavigationDecision, RuntimeState, SidecarMessage,
+        is_allowed_host_origin, parse_loopback_address, parse_sidecar_message, DiagnosticCode,
+        LifecycleSnapshot, LifecycleState, NavigationDecision, RuntimeState, SidecarMessage,
     };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -1445,6 +1488,14 @@ mod tests {
         assert!(is_allowed_host_origin("http://127.0.0.1:1234/"));
         assert!(!is_allowed_host_origin("http://localhost:1234/"));
         assert!(!is_allowed_host_origin("https://127.0.0.1:1234/"));
+    }
+    /// 验证 sidecar 返回的规范 origin 尾斜杠不会破坏 TCP readiness 探测。
+    #[test]
+    fn parses_loopback_origin_with_trailing_slash() {
+        assert_eq!(
+            parse_loopback_address("http://127.0.0.1:1234/").unwrap(),
+            "127.0.0.1:1234".parse().unwrap()
+        );
     }
     /// 验证启动页、当前 Host 和外链导航边界。
     #[test]

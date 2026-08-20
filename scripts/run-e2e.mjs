@@ -4,12 +4,26 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { officialNodePath } from '../tests/e2e/support/paths.mjs'
 
-const scenarios = ['real-harness', 'delayed-success', 'retry', 'prolonged', 'crash-after-ready', 'stubborn-cleanup']
+const defaultScenarios = ['real-harness', 'delayed-success', 'retry', 'prolonged', 'crash-after-ready', 'stubborn-cleanup']
+
+/** 返回本次要运行的场景；默认执行完整门禁，本地诊断时可显式缩小范围。 */
+function selectedScenarios() {
+  const requested = process.env.DSH_E2E_SCENARIOS?.split(',').map(value => value.trim()).filter(Boolean)
+  if (!requested?.length) return defaultScenarios
+  const unknown = requested.filter(value => !defaultScenarios.includes(value))
+  if (unknown.length) throw new Error(`Unknown E2E scenarios: ${unknown.join(', ')}`)
+  return requested
+}
 
 /** 运行一条同步命令并把完整输出交给当前行为测试日志。 */
 function run(command, args, environment = process.env) {
-  const executable = process.platform === 'win32' && command === 'pnpm' ? 'pnpm.cmd' : command
-  const result = spawnSync(executable, args, { env: environment, stdio: 'inherit', shell: process.platform === 'win32' && executable.endsWith('.cmd') })
+  const pnpmEntry = environment.npm_execpath
+  if (command === 'pnpm' && !pnpmEntry) throw new Error('E2E runner must be run from a pnpm script')
+  const executable = command === 'pnpm' ? process.execPath : command
+  const commandArgs = command === 'pnpm'
+    ? [pnpmEntry, ...args]
+    : args
+  const result = spawnSync(executable, commandArgs, { env: environment, stdio: 'inherit', windowsHide: true })
   if (result.error) throw result.error
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} exited with status ${result.status}`)
 }
@@ -63,6 +77,7 @@ async function scenarioEnvironment(scenario) {
   const events = path.join(root, 'events.jsonl')
   const records = path.join(root, 'desktop-records.jsonl')
   const state = path.join(root, 'scenario-state.txt')
+  const crashTrigger = path.join(root, 'crash-trigger')
   const fixture = path.resolve('tests', 'e2e', 'fixtures', 'test-sidecar.mjs')
   await access(fixture)
   return {
@@ -73,6 +88,7 @@ async function scenarioEnvironment(scenario) {
     DSH_TEST_EVENTS: events,
     DSH_TEST_RECORD_FILE: records,
     DSH_TEST_STATE_FILE: state,
+    DSH_TEST_CRASH_TRIGGER: crashTrigger,
     DSH_TEST_RECORDS: records
   }
 }
@@ -80,7 +96,7 @@ async function scenarioEnvironment(scenario) {
 /** 依次运行每个真实桌面场景，并在 runner 退出后验收 sidecar 回收。 */
 async function main() {
   prepareApplication()
-  for (const scenario of scenarios) {
+  for (const scenario of selectedScenarios()) {
     const environment = await scenarioEnvironment(scenario)
     run('pnpm', ['exec', 'wdio', 'run', 'wdio.conf.ts'], environment)
     const events = await readEvents(environment.DSH_TEST_EVENTS)

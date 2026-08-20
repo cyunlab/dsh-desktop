@@ -6,6 +6,7 @@ import { createInterface } from 'node:readline'
 const scenario = process.env.DSH_TEST_SCENARIO ?? 'success'
 const eventsFile = process.env.DSH_TEST_EVENTS
 const stateFile = process.env.DSH_TEST_STATE_FILE
+const crashTrigger = process.env.DSH_TEST_CRASH_TRIGGER
 let server
 let child
 let stopping = false
@@ -133,6 +134,15 @@ async function nextAttempt() {
   return attempt
 }
 
+/** 等待 WebDriver 确认 Ready 页面后，由测试显式触发运行期崩溃。 */
+async function waitForCrashTrigger() {
+  if (!crashTrigger) throw new Error('DSH_TEST_CRASH_TRIGGER is required')
+  while (!stopping) {
+    if (await readFile(crashTrigger, 'utf8').then(() => true).catch(() => false)) return
+    await new Promise(resolve => { crashTimer = setTimeout(resolve, 100) })
+  }
+}
+
 /** 根据环境变量选择成功、失败、延迟、重试和崩溃测试场景。 */
 async function runScenario() {
   const attempt = await nextAttempt()
@@ -158,15 +168,11 @@ async function runScenario() {
   }
   await startServer()
   if (scenario === 'crash-after-ready') {
-    crashTimer = setTimeout(async () => {
+    void waitForCrashTrigger().then(async () => {
       await record('crashed', { origin })
-      if (server) {
-        await new Promise(resolve => server.close(resolve))
-        await record('server-closed', { origin })
-        server = undefined
-      }
+      // 模拟真正的宿主崩溃：不能等待 WebView 的持久 HTTP 连接优雅关闭。
       process.exit(17)
-    }, 1_000)
+    })
   }
 }
 
