@@ -26,21 +26,22 @@ describe('native build workflow contract', () => {
     expect(workflow).toContain('pnpm install --frozen-lockfile')
   })
 
-  it('passes one native target and disables implicit CI publishing', () => {
-    expect(workflow).toContain('pnpm package --${{ matrix.platform }} --${{ matrix.arch }} --publish never')
-    expect(workflow).not.toContain('pnpm package -- --')
+  it('builds the Tauri package through the public package command', () => {
+    expect(workflow).toContain('pnpm package')
+    expect(workflow).toContain('Build native Tauri package with the official Node sidecar')
+    expect(workflow).not.toContain('electron-builder')
   })
 
   it.each([
-    ['windows-2025', 'win', 'x64', 'exe'],
-    ['macos-15', 'mac', 'arm64', 'dmg'],
-    ['macos-15-intel', 'mac', 'x64', 'dmg'],
-    ['ubuntu-24.04', 'linux', 'x64', 'AppImage']
-  ])('builds %s natively', (runner, platform, arch, extension) => {
+    ['windows-2025', 'win', 'x64', 'nsis/*.exe'],
+    ['macos-15', 'mac', 'arm64', 'dmg/*.dmg'],
+    ['macos-15-intel', 'mac', 'x64', 'dmg/*.dmg'],
+    ['ubuntu-24.04', 'linux', 'x64', 'appimage/*.AppImage']
+  ])('builds %s natively', (runner, platform, arch, artifactPath) => {
     expect(workflow).toContain(`runner: ${runner}`)
     expect(workflow).toContain(`platform: ${platform}`)
     expect(workflow).toContain(`arch: ${arch}`)
-    expect(workflow).toContain(`extension: ${extension}`)
+    expect(workflow).toContain(`bundle/${artifactPath}`)
   })
 
   it('gates a draft-only tag release on all build jobs', () => {

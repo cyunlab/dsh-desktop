@@ -45,6 +45,10 @@ jobs:
       - name: Install frozen dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Install stable Rust toolchain
+        shell: bash
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
       - name: Create diagnostics directory
         shell: bash
         run: mkdir -p artifacts
@@ -70,7 +74,7 @@ jobs:
         shell: bash
         run: set -o pipefail; pnpm test:integration 2>&1 | tee artifacts/integration.log
 
-      - name: Run packaged Electron E2E tests
+      - name: Run packaged Tauri E2E tests
         id: e2e
         if: runner.os != 'Linux'
         continue-on-error: true
@@ -78,7 +82,7 @@ jobs:
         shell: bash
         run: set -o pipefail; pnpm test:e2e 2>&1 | tee artifacts/e2e.log
 
-      - name: Run packaged Electron E2E tests under Xvfb
+      - name: Run packaged Tauri E2E tests under Xvfb
         id: e2e_linux
         if: runner.os == 'Linux'
         continue-on-error: true
