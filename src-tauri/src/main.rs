@@ -1614,16 +1614,22 @@ fn activate_existing_window(app: &AppHandle) {
         let show_ok = window.show().is_ok();
         let focus_ok = window.set_focus().is_ok();
         #[cfg(all(debug_assertions, feature = "wdio"))]
-        record_wdio_event(serde_json::json!({
-            "event": "single-instance-activated",
-            "beforeMinimized": before_minimized,
-            "unminimizeOk": unminimize_ok,
-            "showOk": show_ok,
-            "focusOk": focus_ok,
-            "afterMinimized": window.is_minimized().unwrap_or(true),
-            "visible": window.is_visible().unwrap_or(false),
-            "focused": window.is_focused().unwrap_or(false)
-        }));
+        {
+            let observed_window = window.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(250));
+                record_wdio_event(serde_json::json!({
+                    "event": "single-instance-activated",
+                    "beforeMinimized": before_minimized,
+                    "unminimizeOk": unminimize_ok,
+                    "showOk": show_ok,
+                    "focusOk": focus_ok,
+                    "afterMinimized": observed_window.is_minimized().unwrap_or(true),
+                    "visible": observed_window.is_visible().unwrap_or(false),
+                    "focused": observed_window.is_focused().unwrap_or(false)
+                }));
+            });
+        }
         #[cfg(not(all(debug_assertions, feature = "wdio")))]
         let _ = (before_minimized, unminimize_ok, show_ok, focus_ok);
     }

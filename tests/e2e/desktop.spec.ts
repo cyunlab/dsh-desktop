@@ -41,6 +41,20 @@ async function waitForRealHarness(): Promise<string> {
   return browser.getUrl()
 }
 
+/** 通过真实用户点击触发 target=_blank 请求，兼容 WebKit 的脚本 popup 手势限制。 */
+async function requestPopup(url: string): Promise<void> {
+  await browser.execute((targetUrl: string) => {
+    document.querySelector('#dsh-e2e-popup-link')?.remove()
+    const link = document.createElement('a')
+    link.id = 'dsh-e2e-popup-link'
+    link.href = targetUrl
+    link.target = '_blank'
+    link.textContent = 'Open test popup'
+    document.body.appendChild(link)
+  }, url)
+  await $('#dsh-e2e-popup-link').click()
+}
+
 /** 读取 sidecar fixture 写入的结构化生命周期事件。 */
 async function readEvents(): Promise<readonly Record<string, unknown>[]> {
   const file = process.env.DSH_TEST_EVENTS
@@ -156,10 +170,10 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
   if (scenario === 'real-harness') {
     it('keeps external and non-http popup requests out of the Desktop WebView', async () => {
       const origin = await waitForRealHarness()
-      await browser.execute(() => window.open('https://example.com/dsh-e2e', '_blank'))
-      await browser.execute(() => window.open('file:///dsh-e2e-private', '_blank'))
-      await browser.execute(() => window.open('dsh-test://private', '_blank'))
-      await browser.execute(() => window.open('unknown-scheme://private', '_blank'))
+      await requestPopup('https://example.com/dsh-e2e')
+      await requestPopup('file:///dsh-e2e-private')
+      await requestPopup('dsh-test://private')
+      await requestPopup('unknown-scheme://private')
       const records = await waitForRecord('external-open')
       expect(records.filter(event => event.event === 'external-open')).toEqual([{ event: 'external-open', url: 'https://example.com/dsh-e2e' }])
       await browser.pause(500)
