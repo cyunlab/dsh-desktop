@@ -2,11 +2,14 @@ import { createInterface } from 'node:readline'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { arch, platform, tmpdir } from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
+import { createConnection } from 'node:net'
+import { execFile, spawn } from 'node:child_process'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { promisify } from 'node:util'
 import { getNodeTarget } from './ensure-node-sidecar.mjs'
 
 const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)))
+const execFileAsync = promisify(execFile)
 
 /** 从命令行读取可选的资源根目录和 sidecar 入口。 */
 function readOptions(argumentsList) {
@@ -96,9 +99,67 @@ function stopSidecar(child, lines, timeoutMilliseconds = 15_000) {
   })
 }
 
-/** 终止仍未退出的 sidecar，兼容 Windows 和 POSIX 的子进程 API。 */
-function forceTerminate(child) {
-  if (!child.killed) child.kill()
+/** 等待子进程确认退出，超时视为清理失败。 */
+export function waitForChildExit(child, timeoutMilliseconds = 10_000) {
+  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.removeListener('exit', onExit)
+      reject(new Error(`Node sidecar did not exit within ${timeoutMilliseconds}ms`))
+    }, timeoutMilliseconds)
+    /** 记录退出并清理计时器。 */
+    function onExit() {
+      clearTimeout(timer)
+      resolve()
+    }
+    child.once('exit', onExit)
+  })
+}
+
+/** 强制终止 sidecar 整棵进程树并等待父进程确认退出。 */
+export async function terminateProcessTree(child, timeoutMilliseconds = 10_000) {
+  if (child.pid === undefined) return
+  try {
+    if (platform() === 'win32') {
+      await execFileAsync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true })
+    } else {
+      process.kill(-child.pid, 'SIGKILL')
+    }
+  } catch (error) {
+    const alreadyExited = child.exitCode !== null || child.signalCode !== null
+      || (error instanceof Error && 'code' in error && error.code === 'ESRCH')
+    if (!alreadyExited) throw error
+  }
+  await waitForChildExit(child, timeoutMilliseconds)
+}
+
+/** 尝试连接 loopback listener，并确保 socket 总能关闭。 */
+function listenerAcceptsConnections(origin, timeoutMilliseconds = 300) {
+  const url = new URL(origin)
+  return new Promise(resolve => {
+    let settled = false
+    const socket = createConnection({ host: url.hostname, port: Number(url.port) })
+    /** 完成探测并销毁 socket。 */
+    function finish(value) {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(value)
+    }
+    socket.once('connect', () => finish(true))
+    socket.once('error', () => finish(false))
+    socket.setTimeout(timeoutMilliseconds, () => finish(false))
+  })
+}
+
+/** 等待 Harness listener 确认停止接受连接。 */
+export async function waitForListenerClosed(origin, timeoutMilliseconds = 10_000) {
+  const started = Date.now()
+  while (Date.now() - started < timeoutMilliseconds) {
+    if (!(await listenerAcceptsConnections(origin))) return
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  throw new Error(`Harness listener still accepts connections: ${new URL(origin).origin}`)
 }
 
 /** 用随项目下载的官方 Node 启动真实 Harness，并验证 loopback Web 响应。 */
@@ -113,29 +174,43 @@ async function runSmoke(options) {
     cwd: workDirectory,
     env: environment,
     stdio: ['pipe', 'pipe', 'pipe'],
+    detached: platform() !== 'win32',
     windowsHide: true
   })
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity })
   let stderr = ''
+  let readyOrigin
+  let cleanupConfirmed = false
   child.stderr.on('data', chunk => {
     stderr = `${stderr}${chunk}`.slice(-8_000)
   })
   try {
     const ready = await waitForReady(child, lines)
     if (typeof ready.origin !== 'string') throw new Error('Node sidecar ready message did not include an origin')
+    readyOrigin = ready.origin
     const response = await fetch(ready.origin)
     if (!response.ok) throw new Error(`Harness smoke request returned HTTP ${response.status}`)
     if (!response.headers.get('content-type')?.includes('text/html')) throw new Error('Harness smoke response was not HTML')
     child.stdin.write('{"type":"stop"}\n')
     await stopSidecar(child, lines)
+    await waitForListenerClosed(ready.origin)
+    cleanupConfirmed = true
     console.log(`Official Node + Harness smoke passed for ${target.resourceName}`)
   } catch (error) {
-    forceTerminate(child)
+    let cleanupError
+    try {
+      await terminateProcessTree(child)
+      if (readyOrigin) await waitForListenerClosed(readyOrigin)
+      cleanupConfirmed = true
+    } catch (failure) {
+      cleanupError = failure
+    }
     const detail = stderr.trim()
-    throw new Error((error instanceof Error ? error.message : String(error)) + (detail ? '\n' + detail : ''))
+    const cleanupDetail = cleanupError ? `\nCleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}` : ''
+    throw new Error((error instanceof Error ? error.message : String(error)) + (detail ? '\n' + detail : '') + cleanupDetail)
   } finally {
     lines.close()
-    await rm(workDirectory, { recursive: true, force: true })
+    if (cleanupConfirmed) await rm(workDirectory, { recursive: true, force: true })
   }
 }
 
@@ -144,4 +219,10 @@ async function main() {
   await runSmoke(readOptions(process.argv.slice(2)))
 }
 
-await main()
+/** 判断 smoke 脚本是否由 Node 直接执行。 */
+function isDirectEntry() {
+  return process.argv[1] !== undefined
+    && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url
+}
+
+if (isDirectEntry()) await main()

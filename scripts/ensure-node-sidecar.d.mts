@@ -20,6 +20,14 @@ export interface EnsureNodeSidecarOptions {
   readonly runtimePlatform?: string
   readonly runtimeArch?: string
   readonly fetchImpl?: typeof fetch
+  readonly lockOptions?: DirectoryLockOptions
+}
+
+/** 原子目录锁的测试和恢复阈值。 */
+export interface DirectoryLockOptions {
+  readonly retryMilliseconds?: number
+  readonly staleMilliseconds?: number
+  readonly timeoutMilliseconds?: number
 }
 
 /** 返回官方 Node 归档和资源布局。 */
@@ -42,3 +50,6 @@ export function sha256(file: string): Promise<string>
 
 /** 查找展开目录中的 Node 可执行文件。 */
 export function findExecutable(directory: string, relativeExecutable: string): Promise<string | undefined>
+
+/** 使用带陈旧锁恢复的原子目录锁执行任务。 */
+export function withDirectoryLock<T>(lockPath: string, action: () => Promise<T>, options?: DirectoryLockOptions): Promise<T>
