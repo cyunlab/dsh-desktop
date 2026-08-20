@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
-import { access, mkdir, mkdtemp, readFile, readdir, rename, rm, stat } from 'node:fs/promises'
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat } from 'node:fs/promises'
 import { homedir, platform, arch, tmpdir } from 'node:os'
 import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
@@ -71,7 +71,7 @@ async function findExecutable(directory, relativeExecutable) {
 async function ensure() {
   const selected = target()
   const destination = path.join(resourceRoot, selected.resourceName)
-  const executable = path.join(destination, selected.relativeExecutable)
+  const executable = path.join(destination, platform() === 'win32' ? 'node.exe' : 'node')
   try {
     await access(executable)
     console.log(`Node sidecar already present: ${executable}`)
@@ -93,6 +93,9 @@ async function ensure() {
     await rm(destination, { recursive: true, force: true })
     await mkdir(destination, { recursive: true })
     await execFileAsync('tar', ['-xf', archivePath, '-C', destination, '--strip-components=1'], { windowsHide: true })
+    const archiveExecutable = path.join(destination, selected.relativeExecutable)
+    if (archiveExecutable !== executable) await copyFile(archiveExecutable, executable)
+    if (platform() !== 'win32') await chmod(executable, 0o755)
     await stat(executable)
     console.log(`Installed Node ${NODE_VERSION} sidecar: ${executable}`)
   } finally {

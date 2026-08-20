@@ -11,62 +11,111 @@ pub trait ProcessControl: Send + Sync {
     /// 请求被管理进程优雅地停止。
     fn request_graceful_stop(&self) -> Result<(), String>;
 
-    /// 检查被管理进程是否已经退出。
+    /// 检查直接子进程和拥有的进程树是否已经全部退出。
     fn has_exited(&self) -> Result<bool, String>;
 
     /// 强制终止被管理进程以及它拥有的整个进程树。
     fn force_kill_tree(&self) -> Result<(), String>;
 
-    /// 等待并回收被管理进程的退出句柄。
+    /// 回收已经确认退出的直接子进程句柄。
     fn reap(&self) -> Result<(), String>;
 }
 
 /// 描述优雅停止或强制回收的最终结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopOutcome {
-    /// 进程在宽限期内自行退出。
+    /// 进程树在宽限期内自行退出。
     Graceful,
-    /// 进程在宽限期后被强制终止并回收。
+    /// 进程树在宽限期后被强制终止并确认退出。
     Forced,
 }
 
-/// 先优雅停止、再强制终止整个进程树，并在返回前等待和回收子进程。
-pub fn stop_process(process: &dyn ProcessControl, graceful_timeout: Duration) -> StopOutcome {
-    let graceful_requested = process.request_graceful_stop().is_ok();
-    let deadline = Instant::now() + graceful_timeout;
+/// 在指定期限内轮询进程树是否已经全部退出。
+fn wait_until_exited(process: &dyn ProcessControl, timeout: Duration) -> Result<bool, String> {
+    let deadline = Instant::now() + timeout;
     loop {
-        if process.has_exited().unwrap_or(false) {
-            reap_until_complete(process);
-            return if graceful_requested {
-                StopOutcome::Graceful
-            } else {
-                StopOutcome::Forced
-            };
+        if process.has_exited()? {
+            return Ok(true);
         }
         if Instant::now() >= deadline {
-            break;
+            return Ok(false);
         }
-        thread::sleep(Duration::from_millis(25));
-    }
-
-    let mut force_requested_at: Option<Instant> = None;
-    loop {
-        if process.has_exited().unwrap_or(false) {
-            reap_until_complete(process);
-            return StopOutcome::Forced;
-        }
-        if force_requested_at.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
-            let _ = process.force_kill_tree();
-            force_requested_at = Some(Instant::now());
-        }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(25).min(timeout));
     }
 }
 
-/// 在生命周期函数返回前持续回收进程句柄，避免遗留僵尸进程或未完成的等待。
-fn reap_until_complete(process: &dyn ProcessControl) {
-    while process.reap().is_err() {
-        thread::sleep(Duration::from_millis(25));
+/// 先优雅停止、再强杀进程树，并在两个有界期限内确认退出和回收结果。
+pub fn stop_process(
+    process: &dyn ProcessControl,
+    graceful_timeout: Duration,
+    forced_timeout: Duration,
+) -> Result<StopOutcome, String> {
+    if process.request_graceful_stop().is_ok() && wait_until_exited(process, graceful_timeout)? {
+        process.reap()?;
+        return Ok(StopOutcome::Graceful);
+    }
+
+    process.force_kill_tree()?;
+    if !wait_until_exited(process, forced_timeout)? {
+        return Err("sidecar process tree did not exit after forced termination".into());
+    }
+    process.reap()?;
+    Ok(StopOutcome::Forced)
+}
+
+/// 确认旧进程树清理成功后才执行替代轮次启动回调。
+pub fn cleanup_then_restart(
+    process: Option<&dyn ProcessControl>,
+    graceful_timeout: Duration,
+    forced_timeout: Duration,
+    restart: impl FnOnce(),
+) -> Result<Option<StopOutcome>, String> {
+    let outcome = process
+        .map(|process| stop_process(process, graceful_timeout, forced_timeout))
+        .transpose()?;
+    restart();
+    Ok(outcome)
+}
+
+/// readiness 等待可能结束的安全分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessWaitError {
+    /// 当前启动轮次已被 Retry 或 shutdown 取消。
+    Cancelled,
+    /// sidecar 在 listener 可访问前已经退出。
+    ProcessExited,
+    /// 查询进程或 listener 状态时发生内部错误。
+    ProbeFailed,
+}
+
+/// 等待 listener 就绪，同时观察取消、子进程退出和 prolonged 状态。
+pub fn wait_for_readiness(
+    mut is_current: impl FnMut() -> bool,
+    mut child_exited: impl FnMut() -> Result<bool, String>,
+    mut listener_ready: impl FnMut() -> Result<bool, String>,
+    prolonged_after: Duration,
+    poll_interval: Duration,
+    mut on_prolonged: impl FnMut(),
+) -> Result<(), ReadinessWaitError> {
+    let started = Instant::now();
+    let mut prolonged = false;
+    loop {
+        if !is_current() {
+            return Err(ReadinessWaitError::Cancelled);
+        }
+        if child_exited().map_err(|_| ReadinessWaitError::ProbeFailed)? {
+            return Err(ReadinessWaitError::ProcessExited);
+        }
+        if listener_ready().map_err(|_| ReadinessWaitError::ProbeFailed)? {
+            return Ok(());
+        }
+        if !prolonged && started.elapsed() >= prolonged_after {
+            prolonged = true;
+            on_prolonged();
+        }
+        if !poll_interval.is_zero() {
+            thread::sleep(poll_interval);
+        }
     }
 }
 
@@ -76,7 +125,7 @@ pub enum SidecarEvent {
     /// Host 已经报告可访问的 origin。
     Ready(String),
     /// Host 在启动阶段报告了失败。
-    StartupFailed(String),
+    StartupFailed,
     /// Host 主动报告已停止。
     Stopped,
     /// 监督线程观察到 Host 进程退出。
@@ -91,7 +140,7 @@ pub enum LifecycleAction {
     /// 首次 ready，调用方可以导航到 Host。
     Ready(String),
     /// 当前轮次必须清理 sidecar 并展示失败状态。
-    Fail(String),
+    Fail,
 }
 
 /// 将 sidecar 事件与启动阶段和 ready 阶段的语义隔离开。
@@ -127,26 +176,20 @@ impl LifecycleMachine {
                 self.state = MachineState::Ready;
                 LifecycleAction::Ready(origin)
             }
-            (MachineState::Starting, SidecarEvent::StartupFailed(error)) => {
+            (
+                MachineState::Starting,
+                SidecarEvent::StartupFailed | SidecarEvent::Stopped | SidecarEvent::Exited,
+            ) => {
                 self.state = MachineState::Failed;
-                LifecycleAction::Fail(error)
-            }
-            (MachineState::Starting, SidecarEvent::Stopped) => {
-                self.state = MachineState::Failed;
-                LifecycleAction::Fail("Host stopped before becoming ready".into())
-            }
-            (MachineState::Starting, SidecarEvent::Exited) => {
-                self.state = MachineState::Failed;
-                LifecycleAction::Fail("Host exited before becoming ready".into())
+                LifecycleAction::Fail
             }
             (MachineState::Ready, SidecarEvent::Ready(_)) => LifecycleAction::Ignore,
-            (MachineState::Ready, SidecarEvent::StartupFailed(error)) => {
+            (
+                MachineState::Ready,
+                SidecarEvent::StartupFailed | SidecarEvent::Stopped | SidecarEvent::Exited,
+            ) => {
                 self.state = MachineState::Failed;
-                LifecycleAction::Fail(error)
-            }
-            (MachineState::Ready, SidecarEvent::Stopped | SidecarEvent::Exited) => {
-                self.state = MachineState::Failed;
-                LifecycleAction::Fail("Host exited unexpectedly after becoming ready".into())
+                LifecycleAction::Fail
             }
             (MachineState::Failed, _) => LifecycleAction::Ignore,
         }
@@ -160,84 +203,81 @@ impl Default for LifecycleMachine {
     }
 }
 
-/// 测试用的可控 sidecar 事件源，允许覆盖启动和崩溃边界。
-#[cfg(test)]
-struct ControllableSidecar {
-    /// 按顺序返回的事件。
-    events: std::collections::VecDeque<SidecarEvent>,
-}
-
-#[cfg(test)]
-impl ControllableSidecar {
-    /// 创建由测试指定事件序列的 sidecar。
-    fn new(events: impl IntoIterator<Item = SidecarEvent>) -> Self {
-        Self {
-            events: events.into_iter().collect(),
-        }
-    }
-
-    /// 返回下一个可控事件，模拟 stdout 生命周期消息。
-    fn next_event(&mut self) -> Option<SidecarEvent> {
-        self.events.pop_front()
-    }
-}
-
-/// 测试用的进程树控制器，能够模拟优雅退出和顽固后代。
+/// 测试进程的内部状态。
 #[cfg(test)]
 #[derive(Default)]
-struct FakeProcess {
-    /// 是否收到优雅停止请求。
-    graceful_requested: Mutex<bool>,
-    /// 是否收到整棵树的强制终止请求。
-    force_requested: Mutex<bool>,
-    /// 是否模拟顽固的后代进程。
-    stubborn_descendants: bool,
+struct FakeProcessState {
     /// 是否已经退出。
-    exited: Mutex<bool>,
-    /// 是否已经回收句柄。
-    reaped: Mutex<bool>,
+    exited: bool,
+    /// 是否已经回收。
+    reaped: bool,
+}
+
+/// 测试用的可控进程树。
+#[cfg(test)]
+struct FakeProcess {
+    /// 是否拒绝优雅停止。
+    stubborn: bool,
+    /// 是否让强制终止返回错误。
+    force_error: bool,
+    /// 是否在强制终止后仍报告存活。
+    ignores_force: bool,
+    /// 可断言的调用顺序。
+    events: Arc<Mutex<Vec<&'static str>>>,
+    /// 当前模拟状态。
+    state: Mutex<FakeProcessState>,
 }
 
 #[cfg(test)]
 impl FakeProcess {
-    /// 创建一个可配置是否拒绝优雅退出的测试进程。
-    fn new(stubborn_descendants: bool) -> Arc<Self> {
+    /// 创建一个具有指定停止行为的测试进程。
+    fn new(stubborn: bool, force_error: bool, ignores_force: bool) -> Arc<Self> {
         Arc::new(Self {
-            stubborn_descendants,
-            ..Self::default()
+            stubborn,
+            force_error,
+            ignores_force,
+            events: Arc::new(Mutex::new(Vec::new())),
+            state: Mutex::new(FakeProcessState::default()),
         })
     }
 }
 
 #[cfg(test)]
 impl ProcessControl for FakeProcess {
-    /// 记录优雅停止请求，并让非顽固进程立即变为已退出。
+    /// 记录优雅停止，并让普通进程立即退出。
     fn request_graceful_stop(&self) -> Result<(), String> {
-        *self.graceful_requested.lock().unwrap() = true;
-        if !self.stubborn_descendants {
-            *self.exited.lock().unwrap() = true;
+        self.events.lock().unwrap().push("graceful");
+        if !self.stubborn {
+            self.state.lock().unwrap().exited = true;
         }
         Ok(())
     }
 
-    /// 返回测试进程的退出状态。
+    /// 返回测试进程树是否全部退出。
     fn has_exited(&self) -> Result<bool, String> {
-        Ok(*self.exited.lock().unwrap())
+        Ok(self.state.lock().unwrap().exited)
     }
 
-    /// 记录强制终止整棵树，并标记进程退出。
+    /// 记录强杀请求并按配置返回结果。
     fn force_kill_tree(&self) -> Result<(), String> {
-        *self.force_requested.lock().unwrap() = true;
-        *self.exited.lock().unwrap() = true;
+        self.events.lock().unwrap().push("force");
+        if self.force_error {
+            return Err("forced termination failed".into());
+        }
+        if !self.ignores_force {
+            self.state.lock().unwrap().exited = true;
+        }
         Ok(())
     }
 
-    /// 只有已退出的测试进程才允许被回收。
+    /// 记录已经确认退出后的回收动作。
     fn reap(&self) -> Result<(), String> {
-        if !*self.exited.lock().unwrap() {
+        self.events.lock().unwrap().push("reap");
+        let mut state = self.state.lock().unwrap();
+        if !state.exited {
             return Err("process is still running".into());
         }
-        *self.reaped.lock().unwrap() = true;
+        state.reaped = true;
         Ok(())
     }
 }
@@ -245,85 +285,136 @@ impl ProcessControl for FakeProcess {
 #[cfg(test)]
 mod tests {
     use super::{
-        stop_process, ControllableSidecar, FakeProcess, LifecycleAction, LifecycleMachine,
-        SidecarEvent, StopOutcome,
+        cleanup_then_restart, stop_process, wait_for_readiness, FakeProcess, LifecycleAction,
+        LifecycleMachine, ReadinessWaitError, SidecarEvent, StopOutcome,
     };
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     /// 验证启动失败事件会进入失败动作并忽略迟到事件。
     #[test]
     fn startup_failure_is_terminal_for_attempt() {
-        let mut source = ControllableSidecar::new([
-            SidecarEvent::StartupFailed("missing dependency".into()),
-            SidecarEvent::Ready("http://127.0.0.1:1234/".into()),
-        ]);
         let mut machine = LifecycleMachine::new();
         assert_eq!(
-            machine.observe(source.next_event().unwrap()),
-            LifecycleAction::Fail("missing dependency".into())
+            machine.observe(SidecarEvent::StartupFailed),
+            LifecycleAction::Fail
         );
         assert_eq!(
-            machine.observe(source.next_event().unwrap()),
+            machine.observe(SidecarEvent::Ready("http://127.0.0.1:1234/".into())),
             LifecycleAction::Ignore
         );
     }
 
-    /// 验证没有事件的延迟启动不会伪造 ready，随后真实 ready 才允许导航。
-    #[test]
-    fn delayed_readiness_waits_until_ready() {
-        let mut source = ControllableSidecar::new([]);
-        let mut machine = LifecycleMachine::new();
-        assert!(source.next_event().is_none());
-        source
-            .events
-            .push_back(SidecarEvent::Ready("http://127.0.0.1:1234/".into()));
-        assert_eq!(
-            machine.observe(source.next_event().unwrap()),
-            LifecycleAction::Ready("http://127.0.0.1:1234/".into())
-        );
-    }
-
-    /// 验证 ready 后的进程退出被识别为崩溃，而不是正常停止。
+    /// 验证 ready 后的进程退出被识别为失败。
     #[test]
     fn crash_after_ready_returns_failure() {
-        let mut source = ControllableSidecar::new([
-            SidecarEvent::Ready("http://127.0.0.1:1234/".into()),
-            SidecarEvent::Exited,
-        ]);
         let mut machine = LifecycleMachine::new();
         assert!(matches!(
-            machine.observe(source.next_event().unwrap()),
+            machine.observe(SidecarEvent::Ready("http://127.0.0.1:1234/".into())),
             LifecycleAction::Ready(_)
         ));
-        assert_eq!(
-            machine.observe(source.next_event().unwrap()),
-            LifecycleAction::Fail("Host exited unexpectedly after becoming ready".into())
-        );
+        assert_eq!(machine.observe(SidecarEvent::Exited), LifecycleAction::Fail);
     }
 
-    /// 验证普通 sidecar 会优雅退出并在 stop 返回前完成回收。
+    /// 验证普通 sidecar 会优雅退出并在返回前完成回收。
     #[test]
     fn graceful_stop_waits_and_reaps() {
-        let process = FakeProcess::new(false);
+        let process = FakeProcess::new(false, false, false);
         assert_eq!(
-            stop_process(process.as_ref(), Duration::from_millis(100)),
-            StopOutcome::Graceful
+            stop_process(
+                process.as_ref(),
+                Duration::from_millis(10),
+                Duration::from_millis(10)
+            ),
+            Ok(StopOutcome::Graceful)
         );
-        assert!(*process.graceful_requested.lock().unwrap());
-        assert!(!*process.force_requested.lock().unwrap());
-        assert!(*process.reaped.lock().unwrap());
+        assert_eq!(*process.events.lock().unwrap(), ["graceful", "reap"]);
     }
 
-    /// 验证顽固后代会触发整棵进程树强杀，并且不会提前返回。
+    /// 验证顽固后代会被强杀并在返回前完成回收。
     #[test]
     fn stubborn_descendants_are_force_killed_and_reaped() {
-        let process = FakeProcess::new(true);
+        let process = FakeProcess::new(true, false, false);
         assert_eq!(
-            stop_process(process.as_ref(), Duration::from_millis(1)),
-            StopOutcome::Forced
+            stop_process(process.as_ref(), Duration::ZERO, Duration::from_millis(10)),
+            Ok(StopOutcome::Forced)
         );
-        assert!(*process.graceful_requested.lock().unwrap());
-        assert!(*process.force_requested.lock().unwrap());
-        assert!(*process.reaped.lock().unwrap());
+        assert_eq!(
+            *process.events.lock().unwrap(),
+            ["graceful", "force", "reap"]
+        );
+    }
+
+    /// 验证强杀错误会立即传播且不会进入无界等待。
+    #[test]
+    fn force_kill_error_is_propagated() {
+        let process = FakeProcess::new(true, true, false);
+        assert!(stop_process(process.as_ref(), Duration::ZERO, Duration::ZERO).is_err());
+        assert_eq!(*process.events.lock().unwrap(), ["graceful", "force"]);
+    }
+
+    /// 验证强杀后仍存活会在确认期限结束后返回错误。
+    #[test]
+    fn post_kill_confirmation_is_bounded() {
+        let process = FakeProcess::new(true, false, true);
+        assert!(stop_process(process.as_ref(), Duration::ZERO, Duration::ZERO).is_err());
+        assert_eq!(*process.events.lock().unwrap(), ["graceful", "force"]);
+    }
+
+    /// 验证 Retry 只有在旧进程回收完成后才执行替代启动。
+    #[test]
+    fn retry_starts_only_after_confirmed_cleanup() {
+        let process = FakeProcess::new(true, false, false);
+        let events = Arc::clone(&process.events);
+        cleanup_then_restart(
+            Some(process.as_ref()),
+            Duration::ZERO,
+            Duration::from_millis(10),
+            move || events.lock().unwrap().push("restart"),
+        )
+        .unwrap();
+        assert_eq!(
+            *process.events.lock().unwrap(),
+            ["graceful", "force", "reap", "restart"]
+        );
+    }
+
+    /// 验证清理失败时不会执行替代启动。
+    #[test]
+    fn retry_does_not_start_when_cleanup_is_unconfirmed() {
+        let process = FakeProcess::new(true, true, false);
+        let restarted = Arc::new(Mutex::new(false));
+        let restarted_for_callback = Arc::clone(&restarted);
+        assert!(cleanup_then_restart(
+            Some(process.as_ref()),
+            Duration::ZERO,
+            Duration::ZERO,
+            move || *restarted_for_callback.lock().unwrap() = true,
+        )
+        .is_err());
+        assert!(!*restarted.lock().unwrap());
+    }
+
+    /// 验证 listener 等待会在 sidecar 崩溃后立即失败。
+    #[test]
+    fn crash_during_listener_wait_is_detected() {
+        let probes = Rc::new(Cell::new(0));
+        let probes_for_exit = Rc::clone(&probes);
+        let result = wait_for_readiness(
+            || true,
+            move || {
+                let current = probes_for_exit.get() + 1;
+                probes_for_exit.set(current);
+                Ok(current >= 2)
+            },
+            || Ok(false),
+            Duration::from_secs(30),
+            Duration::ZERO,
+            || {},
+        );
+        assert_eq!(result, Err(ReadinessWaitError::ProcessExited));
+        assert_eq!(probes.get(), 2);
     }
 }
