@@ -17,10 +17,13 @@ jobs:
         include:
           - name: Linux
             os: ubuntu-24.04
+            e2e-command: pnpm test:e2e:xvfb
           - name: macOS
             os: macos-14
+            e2e-command: pnpm test:e2e
           - name: Windows
             os: windows-2022
+            e2e-command: pnpm test:e2e
 
     steps:
       - name: Check out the pinned Harness source reference
@@ -65,6 +68,9 @@ jobs:
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
+      - name: Prove release builds cannot enable debug WDIO seams
+        run: pnpm test:e2e:release-guard
+
       - name: Create diagnostics directory
         shell: bash
         run: mkdir -p artifacts
@@ -104,25 +110,12 @@ jobs:
         shell: bash
         run: set -o pipefail; pnpm smoke:node-sidecar 2>&1 | tee artifacts/smoke.log
 
-      - name: Install tauri-driver for supported WebDriver platforms
-        if: runner.os != 'macOS' && hashFiles('tests/e2e/**') != ''
-        continue-on-error: true
-        timeout-minutes: 20
-        shell: bash
-        run: cargo install tauri-driver --locked 2>&1 | tee artifacts/tauri-driver.log
-
-      - name: Run Tauri WebDriver E2E when a checked-in suite exists
+      - name: Run embedded Tauri desktop E2E
         id: e2e
-        if: hashFiles('tests/e2e/**') != ''
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 45
         shell: bash
-        run: set -o pipefail; pnpm test:e2e 2>&1 | tee artifacts/e2e.log
-
-      - name: Keep the official Node smoke gate when no E2E suite is present
-        if: runner.os == 'macOS'
-        shell: bash
-        run: echo 'No checked-in Tauri E2E suite is present yet; the official Node + Harness smoke test remains the runtime gate. When tests/e2e is added, macOS uses the embedded Tauri WebDriver provider.'
+        run: set -o pipefail; ${{ matrix.e2e-command }} 2>&1 | tee artifacts/e2e.log
 
       - name: Verify the Harness submodule stayed unchanged
         id: harness_guard

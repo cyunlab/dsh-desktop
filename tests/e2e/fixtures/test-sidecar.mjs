@@ -11,6 +11,7 @@ let child
 let stopping = false
 let crashTimer
 let listenerTimer
+let stubborn = false
 
 /** 将测试生命周期事件写入独立文件，供 WebDriver 测试确认进程回收和单实例行为。 */
 async function record(event, details = {}) {
@@ -99,7 +100,7 @@ async function announceBeforeListener() {
     void listenServer(port).then(() => record('listener-started', { origin })).catch(async error => {
       await record('fixture-error', { message: String(error) })
     })
-  }, 1_200)
+  }, 120_000)
 }
 
 /** 终止测试 sidecar 的 HTTP 服务和附属进程，并发送 stopped 消息。 */
@@ -108,6 +109,7 @@ async function stop(exitCode = 0) {
   stopping = true
   if (crashTimer) clearTimeout(crashTimer)
   if (listenerTimer) clearTimeout(listenerTimer)
+  if (stubborn) { await record('stop-ignored', { pid: process.pid }); return }
   if (child && child.exitCode === null) {
     child.kill()
     await new Promise(resolve => child.once('exit', resolve))
@@ -134,17 +136,24 @@ async function nextAttempt() {
 /** 根据环境变量选择成功、失败、延迟、重试和崩溃测试场景。 */
 async function runScenario() {
   const attempt = await nextAttempt()
+  await record('fixture-started', { pid: process.pid, attempt })
+  if ((scenario === 'retry' && attempt === 1) || scenario === 'stubborn-cleanup') {
+    child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});process.on('SIGINT',()=>{});setInterval(()=>{},1000)"], { stdio: 'ignore', windowsHide: true })
+    stubborn = true
+    await record('descendant-spawned', { pid: child.pid, parentPid: process.pid, attempt })
+  }
   if (scenario === 'failure' || (scenario === 'retry' && attempt === 1)) {
     await record('startup-failed', { attempt })
     send({ type: 'startup-failed', error: { name: 'TestStartupError', message: `controlled failure (attempt ${attempt})` } })
     return
   }
   if (scenario === 'delayed-success') {
-    setTimeout(() => { void startServer() }, 15_000)
+    setTimeout(() => { void startServer() }, 10_000)
     return
   }
   if (scenario === 'prolonged') {
-    await announceBeforeListener()
+    if (attempt === 1) await announceBeforeListener()
+    else await startServer()
     return
   }
   await startServer()

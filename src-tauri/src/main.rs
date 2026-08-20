@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(all(not(debug_assertions), feature = "wdio"))]
+compile_error!("the wdio feature is test-only and cannot be enabled in release builds");
+
 mod lifecycle;
 
 use lifecycle::{
@@ -8,6 +11,8 @@ use lifecycle::{
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
+#[cfg(all(debug_assertions, feature = "wdio"))]
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -492,8 +497,14 @@ fn decide_navigation(
     let Ok(target) = raw_url.parse::<tauri::Url>() else {
         return NavigationDecision::Deny;
     };
+    if (target.scheme() == "http" && target.host_str() == Some("tauri.localhost"))
+        || (target.scheme() == "tauri" && target.host_str() == Some("localhost"))
+    {
+        return NavigationDecision::Allow;
+    }
     if host_origin.is_some_and(|origin| {
-        target.origin().ascii_serialization() == origin && target.scheme() == "http"
+        target.origin().ascii_serialization() == origin.trim_end_matches('/')
+            && target.scheme() == "http"
     }) {
         return NavigationDecision::Allow;
     }
@@ -565,6 +576,53 @@ fn resolve_node_path(resource_dir: &Path) -> Result<PathBuf, String> {
         "official Node sidecar is missing: {}",
         bundled.display()
     ))
+}
+
+/// 解析官方 sidecar 命令；可控测试替身只存在于 debug+wdio 构建。
+fn resolve_sidecar_command(resource_dir: &Path) -> Result<(PathBuf, PathBuf), DiagnosticCode> {
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    if let Some(raw_path) = std::env::var_os("DSH_TEST_SIDECAR").filter(|value| !value.is_empty()) {
+        let test_path = PathBuf::from(raw_path);
+        if !test_path.is_file() {
+            return Err(DiagnosticCode::BootstrapUnavailable);
+        }
+        return Ok((
+            resolve_node_path(resource_dir).map_err(|_| DiagnosticCode::NodeUnavailable)?,
+            test_path,
+        ));
+    }
+    let program = resolve_node_path(resource_dir).map_err(|_| DiagnosticCode::NodeUnavailable)?;
+    let script = if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist/sidecar/index.js")
+    } else {
+        resource_dir.join("dist/sidecar/index.js")
+    };
+    if !script.is_file() {
+        return Err(DiagnosticCode::BootstrapUnavailable);
+    }
+    Ok((program, script))
+}
+
+/// 仅在 debug+wdio 构建中追加结构化测试事件。
+#[cfg(all(debug_assertions, feature = "wdio"))]
+fn record_wdio_event(event: serde_json::Value) {
+    let Some(path) = std::env::var_os("DSH_TEST_RECORD_FILE").filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{event}");
+    }
+}
+
+/// 将允许的 HTTP(S) URL 交给系统；测试构建仅记录调用。
+fn open_external(app: &AppHandle, url: String) {
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    if std::env::var_os("DSH_TEST_RECORD_FILE").is_some() {
+        record_wdio_event(serde_json::json!({ "event": "external-open", "url": url }));
+        return;
+    }
+    let _ = app.opener().open_url(url, None::<String>);
 }
 
 /// 发布一份生命周期快照，并通知当前 Webview。
@@ -653,16 +711,7 @@ fn spawn_sidecar(
     if let Ok(mut status) = state.node_path_status.lock() {
         *status = node_path_status(&resource_dir).into();
     }
-    let node_path =
-        resolve_node_path(&resource_dir).map_err(|_| DiagnosticCode::NodeUnavailable)?;
-    let script = if cfg!(debug_assertions) {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist/sidecar/index.js")
-    } else {
-        resource_dir.join("dist/sidecar/index.js")
-    };
-    if !script.is_file() {
-        return Err(DiagnosticCode::BootstrapUnavailable);
-    }
+    let (node_path, script) = resolve_sidecar_command(&resource_dir)?;
     let harness_home = app
         .path()
         .app_data_dir()
@@ -681,6 +730,8 @@ fn spawn_sidecar(
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().map_err(|_| DiagnosticCode::SpawnFailed)?;
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    record_wdio_event(serde_json::json!({ "event": "sidecar-spawned", "pid": child.id() }));
     let pid = child.id();
     let ownership = match ProcessOwnership::attach(pid) {
         Ok(ownership) => ownership,
@@ -915,6 +966,10 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
                                 }
                                 return;
                             }
+                            #[cfg(all(debug_assertions, feature = "wdio"))]
+                            record_wdio_event(
+                                serde_json::json!({ "event": "host-ready", "origin": origin }),
+                            );
                             transition(&app, &state, LifecycleState::Ready, "Ready.");
                             navigate_to_host(&app, &origin);
                         }
@@ -1264,7 +1319,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     match decide_navigation(url.as_str(), &startup_url, host_origin.as_deref()) {
                         NavigationDecision::Allow => true,
                         NavigationDecision::External => {
-                            let _ = app.opener().open_url(url.to_string(), None::<String>);
+                            open_external(&app, url.to_string());
                             false
                         }
                         NavigationDecision::Deny => false,
@@ -1275,7 +1330,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let app = app.handle().clone();
                 move |url, _features| {
                     if url.scheme() == "http" || url.scheme() == "https" {
-                        let _ = app.opener().open_url(url.to_string(), None::<String>);
+                        open_external(&app, url.to_string());
                     }
                     tauri::webview::NewWindowResponse::Deny
                 }
@@ -1287,25 +1342,46 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let state_for_close = Arc::clone(&state);
-    startup_window.on_window_event(move |event| {
-        if let WindowEvent::CloseRequested { api, .. } = event {
+    startup_window.on_window_event(move |event| match event {
+        WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             request_shutdown(&app_handle, &state_for_close);
         }
+        WindowEvent::Destroyed => request_shutdown(&app_handle, &state_for_close),
+        _ => {}
     });
     start_attempt(app.handle(), &state);
     Ok(())
 }
 
+/// 恢复并聚焦已有单实例窗口，同时为测试记录可验证结果。
+fn activate_existing_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let before_minimized = window.is_minimized().unwrap_or(false);
+        let unminimize_ok = window.unminimize().is_ok();
+        let show_ok = window.show().is_ok();
+        let focus_ok = window.set_focus().is_ok();
+        #[cfg(all(debug_assertions, feature = "wdio"))]
+        record_wdio_event(serde_json::json!({
+            "event": "single-instance-activated",
+            "beforeMinimized": before_minimized,
+            "unminimizeOk": unminimize_ok,
+            "showOk": show_ok,
+            "focusOk": focus_ok,
+            "afterMinimized": window.is_minimized().unwrap_or(true),
+            "visible": window.is_visible().unwrap_or(false),
+            "focused": window.is_focused().unwrap_or(false)
+        }));
+        #[cfg(not(all(debug_assertions, feature = "wdio")))]
+        let _ = (before_minimized, unminimize_ok, show_ok, focus_ok);
+    }
+}
+
 /// 启动 Tauri 应用并安装单实例、外链和剪贴板插件。
 fn main() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            activate_existing_window(app);
         }))
         .plugin(
             tauri_plugin_opener::Builder::new()
@@ -1318,7 +1394,12 @@ fn main() {
             startup_retry,
             startup_copy_diagnostics,
             startup_reveal_logs
-        ])
+        ]);
+    #[cfg(feature = "wdio")]
+    let builder = builder
+        .plugin(tauri_plugin_wdio::init())
+        .plugin(tauri_plugin_wdio_webdriver::init());
+    builder
         .setup(setup)
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");

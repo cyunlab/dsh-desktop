@@ -56,10 +56,11 @@ describe('manual Desktop behavior workflow', () => {
     expect(contents).toContain('pnpm ensure:node-sidecar')
     expect(contents).toContain('pnpm build')
     expect(contents).toContain('pnpm smoke:node-sidecar 2>&1')
-    expect(contents).toContain("hashFiles('tests/e2e/**') != ''")
-    expect(contents).toContain('cargo install tauri-driver --locked')
-    expect(contents).toContain('embedded Tauri WebDriver provider')
-    expect(contents).toContain('pnpm test:e2e 2>&1')
+    expect(contents.match(/e2e-command: pnpm test:e2e$/gm)).toHaveLength(2)
+    expect(contents).toContain('pnpm test:e2e:xvfb')
+    expect(contents).toContain('${{ matrix.e2e-command }} 2>&1')
+    expect(contents).toContain('pnpm test:e2e:release-guard')
+    expect(contents).not.toContain('tauri-driver')
   })
 
   it('retains bounded diagnostics without building installer artifacts', async () => {
