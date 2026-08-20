@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, open, readdir, rm, stat } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, open, readdir, realpath, rm, stat } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
 import { execFile, spawn } from 'node:child_process'
 import { arch as hostArch, tmpdir } from 'node:os'
@@ -178,35 +178,108 @@ async function locateBundledRuntime(contentRoot, contract) {
   const nodeExecutable = contents.find(file => normalized(file).endsWith(nodeSuffix))
   const sidecarScript = contents.find(file => normalized(file).endsWith(sidecarSuffix))
   if (!nodeExecutable || !sidecarScript) throw new Error(`Bundled runtime files cannot be located in ${contract.label}`)
-  return { nodeExecutable, sidecarScript }
+  // macOS 的 /tmp 可能是指向 /private/tmp 的符号链接；Node ESM 会将入口 realpath 化，
+  // 因此这里必须把 argv 中的入口也 canonicalize，避免 sidecar 的 direct-entry 检查静默跳过。
+  return { nodeExecutable: await realpath(nodeExecutable), sidecarScript: await realpath(sidecarScript) }
 }
 
-/** 等待官方 Node sidecar 输出指定生命周期消息，并保留最后一段错误输出。 */
-function waitForSidecarMessage(child, lines, expected, timeoutMilliseconds = 90_000) {
-  return new Promise((resolve, reject) => {
-    let settled = false
-    const timer = setTimeout(() => finishReject(new Error(`Bundled sidecar did not report ${expected} within ${timeoutMilliseconds}ms`)), timeoutMilliseconds)
-    const finishResolve = value => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve(value)
+/** 创建可排队的 sidecar 生命周期读取器，避免 ready/stopped 同一 stdout chunk 时丢失后者。 */
+function createSidecarMessageReader(child, lines) {
+  const messages = []
+  const waiters = []
+  let terminalError
+  let terminalExitCode
+
+  /** 将已收到的消息交给最早匹配的生命周期等待者。 */
+  const dispatch = message => {
+    const waiterIndex = waiters.findIndex(waiter => waiter.expected === message.type || message.type === 'startup-failed')
+    if (waiterIndex < 0) {
+      messages.push(message)
+      return
     }
-    const finishReject = error => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
+    const [waiter] = waiters.splice(waiterIndex, 1)
+    clearTimeout(waiter.timer)
+    if (message.type === 'startup-failed') waiter.reject(new Error(`Bundled Harness startup failed: ${message.error?.message ?? 'unknown error'}`))
+    else waiter.resolve(message)
+  }
+  /** 解析 stdout 中的一行结构化消息；非 JSON 日志不影响生命周期等待。 */
+  const onLine = line => {
+    try { dispatch(JSON.parse(line)) } catch {}
+  }
+  /** 将 child spawn 错误广播给当前及后续生命周期等待。 */
+  const onError = error => {
+    terminalError = error
+    while (waiters.length > 0) {
+      const waiter = waiters.shift()
+      clearTimeout(waiter.timer)
+      waiter.reject(error)
+    }
+  }
+  /** child 无生命周期消息退出时必须失败，即使退出码是 0。 */
+  const onExit = code => {
+    terminalExitCode = code
+    while (waiters.length > 0) {
+      const waiter = waiters.shift()
+      clearTimeout(waiter.timer)
+      waiter.reject(new Error(`Bundled sidecar exited before ${waiter.expected} with code ${code ?? 'unknown'}`))
+    }
+  }
+  lines.on('line', onLine)
+  child.once('error', onError)
+  child.once('exit', onExit)
+
+  return {
+    /** 等待指定生命周期消息，同时消费已经缓冲的 stdout 行。 */
+    waitFor(expected, timeoutMilliseconds = 90_000) {
+      const messageIndex = messages.findIndex(message => message.type === expected || message.type === 'startup-failed')
+      if (messageIndex >= 0) {
+        const [message] = messages.splice(messageIndex, 1)
+        if (message.type === 'startup-failed') return Promise.reject(new Error(`Bundled Harness startup failed: ${message.error?.message ?? 'unknown error'}`))
+        return Promise.resolve(message)
+      }
+      if (terminalError) return Promise.reject(terminalError)
+      if (terminalExitCode !== undefined) return Promise.reject(new Error(`Bundled sidecar exited before ${expected} with code ${terminalExitCode ?? 'unknown'}`))
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const waiterIndex = waiters.findIndex(waiter => waiter.timer === timer)
+          if (waiterIndex >= 0) waiters.splice(waiterIndex, 1)
+          reject(new Error(`Bundled sidecar did not report ${expected} within ${timeoutMilliseconds}ms`))
+        }, timeoutMilliseconds)
+        waiters.push({ expected, resolve, reject, timer })
+      })
+    },
+    /** 释放 stdout 和 child 监听器，保证 verifier 本身不会留下引用。 */
+    dispose() {
+      lines.removeListener('line', onLine)
+      child.removeListener('error', onError)
+      child.removeListener('exit', onExit)
+      while (waiters.length > 0) {
+        const waiter = waiters.shift()
+        clearTimeout(waiter.timer)
+        waiter.reject(new Error('Bundled sidecar lifecycle reader was disposed'))
+      }
+    }
+  }
+}
+
+/** 等待控制消息真正写入 sidecar stdin，避免 stop 仍在缓冲时开始判断 child 退出。 */
+function writeSidecarControlMessage(child, message) {
+  return new Promise((resolve, reject) => {
+    const input = child.stdin
+    if (!input || input.destroyed || input.writableEnded) {
+      reject(new Error('Bundled sidecar stdin is unavailable'))
+      return
+    }
+    /** 处理 stdin 管道在写回调前关闭的情况。 */
+    const onError = error => {
+      input.removeListener('error', onError)
       reject(error)
     }
-    lines.on('line', line => {
-      let message
-      try { message = JSON.parse(line) } catch { return }
-      if (message.type === expected) finishResolve(message)
-      else if (message.type === 'startup-failed') finishReject(new Error(`Bundled Harness startup failed: ${message.error?.message ?? 'unknown error'}`))
-    })
-    child.once('error', finishReject)
-    child.once('exit', code => {
-      if (!settled) finishReject(new Error(`Bundled sidecar exited before ${expected} with code ${code ?? 'unknown'}`))
+    input.once('error', onError)
+    input.write(`${JSON.stringify(message)}\n`, error => {
+      input.removeListener('error', onError)
+      if (error) reject(error)
+      else resolve()
     })
   })
 }
@@ -215,7 +288,7 @@ function waitForSidecarMessage(child, lines, expected, timeoutMilliseconds = 90_
 export async function probeBundledRuntime(contentRoot, platformName, runtimeArch = hostArch()) {
   const contract = artifactContract(platformName, runtimeArch)
   const { nodeExecutable, sidecarScript } = await locateBundledRuntime(contentRoot, contract)
-  const workDirectory = await mkdtemp(path.join(tmpdir(), 'dsh-artifact-runtime-probe-'))
+  const workDirectory = await realpath(await mkdtemp(path.join(tmpdir(), 'dsh-artifact-runtime-probe-')))
   const environment = { ...process.env, DSH_HOME: path.join(workDirectory, 'harness-home') }
   delete environment.DSH_NODE_PATH
   for (const name of Object.keys(environment)) {
@@ -229,34 +302,71 @@ export async function probeBundledRuntime(contentRoot, platformName, runtimeArch
     windowsHide: true
   })
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity })
+  const protocol = createSidecarMessageReader(child, lines)
   let stderr = ''
   let origin
+  let cleanupConfirmed = false
   child.stderr.on('data', chunk => { stderr = `${stderr}${chunk}`.slice(-8_000) })
   try {
-    const ready = await waitForSidecarMessage(child, lines, 'ready')
+    const ready = await protocol.waitFor('ready')
     origin = ready.origin
     if (typeof origin !== 'string') throw new Error('Bundled sidecar ready message did not include an origin')
     const response = await fetch(origin)
     if (!response.ok) throw new Error(`Bundled Harness probe returned HTTP ${response.status}`)
     if (!response.headers.get('content-type')?.includes('text/html')) throw new Error('Bundled Harness probe did not return HTML')
-    child.stdin.write('{"type":"stop"}\n')
-    await waitForSidecarMessage(child, lines, 'stopped', 20_000)
+    await writeSidecarControlMessage(child, { type: 'stop' })
+    await protocol.waitFor('stopped', 20_000)
+    // stopped 已经确认进入退出路径，此时关闭 verifier 持有的写端，避免 stdin 管道延迟影响 reap。
+    if (!child.stdin.destroyed) child.stdin.end()
     await waitForChildExit(child, 20_000)
+    cleanupConfirmed = true
     await waitForListenerClosed(origin)
     console.log(`Verified packaged official Node + Harness runtime: ${contract.label}`)
   } catch (error) {
     const detail = stderr.trim()
-    try { await terminateProcessTree(child) } catch (cleanupError) {
+    try { await cleanupBundledChild(child) } catch (cleanupError) {
       throw new Error(`${error instanceof Error ? error.message : String(error)}\nCleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`)
     }
+    cleanupConfirmed = true
     if (origin) {
       try { await waitForListenerClosed(origin) } catch {}
     }
     throw new Error(`${error instanceof Error ? error.message : String(error)}${detail ? `\n${detail}` : ''}`)
   } finally {
+    protocol.dispose()
     lines.close()
-    await rm(workDirectory, { recursive: true, force: true })
+    // 进程树未确认退出时保留 cwd，避免删除仍被 child 使用的目录并掩盖清理失败。
+    if (cleanupConfirmed) await rm(workDirectory, { recursive: true, force: true })
   }
+}
+
+/** 在真实 DMG 挂载点内执行检查，并保证主流程或检查失败时都尝试卸载。 */
+export async function inspectMountedDmg(artifact, inspectionRoot, inspect, commandRunner = execFileAsync) {
+  const canonicalInspectionRoot = await realpath(inspectionRoot)
+  const mountPoint = path.join(canonicalInspectionRoot, 'mounted')
+  await mkdir(mountPoint)
+  let attachAttempted = false
+  let operationError
+  try {
+    attachAttempted = true
+    await commandRunner('hdiutil', ['attach', '-readonly', '-nobrowse', '-mountpoint', mountPoint, artifact])
+    await inspect(mountPoint)
+  } catch (error) {
+    operationError = error
+  }
+  let detachError
+  if (attachAttempted) {
+    try {
+      await commandRunner('hdiutil', ['detach', mountPoint])
+    } catch (error) {
+      detachError = error
+    }
+  }
+  if (operationError && detachError) {
+    throw new AggregateError([operationError, detachError], `DMG inspection failed and unmount failed: ${operationError instanceof Error ? operationError.message : String(operationError)}`)
+  }
+  if (operationError) throw operationError
+  if (detachError) throw detachError
 }
 
 /** 等待 child process 确认退出，防止产物验收留下 Harness。 */
@@ -266,6 +376,19 @@ function waitForChildExit(child, timeoutMilliseconds) {
     const timer = setTimeout(() => reject(new Error(`Bundled sidecar did not exit within ${timeoutMilliseconds}ms`)), timeoutMilliseconds)
     child.once('exit', () => { clearTimeout(timer); resolve() })
   })
+}
+
+/** 仅在 child 仍存活时终止进程树，避免 Windows 对已自然退出的 code 0 child 误报清理失败。 */
+async function cleanupBundledChild(child) {
+  if (child.exitCode === null && child.signalCode === null) {
+    try {
+      await terminateProcessTree(child)
+    } catch (error) {
+      // kill 与 exit 事件之间存在竞态；只有确认仍存活时才把清理错误暴露给验收结果。
+      if (child.exitCode === null && child.signalCode === null) throw error
+    }
+  }
+  await waitForChildExit(child, 20_000)
 }
 
 /** 查找 GitHub Windows runner 或本机 PATH 中可用的 7-Zip。 */
@@ -304,16 +427,14 @@ async function verifyInspectableContainer(artifact, contract) {
       await execFileAsync(artifact, ['--appimage-extract'], { cwd: inspectionRoot })
       contentRoot = path.join(inspectionRoot, 'squashfs-root')
     } else {
-      contentRoot = path.join(inspectionRoot, 'mounted')
-      await mkdir(contentRoot)
-      await execFileAsync('hdiutil', ['attach', '-readonly', '-nobrowse', '-mountpoint', contentRoot, artifact])
+      await inspectMountedDmg(artifact, inspectionRoot, async mountedRoot => {
+        await verifyExtractedBundleContents(mountedRoot, contract.platformName, contract.architecture === 'aarch64' ? 'arm64' : 'x64')
+        await probeBundledRuntime(mountedRoot, contract.platformName, contract.architecture === 'aarch64' ? 'arm64' : 'x64')
+      })
+      return
     }
-    try {
-      await verifyExtractedBundleContents(contentRoot, contract.platformName, contract.architecture === 'aarch64' ? 'arm64' : 'x64')
-      await probeBundledRuntime(contentRoot, contract.platformName, contract.architecture === 'aarch64' ? 'arm64' : 'x64')
-    } finally {
-      if (contract.platformName === 'mac') await execFileAsync('hdiutil', ['detach', contentRoot])
-    }
+    await verifyExtractedBundleContents(contentRoot, contract.platformName, contract.architecture === 'aarch64' ? 'arm64' : 'x64')
+    await probeBundledRuntime(contentRoot, contract.platformName, contract.architecture === 'aarch64' ? 'arm64' : 'x64')
   } finally {
     await rm(inspectionRoot, { recursive: true, force: true })
   }

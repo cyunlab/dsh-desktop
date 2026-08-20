@@ -20,5 +20,13 @@ export function verifyExtractedBundleContents(contentRoot: string, platformName:
 /** 使用解包后的官方 Node 启动真实 Harness 并验证其 loopback 生命周期。 */
 export function probeBundledRuntime(contentRoot: string, platformName: string, runtimeArch?: string): Promise<void>
 
+/** 在真实 DMG 挂载点内执行检查，并在异常路径也确认卸载命令已发出。 */
+export function inspectMountedDmg(
+  artifact: string,
+  inspectionRoot: string,
+  inspect: (mountPoint: string) => Promise<void>,
+  commandRunner?: (file: string, args: string[]) => Promise<unknown>
+): Promise<void>
+
 /** 验证 Tauri 产物、架构和资源。 */
 export function verifyTauriArtifact(platformName: string, options?: VerifyTauriArtifactOptions): Promise<string>
