@@ -228,10 +228,10 @@ fn classify_exit(
     current_generation: u64,
     requested_generation: Option<u64>,
 ) -> ExitReason {
-    if process_generation != current_generation {
-        ExitReason::StaleGeneration
-    } else if requested_generation == Some(process_generation) {
+    if requested_generation == Some(process_generation) {
         ExitReason::Requested
+    } else if process_generation != current_generation {
+        ExitReason::StaleGeneration
     } else {
         ExitReason::Unexpected
     }
@@ -628,12 +628,10 @@ impl ProcessControl for CliProcess {
             self.try_exit(current_generation)?;
             return Ok(());
         }
+        self.requested_generation
+            .store(self.generation, Ordering::Release);
         #[cfg(unix)]
         {
-            if current_generation == self.generation {
-                self.requested_generation
-                    .store(current_generation, Ordering::Release);
-            }
             let pid = child.id() as i32;
             let result = unsafe { libc::kill(pid, libc::SIGTERM) };
             if result == 0 {
@@ -651,14 +649,6 @@ impl ProcessControl for CliProcess {
                 }
                 Ok(())
             } else {
-                if current_generation == self.generation {
-                    let _ = self.requested_generation.compare_exchange(
-                        current_generation,
-                        0,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
-                }
                 Err(format!("failed to signal CLI leader {pid}: {error}"))
             }
         }
@@ -706,22 +696,52 @@ mod tests {
         classify_exit, preflight_address, prepend_node_path, resolve_dsh_cli_entry,
         spawn_owned_command, CliCommandPlan, ExitReason, SupervisorError, HOST_ADDRESS,
     };
-    #[cfg(unix)]
-    use crate::lifecycle::StopOutcome;
+    use crate::lifecycle::{stop_process, ProcessControl, StopOutcome};
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io;
     use std::net::{Ipv4Addr, TcpListener};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    #[cfg(unix)]
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::thread;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(unix)]
     static HELPER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    /// 模拟平台优雅信号尚不可用、只能进入强制清理的 owned process。
+    struct FailingGracefulProcess {
+        process_generation: u64,
+        requested_generation: AtomicU64,
+        exited: AtomicBool,
+    }
+
+    impl ProcessControl for FailingGracefulProcess {
+        /// 登记 owned stop 后模拟平台优雅请求失败。
+        fn request_graceful_stop(&self, _current_generation: u64) -> Result<(), String> {
+            self.requested_generation
+                .store(self.process_generation, Ordering::Release);
+            Err("graceful request unavailable".into())
+        }
+
+        /// 返回强制清理是否已经令测试进程退出。
+        fn has_exited(&self) -> Result<bool, String> {
+            Ok(self.exited.load(Ordering::Acquire))
+        }
+
+        /// 模拟 Job 或进程组强制回收成功。
+        fn force_kill_tree(&self) -> Result<(), String> {
+            self.exited.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        /// 测试进程无需持有真实系统句柄。
+        fn reap(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
 
     /// POSIX helper 的信号处理器只设置原子标志，实际清理留在普通控制流。
     #[cfg(unix)]
@@ -846,9 +866,32 @@ mod tests {
     #[test]
     fn classifies_exit_against_owned_generation() {
         assert_eq!(classify_exit(7, 7, Some(7)), ExitReason::Requested);
+        assert_eq!(classify_exit(7, 8, Some(7)), ExitReason::Requested);
         assert_eq!(classify_exit(7, 8, None), ExitReason::StaleGeneration);
         assert_eq!(classify_exit(7, 7, None), ExitReason::Unexpected);
         assert_eq!(classify_exit(7, 8, Some(8)), ExitReason::StaleGeneration);
+    }
+
+    /// 验证优雅请求失败并转入强制清理时仍保留 owned Requested 语义。
+    #[test]
+    fn graceful_request_failure_then_forced_cleanup_remains_requested() {
+        let process = FailingGracefulProcess {
+            process_generation: 7,
+            requested_generation: AtomicU64::new(0),
+            exited: AtomicBool::new(false),
+        };
+        assert_eq!(
+            stop_process(&process, 8, Duration::ZERO, Duration::ZERO),
+            Ok(StopOutcome::Forced)
+        );
+        assert_eq!(
+            classify_exit(
+                process.process_generation,
+                8,
+                Some(process.requested_generation.load(Ordering::Acquire)),
+            ),
+            ExitReason::Requested
+        );
     }
 
     /// 验证 PATH 缺失时仍能提供仅包含官方 Node 的有效值。
@@ -918,6 +961,19 @@ mod tests {
         panic!("CLI process did not exit");
     }
 
+    /// 只轮询并缓存真实 Child 状态，不提前冻结退出原因。
+    fn wait_for_unclassified_status(process: &super::CliProcess) {
+        for _ in 0..2_000 {
+            if process.observe_child_status().unwrap().is_some() {
+                assert_eq!(process.requested_generation.load(Ordering::Acquire), 0);
+                assert!(process.classified_reason.lock().unwrap().is_none());
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("CLI child status was not observable");
+    }
+
     /// 验证未被轮询的真实非零退出在随后 stop 时仍保持 unexpected。
     #[cfg(unix)]
     #[test]
@@ -928,7 +984,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let process = spawn_owned_command(command, 11, || Ok(())).unwrap();
-        thread::sleep(Duration::from_millis(100));
+        wait_for_unclassified_status(&process);
         let report = process
             .stop(11, Duration::from_secs(1), Duration::from_secs(1))
             .unwrap();
@@ -938,10 +994,10 @@ mod tests {
         assert_eq!(wait_for_exit(&process, 12).reason, ExitReason::Unexpected);
     }
 
-    /// 验证 generation 推进后的真实 stop seam 把旧进程退出分类为 stale。
+    /// 验证 generation 推进后 stop 仍存活的旧进程仍属于 owned requested。
     #[cfg(unix)]
     #[test]
-    fn stop_classifies_active_process_from_stale_generation() {
+    fn stop_requests_active_process_after_generation_advances() {
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", "exec sleep 60"])
@@ -951,7 +1007,26 @@ mod tests {
         let report = process
             .stop(13, Duration::from_secs(2), Duration::from_secs(1))
             .unwrap();
-        assert_eq!(report.exit.unwrap().reason, ExitReason::StaleGeneration);
+        assert_eq!(report.exit.unwrap().reason, ExitReason::Requested);
+    }
+
+    /// 验证未收到 stop 的旧进程在替代 generation 中首次观察为 stale。
+    #[cfg(unix)]
+    #[test]
+    fn stop_observes_prior_exit_as_stale_after_generation_advances() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exit 23"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let process = spawn_owned_command(command, 12, || Ok(())).unwrap();
+        wait_for_unclassified_status(&process);
+        let report = process
+            .stop(13, Duration::from_secs(1), Duration::from_secs(1))
+            .unwrap();
+        let exit = report.exit.unwrap();
+        assert_eq!(exit.status.code(), Some(23));
+        assert_eq!(exit.reason, ExitReason::StaleGeneration);
     }
 
     /// 子进程 helper 在 SIGTERM 后主动关闭 listener 和后代，模拟官方 CLI disposal。
