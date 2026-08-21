@@ -24,8 +24,8 @@ async function largestPngLayer(icnsPath: string) {
 }
 
 describe('Desktop icon assets', () => {
-  /** 验证旧式 ICNS 回退图层不预裁圆角，避免与系统蒙版叠加。 */
-  it('keeps the fallback macOS icon layer opaque and unmasked', async () => {
+  /** 验证 Dock 使用的 ICNS 保留透明四角，不会显示为不透明方块。 */
+  it('keeps transparent corners in the largest macOS icon layer', async () => {
     const layer = await largestPngLayer(path.join(root, 'src-tauri/icons/icon.icns'))
     const { data, info } = await sharp(layer).ensureAlpha().raw().toBuffer({ resolveWithObject: true })
     /** 返回指定像素的 alpha 通道。 */
@@ -35,18 +35,6 @@ describe('Desktop icon assets', () => {
       alphaAt(info.width - 1, 0),
       alphaAt(0, info.height - 1),
       alphaAt(info.width - 1, info.height - 1)
-    ]).toEqual([255, 255, 255, 255])
-  })
-
-  /** 验证 macOS 26 使用 Icon Composer 方形图层并交由系统生成最终圆角。 */
-  it('ships an unmasked Icon Composer source for macOS 26', async () => {
-    const config = JSON.parse(await readFile(path.join(root, 'src-tauri/tauri.conf.json'), 'utf8'))
-    const manifest = JSON.parse(await readFile(path.join(root, 'src-tauri/icons/AppIcon.icon/icon.json'), 'utf8'))
-    const artwork = await readFile(path.join(root, 'src-tauri/icons/AppIcon.icon/Assets/Artwork.svg'), 'utf8')
-    expect(config.bundle.icon).toContain('icons/AppIcon.icon')
-    expect(config.bundle.macOS.minimumSystemVersion).toBe('26.0')
-    expect(manifest['supported-platforms'].squares).toContain('macOS')
-    expect(artwork).toContain('<rect x="126" y="107" width="1001" height="1001" fill="url(#frame)"/>')
-    expect(artwork).not.toContain('width="1042" height="1001" rx="240"')
+    ]).toEqual([0, 0, 0, 0])
   })
 })

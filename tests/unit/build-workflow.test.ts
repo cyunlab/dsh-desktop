@@ -47,8 +47,8 @@ describe('native build workflow contract', () => {
 
   it.each([
     ['windows-2025', 'win', 'x64', 'nsis/*.exe'],
-    ['macos-26', 'mac', 'arm64', 'dmg/*.dmg'],
-    ['macos-26-intel', 'mac', 'x64', 'dmg/*.dmg'],
+    ['macos-15', 'mac', 'arm64', 'dmg/*.dmg'],
+    ['macos-15-intel', 'mac', 'x64', 'dmg/*.dmg'],
     ['ubuntu-24.04', 'linux', 'x64', 'appimage/*.AppImage']
   ])('builds %s natively', (runner, platform, arch, artifactPath) => {
     expect(workflow).toContain(`runner: ${runner}`)
