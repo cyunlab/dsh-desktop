@@ -7,8 +7,8 @@ export const DIRECT_DSH_WEB_ARGS: readonly ['web', '--host', '127.0.0.1', '--por
 export interface ProcessTreeOwnership {
   readonly rootPid?: number
   readonly platformName: NodeJS.Platform
-  readonly queryWindowsProcesses: (timeoutMilliseconds?: number) => Promise<readonly { readonly pid: number; readonly parentPid: number; readonly creationDate: string }[]>
-  readonly knownProcessIdentities: Map<number, string>
+  readonly windowsController?: { request(command: 'STATUS' | 'STOP' | 'FORCE' | 'EXIT', timeoutMilliseconds: number): Promise<number> }
+  readonly controllerProcess?: ChildProcess
 }
 
 /** 串行执行固定端口探测。 */
@@ -17,11 +17,11 @@ export function withFixedPortProbeLock<T>(action: () => Promise<T>, options?: { 
 /** 等待子进程确认退出。 */
 export function waitForChildExit(child: ChildProcess, timeoutMilliseconds?: number): Promise<void>
 
-/** 从 Windows 进程表解析由稳定 root PID 拥有的仍存活进程。 */
-export function windowsOwnedProcessIds(rootPid: number, rootCreationDate: string, rows: readonly { readonly pid: number; readonly parentPid: number; readonly creationDate: string }[]): number[]
+/** 建立 POSIX PGID 或 Windows Job controller ownership。 */
+export function ownProcessTree(child: ChildProcess, options?: { readonly rootPid?: number; readonly platformName?: NodeJS.Platform; readonly windowsController?: ProcessTreeOwnership['windowsController']; readonly controllerProcess?: ChildProcess }): ProcessTreeOwnership
 
-/** 建立不依赖 leader 持续存活的进程树 ownership。 */
-export function ownProcessTree(child: ChildProcess, options?: { readonly platformName?: NodeJS.Platform; readonly queryWindowsProcesses?: ProcessTreeOwnership['queryWindowsProcesses']; readonly captureTimeoutMilliseconds?: number }): Promise<ProcessTreeOwnership>
+/** 构造保真传递 packaged executable、argv 与 cwd 的 Windows controller 参数。 */
+export function windowsJobControllerArguments(command: PackagedDshCliCommand, workDirectory: string): readonly string[]
 
 /** 查询 owned process tree 是否完全消失。 */
 export function processTreeHasExited(ownership: ProcessTreeOwnership, timeoutMilliseconds?: number): Promise<boolean>

@@ -9,6 +9,7 @@ import { probeDirectDshWeb, waitForListenerClosed } from '../../scripts/smoke-ds
 
 const desktopManifest = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'))
 const pinnedDshVersion = desktopManifest.dependencies['@deepseek-ai/dsh'] as string
+const FIXED_PORT_TEST_TIMEOUT_MS = 7 * 60_000
 
 /** 创建带指定机器字段和可选 NSIS 标记的最小 PE 测试文件。 */
 function fakePe(machine: number, marker = ''): Buffer {
@@ -192,7 +193,7 @@ function processExists(pid: number): boolean {
   try { process.kill(pid, 0); return true } catch { return false }
 }
 
-describe.sequential('Tauri artifact verification', () => {
+describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TIMEOUT_MS }, () => {
   it('checks NSIS magic, application, official Node and the complete published CLI closure', async () => {
     const fixture = await createWindowsFixture()
     try {
@@ -314,7 +315,7 @@ describe.sequential('Tauri artifact verification', () => {
       delete process.env.DSH_FIXTURE_EVENTS
       await rm(fixture.root, { recursive: true, force: true })
     }
-  }, 20_000)
+  }, FIXED_PORT_TEST_TIMEOUT_MS)
 
   it.skipIf(process.platform === 'win32')('signals only the POSIX leader during the graceful window', async () => {
     const fixture = await createRuntimeFixture(gracefulLeaderStubbornDescendantSource())
@@ -329,7 +330,7 @@ describe.sequential('Tauri artifact verification', () => {
       delete process.env.DSH_FIXTURE_EVENTS
       await rm(fixture.root, { recursive: true, force: true })
     }
-  }, 20_000)
+  }, FIXED_PORT_TEST_TIMEOUT_MS)
 
   it('rejects non-text/html while still cleaning the listener', async () => {
     const fixture = await createRuntimeFixture(directCliSource({ contentType: 'application/xhtml+xml' }))

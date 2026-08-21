@@ -1448,6 +1448,8 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::Duration;
+    #[cfg(unix)]
+    use std::time::Instant;
     use std::time::{SystemTime, UNIX_EPOCH};
     #[cfg(windows)]
     use windows_sys::Win32::Foundation::{
@@ -1933,17 +1935,32 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn posix_forces_stubborn_process_group_cleanup() {
+        let root = temporary_directory("posix-stubborn-helper");
+        let ready = root.join("ready");
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "trap '' TERM; sleep 60 & wait"])
+            .args([
+                "-c",
+                "trap '' TERM; sleep 60 & printf ready > \"$DSH_CLI_SUPERVISOR_READY\"; wait",
+            ])
+            .env("DSH_CLI_SUPERVISOR_READY", &ready)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let process = spawn_owned_command(command, 22, || Ok(())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "stubborn helper did not install TERM trap and spawn descendant"
+            );
+            thread::yield_now();
+        }
         let report = process
             .stop(22, Duration::ZERO, Duration::from_secs(2))
             .unwrap();
         assert_eq!(report.outcome, StopOutcome::Forced);
         assert_eq!(report.exit.unwrap().reason, ExitReason::Requested);
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// 持有 Windows 后代进程的独立等待句柄，避免 PID 复用影响清理断言。

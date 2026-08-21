@@ -1,17 +1,17 @@
-import { execFile, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { arch, platform, tmpdir } from 'node:os'
 import path from 'node:path'
 import { createConnection } from 'node:net'
 import { pathToFileURL } from 'node:url'
-import { promisify } from 'node:util'
 import { getNodeTarget, withDirectoryLock } from './ensure-official-node.mjs'
 import { packagedDshCliCommand } from './runtime-closure.mjs'
 
 const root = path.resolve(import.meta.dirname, '..')
-const execFileAsync = promisify(execFile)
 const MAX_HTML_BYTES = 64 * 1024
 const WINDOWS_COMMAND_TIMEOUT_MS = 2_000
+const WINDOWS_CONTROLLER_START_TIMEOUT_MS = 15_000
+const WINDOWS_JOB_CONTROLLER = path.join(root, 'scripts', 'windows-job-controller.ps1')
 export const FIXED_HOST_ORIGIN = 'http://127.0.0.1:3080/'
 export const DIRECT_DSH_WEB_ARGS = Object.freeze(['web', '--host', '127.0.0.1', '--port', '3080'])
 
@@ -58,52 +58,15 @@ export function waitForChildExit(child, timeoutMilliseconds = 10_000) {
   })
 }
 
-/** 查询 Windows 当前进程表，保留已退出 leader 的 ParentProcessId 关系。 */
-async function windowsProcessTable(timeoutMilliseconds = WINDOWS_COMMAND_TIMEOUT_MS) {
-  const script = 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate | ConvertTo-Json -Compress'
-  const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-    encoding: 'utf8',
-    windowsHide: true,
-    maxBuffer: 16 * 1024 * 1024,
-    timeout: Math.max(1, timeoutMilliseconds),
-    killSignal: 'SIGKILL'
-  })
-  const parsed = JSON.parse(stdout || '[]')
-  return (Array.isArray(parsed) ? parsed : [parsed]).map(row => ({
-    pid: Number(row.ProcessId),
-    parentPid: Number(row.ParentProcessId),
-    creationDate: String(row.CreationDate ?? '')
-  })).filter(row => Number.isInteger(row.pid) && Number.isInteger(row.parentPid) && row.creationDate.length > 0)
-}
-
-/** 以 PID+CreationDate 身份解析 Windows 进程树，并拒绝复用的 root PID。 */
-export function windowsOwnedProcessIds(rootPid, rootCreationDate, rows) {
-  const root = rows.find(row => row.pid === rootPid && row.creationDate === rootCreationDate)
-  if (!root) return []
-  const owned = new Map([[rootPid, rootCreationDate]])
-  let changed = true
-  while (changed) {
-    changed = false
-    for (const row of rows) {
-      const parentCreationDate = owned.get(row.parentPid)
-      const parent = rows.find(candidate => candidate.pid === row.parentPid && candidate.creationDate === parentCreationDate)
-      if (parent && !owned.has(row.pid)) {
-        owned.set(row.pid, row.creationDate)
-        changed = true
-      }
-    }
-  }
-  return [...owned.keys()]
-}
-
-/** 对任意 Windows 查询施加调用方剩余 deadline，测试 seam 也不得无限挂起。 */
-async function queryWindowsProcessesWithin(ownership, timeoutMilliseconds) {
+/** 为 Job controller 的单次命令施加 deadline，controller 卡死不得拖住验收。 */
+async function requestWindowsController(ownership, command, timeoutMilliseconds = WINDOWS_COMMAND_TIMEOUT_MS) {
+  if (!ownership.windowsController) throw new Error('Windows Job controller is unavailable')
   let timer
   try {
     return await Promise.race([
-      ownership.queryWindowsProcesses(timeoutMilliseconds),
+      ownership.windowsController.request(command, timeoutMilliseconds),
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`Windows process query exceeded ${timeoutMilliseconds}ms`)), timeoutMilliseconds)
+        timer = setTimeout(() => reject(new Error(`Windows Job controller ${command} exceeded ${timeoutMilliseconds}ms`)), timeoutMilliseconds)
       })
     ])
   } finally {
@@ -111,67 +74,164 @@ async function queryWindowsProcessesWithin(ownership, timeoutMilliseconds) {
   }
 }
 
-/** 刷新已确认的 Windows PID+CreationDate ownership；只从仍匹配身份的 parent 扩张。 */
-function absorbWindowsRows(ownership, rows) {
-  let changed = true
-  while (changed) {
-    changed = false
-    for (const row of rows) {
-      const parentCreationDate = ownership.knownProcessIdentities.get(row.parentPid)
-      const parentMatches = rows.some(candidate => candidate.pid === row.parentPid && candidate.creationDate === parentCreationDate)
-      if (parentMatches && !ownership.knownProcessIdentities.has(row.pid)) {
-        ownership.knownProcessIdentities.set(row.pid, row.creationDate)
-        changed = true
-      }
-    }
-  }
-  return rows.filter(row => ownership.knownProcessIdentities.get(row.pid) === row.creationDate)
-}
-
-/** 在 deadline 内查询并吸收 Windows 进程身份。 */
-async function refreshWindowsOwnership(ownership, timeoutMilliseconds) {
-  return absorbWindowsRows(ownership, await queryWindowsProcessesWithin(ownership, timeoutMilliseconds))
-}
-
-/** 建立 PID+CreationDate 绑定的跨平台进程树 ownership。 */
-export async function ownProcessTree(child, options = {}) {
-  const ownership = {
-    rootPid: Number.isInteger(child.pid) ? child.pid : undefined,
+/** 建立由原生 Job handle 持有的 Windows ownership，或 POSIX detached PGID ownership。 */
+export function ownProcessTree(child, options = {}) {
+  return Object.freeze({
+    rootPid: options.rootPid ?? (Number.isInteger(child.pid) ? child.pid : undefined),
     platformName: options.platformName ?? platform(),
-    queryWindowsProcesses: options.queryWindowsProcesses ?? windowsProcessTable,
-    knownProcessIdentities: new Map()
+    windowsController: options.windowsController,
+    controllerProcess: options.controllerProcess
+  })
+}
+
+/** 构造 Windows Job controller 参数，并保持 packaged executable、argv 与 cwd 原样可验证。 */
+export function windowsJobControllerArguments(command, workDirectory) {
+  return Object.freeze([
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    WINDOWS_JOB_CONTROLLER,
+    '-Executable',
+    command.executable,
+    '-ArgumentsBase64',
+    Buffer.from(JSON.stringify(command.args), 'utf8').toString('base64'),
+    '-WorkingDirectory',
+    workDirectory
+  ])
+}
+
+/** 将 Windows Job controller stdout 封装成带 request id 与 deadline 的行协议。 */
+function createWindowsControllerTransport(child) {
+  let buffer = ''
+  let nextRequestId = 1
+  let readySettled = false
+  let resolveReady
+  let rejectReady
+  const pending = new Map()
+  const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject })
+  /** 拒绝所有未完成请求，controller failure 必须显式进入 cleanup。 */
+  function rejectAll(error) {
+    if (!readySettled) {
+      readySettled = true
+      rejectReady(error)
+    }
+    for (const request of pending.values()) request.reject(error)
+    pending.clear()
   }
-  if (ownership.platformName === 'win32' && Number.isInteger(ownership.rootPid)) {
-    const deadline = Date.now() + (options.captureTimeoutMilliseconds ?? WINDOWS_COMMAND_TIMEOUT_MS)
-    while (Date.now() < deadline) {
-      const remaining = Math.max(1, deadline - Date.now())
-      const rows = await queryWindowsProcessesWithin(ownership, remaining)
-      const root = rows.find(row => row.pid === ownership.rootPid)
-      if (root) {
-        ownership.knownProcessIdentities.set(root.pid, root.creationDate)
-        absorbWindowsRows(ownership, rows)
-        break
+  /** 解析 controller 的 READY 或带 request id 的响应行。 */
+  function consumeLine(line) {
+    const readyMatch = /^READY (\d+)$/.exec(line)
+    if (readyMatch && !readySettled) {
+      readySettled = true
+      resolveReady(Number(readyMatch[1]))
+      return
+    }
+    const response = /^(\d+) (OK|ERROR)(?: (.*))?$/.exec(line)
+    if (!response) return
+    const request = pending.get(Number(response[1]))
+    if (!request) return
+    pending.delete(Number(response[1]))
+    clearTimeout(request.timer)
+    if (response[2] === 'ERROR') request.reject(new Error(response[3] || 'Windows Job controller failed'))
+    else request.resolve(Number(response[3] ?? 0))
+  }
+  child.stdout.setEncoding('utf8')
+  child.stdout.on('data', chunk => {
+    buffer += chunk
+    let newline
+    while ((newline = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, newline).trim()
+      buffer = buffer.slice(newline + 1)
+      if (line) consumeLine(line)
+    }
+  })
+  child.once('error', error => rejectAll(new Error(`Windows Job controller spawn failed: ${error.message}`)))
+  child.once('exit', (code, signal) => rejectAll(new Error(`Windows Job controller exited with ${code ?? signal ?? 'unknown'}`)))
+  return Object.freeze({
+    /** 等待 suspended root 已成功加入 Job 后才允许 verifier 继续。 */
+    async ready(timeoutMilliseconds) {
+      let timer
+      try {
+        return await Promise.race([
+          ready,
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Windows Job controller readiness timed out')), timeoutMilliseconds) })
+        ])
+      } finally {
+        clearTimeout(timer)
       }
-      await new Promise(resolve => setTimeout(resolve, Math.min(50, remaining)))
+    },
+    /** 向 controller 发一条命令并等待同 request id 的有界响应。 */
+    request(command, timeoutMilliseconds) {
+      return new Promise((resolve, reject) => {
+        const id = nextRequestId++
+        const timer = setTimeout(() => {
+          pending.delete(id)
+          reject(new Error(`Windows Job controller ${command} exceeded ${timeoutMilliseconds}ms`))
+        }, timeoutMilliseconds)
+        pending.set(id, { resolve, reject, timer })
+        child.stdin.write(`${id} ${command}\n`, error => {
+          if (!error) return
+          clearTimeout(timer)
+          pending.delete(id)
+          reject(error)
+        })
+      })
     }
-    if (!ownership.knownProcessIdentities.has(ownership.rootPid)) {
-      throw new Error(`Windows process identity unavailable for PID ${ownership.rootPid}`)
-    }
+  })
+}
+
+/** 直接启动 POSIX CLI，或让 Windows controller 在 suspended 状态下先绑定 Job。 */
+async function spawnOwnedCli(command, workDirectory) {
+  if (platform() !== 'win32') {
+    const child = spawn(command.executable, command.args, {
+      cwd: workDirectory,
+      env: command.environment,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
+      windowsHide: true
+    })
+    return { child, ownership: ownProcessTree(child) }
   }
-  return ownership
+  const controller = spawn('powershell.exe', windowsJobControllerArguments(command, workDirectory), {
+    cwd: workDirectory,
+    env: command.environment,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true
+  })
+  const transport = createWindowsControllerTransport(controller)
+  try {
+    const rootPid = await transport.ready(WINDOWS_CONTROLLER_START_TIMEOUT_MS)
+    return {
+      child: controller,
+      ownership: ownProcessTree(controller, {
+        rootPid,
+        platformName: 'win32',
+        windowsController: transport,
+        controllerProcess: controller
+      })
+    }
+  } catch (error) {
+    controller.kill('SIGKILL')
+    await waitForChildExit(controller, WINDOWS_COMMAND_TIMEOUT_MS).catch(() => {})
+    throw error
+  }
 }
 
 /** 返回 owned process group 或 Windows descendant 集是否已经完全消失。 */
 export async function processTreeHasExited(ownership, timeoutMilliseconds = WINDOWS_COMMAND_TIMEOUT_MS) {
   if (!Number.isInteger(ownership.rootPid)) return true
   if (ownership.platformName === 'win32') {
-    return (await refreshWindowsOwnership(ownership, timeoutMilliseconds)).length === 0
+    if (ownership.controllerProcess?.exitCode != null || ownership.controllerProcess?.signalCode != null) return true
+    return await requestWindowsController(ownership, 'STATUS', timeoutMilliseconds) === 0
   }
   try {
     process.kill(-ownership.rootPid, 0)
     return false
   } catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'ESRCH') return true
+    if (error instanceof Error && 'code' in error && error.code === 'EPERM') return false
     throw new Error(`Cannot inspect POSIX process group ${ownership.rootPid}: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
@@ -189,22 +249,11 @@ export async function waitForProcessTreeExit(ownership, timeoutMilliseconds = 10
 
 /** 强制终止 CLI 整棵进程树并验收 owned tree 消失。 */
 export async function terminateProcessTree(child, timeoutMilliseconds = 10_000, ownership = ownProcessTree(child)) {
-  ownership = await ownership
   if (child.pid === undefined) return
   const deadline = Date.now() + timeoutMilliseconds
   try {
     if (ownership.platformName === 'win32') {
-      const owned = (await refreshWindowsOwnership(ownership, Math.max(1, deadline - Date.now()))).reverse()
-      for (const processIdentity of owned) {
-        const remaining = Math.max(1, deadline - Date.now())
-        try {
-          await execFileAsync('taskkill.exe', ['/PID', String(processIdentity.pid), '/T', '/F'], {
-            windowsHide: true,
-            timeout: remaining,
-            killSignal: 'SIGKILL'
-          })
-        } catch {}
-      }
+      await requestWindowsController(ownership, 'FORCE', Math.max(1, deadline - Date.now()))
     } else {
       try {
         process.kill(-ownership.rootPid, 'SIGKILL')
@@ -213,12 +262,21 @@ export async function terminateProcessTree(child, timeoutMilliseconds = 10_000, 
       }
     }
   } catch (error) {
+    if (ownership.platformName === 'win32') {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      await waitForChildExit(child, Math.max(1, deadline - Date.now()))
+      return
+    }
+    const expectedTransition = error instanceof Error && 'code' in error
+      && (error.code === 'ESRCH' || error.code === 'EPERM')
     const alreadyExited = await processTreeHasExited(ownership).catch(() => false)
-      || (error instanceof Error && 'code' in error && error.code === 'ESRCH')
-    if (!alreadyExited) throw error
+    if (!alreadyExited && !expectedTransition) throw error
+  }
+  await waitForProcessTreeExit(ownership, Math.max(1, deadline - Date.now()))
+  if (ownership.platformName === 'win32' && child.exitCode === null && child.signalCode === null) {
+    await requestWindowsController(ownership, 'EXIT', Math.max(1, deadline - Date.now()))
   }
   await waitForChildExit(child, Math.max(1, deadline - Date.now()))
-  await waitForProcessTreeExit(ownership, Math.max(1, deadline - Date.now()))
 }
 
 /** 尝试连接 loopback listener，并确保 socket 总能关闭。 */
@@ -301,8 +359,11 @@ export async function waitForHtmlReadiness(child, options = {}) {
       if (child.exitCode !== null || child.signalCode !== null) {
         throw new Error(`Packaged dsh CLI exited before HTML readiness with ${child.exitCode ?? child.signalCode ?? 'unknown'}`)
       }
-      if (options.ownership?.platformName === 'win32') {
-        await refreshWindowsOwnership(options.ownership, Math.min(WINDOWS_COMMAND_TIMEOUT_MS, Math.max(1, timeoutMilliseconds - (Date.now() - started))))
+      if (options.ownership?.platformName === 'win32' && await processTreeHasExited(
+        options.ownership,
+        Math.min(WINDOWS_COMMAND_TIMEOUT_MS, Math.max(1, timeoutMilliseconds - (Date.now() - started)))
+      )) {
+        throw new Error('Packaged dsh CLI exited before HTML readiness with Windows Job active count 0')
       }
       try {
         const response = await fetch(origin, { redirect: 'manual', signal: AbortSignal.timeout(1_000) })
@@ -323,13 +384,7 @@ export async function waitForHtmlReadiness(child, options = {}) {
 async function stopCliProcess(child, ownership, timeoutMilliseconds = 8_000) {
   if (await processTreeHasExited(ownership)) return
   if (ownership.platformName === 'win32') {
-    try {
-      await execFileAsync('taskkill.exe', ['/PID', String(ownership.rootPid), '/T'], {
-        windowsHide: true,
-        timeout: Math.min(WINDOWS_COMMAND_TIMEOUT_MS, timeoutMilliseconds),
-        killSignal: 'SIGKILL'
-      })
-    } catch {}
+    await requestWindowsController(ownership, 'STOP', Math.min(WINDOWS_COMMAND_TIMEOUT_MS, timeoutMilliseconds))
   } else {
     try {
       process.kill(child.pid, 'SIGTERM')
@@ -340,7 +395,13 @@ async function stopCliProcess(child, ownership, timeoutMilliseconds = 8_000) {
     }
   }
   try {
-    await Promise.all([waitForChildExit(child, timeoutMilliseconds), waitForProcessTreeExit(ownership, timeoutMilliseconds)])
+    await waitForProcessTreeExit(ownership, timeoutMilliseconds)
+    if (ownership.platformName === 'win32' && child.exitCode === null && child.signalCode === null) {
+      await requestWindowsController(ownership, 'EXIT', WINDOWS_COMMAND_TIMEOUT_MS)
+      await waitForChildExit(child, WINDOWS_COMMAND_TIMEOUT_MS)
+    } else {
+      await waitForChildExit(child, timeoutMilliseconds)
+    }
   } catch {
     await terminateProcessTree(child, 10_000, ownership)
   }
@@ -367,17 +428,10 @@ export async function probeDirectDshWeb(options) {
       args: DIRECT_DSH_WEB_ARGS,
       environment
     })
-    const child = spawn(command.executable, command.args, {
-      cwd: workDirectory,
-      env: command.environment,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: platform() !== 'win32',
-      windowsHide: true
-    })
-    const ownership = await ownProcessTree(child)
+    const { child, ownership } = await spawnOwnedCli(command, workDirectory)
     let stderr = ''
     child.stderr.on('data', chunk => { stderr = `${stderr}${chunk}`.slice(-8_000) })
-    child.stdout.resume()
+    if (ownership.platformName !== 'win32') child.stdout.resume()
     let cleanupConfirmed = false
     try {
       const html = await waitForHtmlReadiness(child, { timeoutMilliseconds: options.timeoutMilliseconds, ownership })
