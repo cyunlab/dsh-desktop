@@ -2,6 +2,8 @@
 
 Status: accepted
 
+> ADR 0006 supersedes this ADR's Desktop-owned sidecar lifecycle protocol. The Tauri shell and packaged official Node runtime decisions remain accepted.
+
 ## Decision
 
 The Desktop product will migrate its native shell from Electron to Tauri. The Harness Host and all Harness plugins will run in a separately packaged, version-matched official Node.js executable (the Node sidecar). Tauri owns the application window and lifecycle; it does not run Harness code through its embedded runtime.

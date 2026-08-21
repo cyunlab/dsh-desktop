@@ -1,49 +1,58 @@
-# Tauri + 官方 Node sidecar 垂直切片
+# Tauri + official Node direct-CLI vertical slice
 
-Tauri 是唯一的 Desktop shell。Tauri Rust 进程只负责窗口和 sidecar 生命周期；Harness Host 与插件全部运行在随应用发布的官方 Node.js 进程中。
+Tauri is the only Desktop shell. The Rust process owns the controlled window and Desktop lifecycle. Harness Host and plugins run in a separately packaged official Node.js process through the pinned published `dsh` CLI.
 
 ```text
 Tauri Rust
-  └─ 官方 node(.exe) dist/sidecar/index.js
-       └─ 同一 Node 进程内启动 Harness Host
-            └─ loopback Web UI
+  └─ official node(.exe) @deepseek-ai/dsh/lib/bin.js
+       └─ dsh web --host 127.0.0.1 --port 3080
+            └─ loopback Web Client
 ```
 
-开发与打包模式默认都读取固定版本的 `resources/node/<platform-arch>/node(.exe)`，不会依赖 PATH 或用户机器上的 Node 安装。`DSH_NODE_PATH` 是唯一的显式覆盖入口。Rust 启动 sidecar 时会将解析出的 Node 所在目录置于该进程 `PATH` 的首位（Windows 会规范化 `PATH`/`Path` 大小写），因此插件 `spawn("node")` 也始终得到同一官方运行时。开发和构建命令会下载该固定版本，已存在且完整时不会重复下载。sidecar 的工作目录是 Tauri 应用数据目录，`DSH_HOME` 也指向该目录。
+Development and packaged modes resolve the same fixed Node version from `resources/node/<platform-arch>/node(.exe)` unless `DSH_NODE_PATH` explicitly overrides it. Desktop places that executable's directory first in the child PATH, provides the isolated Desktop Harness Home through `DSH_HOME`, and starts the CLI from a distinct Desktop-owned default working directory. The CLI otherwise inherits the parent environment.
 
-sidecar stdout 使用逐行 JSON 传输最小生命周期事件：`ready`、`startup-failed`、`stopped`、`stop-failed`。业务请求仍由 Harness Host 的 loopback HTTP/WebSocket 处理，不通过 Rust 复制一套业务协议。窗口关闭时 Rust 发送 `{"type":"stop"}`，等待有限时间后终止进程树。
+Desktop invokes the published CLI entry and does not import internal profile-launcher modules. The CLI owns the upstream `web` profile, profile and Home patches, presets, telemetry overlay, configuration reload, exception handling, and Harness disposal. The old Desktop JavaScript launcher and stdin/stdout JSON lifecycle protocol are removed.
 
-## 发布 runtime closure
+## Fixed Host origin and readiness
 
-`scripts/build.mjs` 会在生成 `dist/sidecar/index.js` 后，为当前目标平台执行一次 pnpm production install，并使用 hoisted 布局生成可移植的 `dist/node_modules`。安装包只携带这个已经物化的依赖树，不携带 pnpm store、workspace symlink、构建机路径或开发依赖；随包的 sidecar 因此可以由官方 Node 在没有仓库 `node_modules` 的安装目录中直接启动。依赖安装缓存位于被 `.gitignore` 忽略的 `node_modules/.dsh-runtime-closure/<platform>-<arch>`，锁文件或目标平台变化会使缓存失效。
+Desktop always passes `web --host 127.0.0.1 --port 3080` and allows the main window to load only `http://127.0.0.1:3080/` for the owned Host. Customizing the Desktop Host binding through `profiles/web` or Harness Home patches is unsupported; Desktop neither parses CLI output nor discovers an alternate origin.
 
-runtime closure 校验会遍历 Harness 的必需依赖和 Cordis patch 动态插件，检查 Web 前端、node-pty、koffi、ripgrep、sharp、Node-API addon 及平台 helper；缺失或残留 symlink 会让构建失败。`scripts/verify-tauri-artifact.mjs` 还会从真实 NSIS、DMG 或 AppImage 解包后的内容找到随包官方 Node，启动真实 sidecar/Harness，访问 loopback HTML 并优雅停止。这一步禁止只验证仓库目录或系统 Node 的假绿。
+Before spawn, Desktop attempts an exclusive bind of port 3080. It releases the listener immediately before starting the CLI. This is a practical ordinary-collision check, not a guarantee against a hostile local process that deliberately wins the bind race and imitates the expected service.
 
-Desktop 只保有一个主窗口。Web Client 请求创建 popup 时，Desktop 不创建第二个 WebView；`http` 与 `https` 目标交由操作系统默认浏览器打开，其他协议一律拒绝。主窗口只允许加载受控的启动页及当前 sidecar 报告的 loopback origin。
+After spawn, Desktop polls the fixed root while observing CLI exit. A 2xx response with `Content-Type: text/html` and a non-empty body allows navigation. Desktop publishes Ready only after the controlled WebView finishes loading that startup generation's root page. It does not continuously poll HTTP after Ready; a later unexpected CLI exit returns the window to Failed.
 
-## 生命周期与恢复
+## Runtime closure
 
-启动页与 Rust shell 只通过 Tauri event/command 通信，不读取 sidecar stdin/stdout，也不直接访问文件系统。Desktop 生命周期为 `Starting`、`Starting sidecar`、`Waiting for client to start`、`Ready`、`Failed`、`Stopping`。sidecar 的 `ready` 消息只表示已报告 Host origin：Rust 还会请求该 origin 的根 HTML，确认页面可服务后才导航；仅当主 WebView 完成当前轮次 Host 页面加载后才发布 Desktop `Ready`。等待 30 秒从同一启动轮次开始的绝对时间计算，且进入非终态的“启动时间较长”后继续无限等待；仅用户 Retry 或明确的启动错误才会中止本轮启动。sidecar 在 Ready 后意外退出时必须进入 Failed。启动页不向用户暴露上游 Web Client 这一内部术语。
+The build materializes a portable production dependency tree containing the pinned published CLI entry, its shipped configuration and presets, bundle patches, Web frontend, native modules, helpers, and transitive production dependencies. The package contains no pnpm store, workspace symlinks, development dependencies, or Desktop-owned JavaScript Host launcher.
 
-失败页提供 Retry、Copy diagnostics 和 Open logs。Retry 必须先向已有 sidecar 请求停止，等待有限时间；超时后终止其进程树，随后才能创建新的 sidecar。诊断只包含版本、平台与架构、sidecar 路径状态、生命周期时间和脱敏错误；不得记录环境变量、凭据、会话、提示词、工具参数、工作区内容、URL 查询或 HTTP 请求体。
+Runtime closure verification rejects a missing CLI entry, CLI configuration asset, frontend, native dependency, helper, or non-portable symlink. Artifact probes locate packaged Node and the packaged CLI, start the same fixed command used by Desktop, require real HTML, and confirm listener plus process-tree cleanup without using repository dependencies or system Node.
 
-Desktop 使用单实例语义。重复启动只恢复并聚焦已有主窗口，不转发第二次启动的参数，也不启动第二个 Host。
+## Lifecycle and recovery
 
-## 测试与发布
+The Startup page and Rust shell communicate only through Tauri events and commands. Desktop lifecycle states are Starting, Waiting for client, Prolonged startup, Ready, Failed, and Stopping.
 
-CI 在 Windows x64、macOS arm64/x64 和 Linux x64 上都会先用随项目下载的固定官方 Node 启动真实 Harness，并验证 loopback HTML 响应和优雅回收。这是所有平台的运行时门禁。三平台都强制运行已提交的真实桌面 E2E，并使用 embedded `@wdio/tauri-service` provider；Linux 通过 Xvfb 运行。Computer Use 仅作 Windows 人工验证，不作为 CI 门禁。
+Starting covers fixed-port preflight and CLI spawn. Waiting for client covers HTTP readiness and the current-generation WebView load. After 30 seconds the same attempt enters the non-terminal Prolonged startup state and exposes Retry while continuing to wait indefinitely. Port conflict, spawn failure, cleanup failure, or CLI exit before readiness enters Failed.
 
-Windows 仅构建和发布 x64 NSIS `.exe`，不构建 MSI。macOS 分别构建 arm64 与 x64 DMG，Linux 构建 x64 AppImage。CI 在每个目标平台打包官方 Node sidecar、运行 Tauri 行为测试，并保留 Harness 子模块只读校验。
+Retry always cancels the current generation and stops its owned CLI process tree before starting a replacement. It does not preserve the old Host for a WebView-only reload. Duplicate Desktop launches focus the existing main window and never start another CLI.
 
-## 本地运行
+Copy diagnostics contains only application and runtime versions, platform and architecture, lifecycle state and elapsed time, process status, and a stable error category. CLI stdout and stderr are inherited by development builds and discarded by packaged builds. Desktop does not persist CLI output and does not expose an Open logs action in this milestone.
 
-需要 Rust、Cargo 和 Tauri CLI。首次运行 `pnpm tauri:dev` 或 `pnpm tauri:build` 会为当前平台下载固定版本官方 Node 到 `resources/node/<platform-arch>/node(.exe)`；已有完整可执行文件时不会重复下载。若只想临时使用其他 Node，可通过 `DSH_NODE_PATH` 覆盖运行时路径：
+## Shutdown ownership
 
-```powershell
-$env:DSH_NODE_PATH = "C:\\Program Files\\nodejs\\node.exe"
-pnpm tauri:dev
-```
+On macOS and Linux, Desktop sends SIGTERM to the CLI leader so the upstream CLI can dispose Harness. The CLI process group remains owned for forced cleanup after the eight-second Desktop deadline.
 
-Node 归档缓存在 Windows 的 `%LOCALAPPDATA%\\dsh-desktop\\node`，在 macOS/Linux 的 `$XDG_CACHE_HOME/dsh-desktop/node`（未设置时为 `~/.cache/dsh-desktop/node`）。每次使用缓存前都会按仓库内固定的官方 SHA-256 校验，下载中的归档不会直接写入资源目录。
+On Windows, Desktop creates the CLI in a dedicated hidden console, attaches it to a Job Object before normal execution, and sends Ctrl+C for an owned shutdown request. Exit 130 is expected only when that same lifecycle generation requested shutdown. Console failure or timeout falls back to bounded `TerminateJobObject` cleanup.
 
-当前垂直切片只包含窗口、Host 加载和 sidecar 回收；托盘、通知及桌面能力桥不在本次范围内。
+## Testing and release
+
+Tests cover fixed command construction, port conflict, startup exit, HTML and WebView readiness, generation isolation, prolonged startup, Retry ordering, crash after Ready, expected versus unexpected exit classification, and forced descendant cleanup.
+
+macOS and Linux exercise the real SIGTERM path. A Windows-only integration test exercises the real console Ctrl+C path and exit 130 classification. It is committed with the implementation but remains unexecuted while development is on macOS and Windows CI is unavailable. A follow-up issue will promote the real packaged Windows control-event scenario to a blocking release guard.
+
+Windows produces x64 NSIS, macOS produces arm64 and x64 DMG, and Linux produces x64 AppImage development artifacts. The read-only Harness submodule remains outside the Desktop build inputs.
+
+## Local development
+
+`pnpm tauri:dev` and `pnpm tauri:build` ensure the fixed official Node executable is present before running. A developer may temporarily override it with `DSH_NODE_PATH`. Node archives are checksum-verified before use.
+
+This vertical slice excludes tray behavior, notifications, a desktop capability bridge, dynamic ports, persisted CLI logs, user-configurable Desktop Host binding, and public-release Windows control-event gating.
