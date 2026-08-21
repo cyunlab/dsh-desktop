@@ -152,6 +152,23 @@ fn is_packaged_startup_url(target: &tauri::Url) -> bool {
         && target.fragment().is_none()
 }
 
+/// 判断 URL 是否属于 Tauri CLI 在 debug 模式提供的固定本地启动页 origin。
+fn is_development_startup_origin(target: &tauri::Url) -> bool {
+    cfg!(debug_assertions)
+        && target.scheme() == "http"
+        && target.host_str() == Some("127.0.0.1")
+        && target.port_or_known_default() == Some(1430)
+}
+
+/// 判断 URL 是否是当前构建模式允许承载 Startup page 的精确入口。
+fn is_startup_url(target: &tauri::Url) -> bool {
+    is_packaged_startup_url(target)
+        || (is_development_startup_origin(target)
+            && matches!(target.path(), "" | "/" | "/index.html")
+            && target.query().is_none()
+            && target.fragment().is_none())
+}
+
 /// 对窗口导航作出允许、交给系统浏览器或拒绝的决定。
 fn decide_navigation(
     raw_url: &str,
@@ -164,11 +181,12 @@ fn decide_navigation(
     let Ok(target) = raw_url.parse::<tauri::Url>() else {
         return NavigationDecision::Deny;
     };
-    if is_packaged_startup_url(&target) {
+    if is_startup_url(&target) {
         return NavigationDecision::Allow;
     }
     if (target.scheme() == "http" && target.host_str() == Some("tauri.localhost"))
         || (target.scheme() == "tauri" && target.host_str() == Some("localhost"))
+        || is_development_startup_origin(&target)
     {
         return NavigationDecision::Deny;
     }
@@ -1832,9 +1850,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     if !is_finished_page_load(payload.event()) {
                         return;
                     }
-                    let is_app_page = (url.scheme() == "http"
-                        && url.host_str() == Some("tauri.localhost"))
-                        || (url.scheme() == "tauri" && url.host_str() == Some("localhost"));
+                    let is_app_page = is_startup_url(url);
                     if is_app_page {
                         if let Ok(mut startup_url) = state.startup_url.lock() {
                             *startup_url = Some(url.to_string());
@@ -1884,7 +1900,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             })
             .build()?;
     if let Ok(url) = startup_window.url() {
-        if is_packaged_startup_url(&url) {
+        if is_startup_url(&url) {
             if let Ok(mut startup_url) = state.startup_url.lock() {
                 *startup_url = Some(url.to_string());
             }
@@ -2101,6 +2117,14 @@ mod tests {
     fn applies_navigation_policy() {
         let startup = "http://tauri.localhost/index.html";
         let host = Some("http://127.0.0.1:1234");
+        assert_eq!(
+            decide_navigation("http://127.0.0.1:1430/", "", host),
+            NavigationDecision::Allow
+        );
+        assert_eq!(
+            decide_navigation("http://127.0.0.1:1430/private", "", host),
+            NavigationDecision::Deny
+        );
         assert_eq!(
             decide_navigation(startup, startup, host),
             NavigationDecision::Allow
