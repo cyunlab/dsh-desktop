@@ -89,7 +89,8 @@ async function scenarioEnvironment(scenario) {
     DSH_TEST_RECORD_FILE: records,
     DSH_TEST_STATE_FILE: state,
     DSH_TEST_CRASH_TRIGGER: crashTrigger,
-    DSH_TEST_RECORDS: records
+    DSH_TEST_RECORDS: records,
+    ...(scenario === 'retry' || scenario === 'prolonged' ? { DSH_TEST_PROLONGED_AFTER_MS: '500' } : {})
   }
 }
 
@@ -97,9 +98,12 @@ async function scenarioEnvironment(scenario) {
 async function verifyScenarioCleanup(environment) {
   const events = await readEvents(environment.DSH_TEST_EVENTS)
   const records = await readEvents(environment.DSH_TEST_RECORD_FILE)
-  const pids = [...events.filter(event => event.event === 'descendant-spawned').map(event => event.pid), ...records.filter(event => event.event === 'cli-spawned').map(event => event.pid)].filter(Number.isInteger)
+  const pids = [...new Set([...events.filter(event => event.event === 'descendant-spawned').map(event => event.pid), ...records.filter(event => event.event === 'cli-spawned').map(event => event.pid)].filter(Number.isInteger))]
+  const origins = [...new Set(records.filter(event => event.event === 'client-page-served').map(event => event.origin).filter(origin => typeof origin === 'string'))]
+  if (!pids.length) throw new Error('desktop cleanup verifier did not observe any CLI PID')
+  if (!origins.length) throw new Error('desktop cleanup verifier did not observe any served client origin')
   await waitForProcessesExit(pids)
-  for (const item of records.filter(event => event.event === 'host-ready')) await waitForListenerShutdown(item.origin)
+  for (const origin of origins) await waitForListenerShutdown(origin)
 }
 
 /** 依次运行每个真实桌面场景，并在 runner 退出后验收 CLI 回收。 */

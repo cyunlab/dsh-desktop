@@ -11,7 +11,9 @@ let child
 let stopping = false
 let crashTimer
 let listenerTimer
-let stubborn = false
+let ignoresStop = false
+let hasStubbornDescendant = false
+let attemptNumber = 0
 const host = argumentValue('--host') ?? '127.0.0.1'
 const hostPort = Number.parseInt(argumentValue('--port') ?? '3080', 10)
 
@@ -49,24 +51,24 @@ function page() {
 
 let origin
 
-/** 创建确定性 Harness HTTP 处理器，所有业务流量仍走 loopback HTTP。 */
-function createHttpServer() {
+/** 创建确定性 Harness HTTP 处理器，可为 Retry 首轮保持占端口但拒绝 HTML readiness。 */
+function createHttpServer(servesHtml = true) {
   return createServer((request, response) => {
-    response.setHeader('content-type', 'text/html; charset=utf-8')
+    response.setHeader('content-type', servesHtml ? 'text/html; charset=utf-8' : 'application/json')
     if (request.url === '/health') {
       response.statusCode = 200
       response.end('ok')
       return
     }
     response.statusCode = 200
-    response.end(page())
+    response.end(servesHtml ? page() : '{}')
   })
 }
 
 /** 监听指定的 loopback 端口，返回操作系统分配的端口号。 */
-async function listenServer(port = hostPort) {
+async function listenServer(port = hostPort, servesHtml = true) {
   if (server) return server.address().port
-  server = createHttpServer()
+  server = createHttpServer(servesHtml)
   await new Promise((resolve, reject) => {
     server.once('error', reject)
     server.listen(port, host, resolve)
@@ -76,19 +78,26 @@ async function listenServer(port = hostPort) {
   return address.port
 }
 
+/** 占用固定端口但只返回 JSON，使首轮保持存活并进入 Prolonged。 */
+async function startUnreadyServer() {
+  const port = await listenServer(hostPort, false)
+  origin = `http://${host}:${port}/`
+  await record('listener-started', { origin, attempt: attemptNumber })
+}
+
 /** 启动 loopback HTTP 服务并发布 ready 生命周期消息。 */
 async function startServer() {
   if (server) return
   const port = await listenServer()
   origin = `http://${host}:${port}/`
-  await record('ready', { origin })
+  await record('ready', { origin, attempt: attemptNumber })
 }
 
 /** 延迟开启固定 listener，用于稳定覆盖 prolonged-startup 状态。 */
 async function announceBeforeListener() {
   origin = `http://${host}:${hostPort}/`
   listenerTimer = setTimeout(() => {
-    void listenServer(hostPort).then(() => record('listener-started', { origin })).catch(async error => {
+    void listenServer(hostPort).then(() => record('listener-started', { origin, attempt: attemptNumber })).catch(async error => {
       await record('fixture-error', { message: String(error) })
     })
   }, 120_000)
@@ -100,15 +109,16 @@ async function stop(exitCode = 0) {
   stopping = true
   if (crashTimer) clearTimeout(crashTimer)
   if (listenerTimer) clearTimeout(listenerTimer)
-  if (stubborn) { await record('stop-ignored', { pid: process.pid }); return }
-  if (child && child.exitCode === null) {
-    child.kill()
-    await new Promise(resolve => child.once('exit', resolve))
-  }
   if (server) {
     await new Promise(resolve => server.close(resolve))
-    await record('server-closed', { origin })
+    await record('server-closed', { origin, attempt: attemptNumber })
     server = undefined
+  }
+  if (ignoresStop) { await record('stop-ignored', { pid: process.pid }); return }
+  if (child && child.exitCode === null) {
+    child.kill()
+    if (hasStubbornDescendant) await record('cleanup-waiting-for-descendant', { pid: child.pid })
+    await new Promise(resolve => child.once('exit', resolve))
   }
   await record('stopped', { origin })
   process.exit(exitCode)
@@ -135,15 +145,21 @@ async function waitForCrashTrigger() {
 /** 根据环境变量选择成功、失败、延迟、重试和崩溃测试场景。 */
 async function runScenario() {
   const attempt = await nextAttempt()
+  attemptNumber = attempt
   await record('fixture-started', { pid: process.pid, attempt })
   if ((scenario === 'retry' && attempt === 1) || scenario === 'stubborn-cleanup') {
     child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});process.on('SIGINT',()=>{});setInterval(()=>{},1000)"], { stdio: 'ignore', windowsHide: true })
-    stubborn = true
+    hasStubbornDescendant = true
+    ignoresStop = scenario === 'stubborn-cleanup'
     await record('descendant-spawned', { pid: child.pid, parentPid: process.pid, attempt })
   }
-  if (scenario === 'failure' || (scenario === 'retry' && attempt === 1)) {
+  if (scenario === 'failure') {
     await record('startup-failed', { attempt })
     process.exit(17)
+    return
+  }
+  if (scenario === 'retry' && attempt === 1) {
+    await startUnreadyServer()
     return
   }
   if (scenario === 'delayed-success') {

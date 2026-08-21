@@ -117,10 +117,10 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
   }
 
   if (scenario === 'retry') {
-    /** 先同步到真实 packaged startup page，再观察失败页和 Retry 生命周期。 */
-    it('renders controlled startup failure and retries after stopping the old CLI', async () => {
+    /** 从仍存活且占用固定端口的 Prolonged 轮次触发 Retry，验证回收先于替代轮次。 */
+    it('reclaims the live prolonged CLI before starting its replacement', async () => {
       await waitForPackagedStartupPage(browser)
-      await waitForText('#state', 'Startup failed')
+      await waitForText('#state', 'Still starting', 15_000)
       await $('#retry').waitForDisplayed()
       await $('#copy').waitForDisplayed()
       await $('#copy').click()
@@ -132,11 +132,15 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
       await $('#retry').click()
       await waitForHarness()
       const events = await waitForEvent('ready')
-      const names = events.map(event => event.event)
-      expect(names).toContain('startup-failed')
-      expect(names.indexOf('ready')).toBeGreaterThan(names.indexOf('startup-failed'))
       const oldPids = events.filter(event => event.attempt === 1 && (event.event === 'fixture-started' || event.event === 'descendant-spawned')).map(event => Number(event.pid))
+      expect(oldPids.length).toBe(2)
       expect(oldPids.every(pid => !processExists(pid))).toBe(true)
+      const listenerClosed = events.findIndex(event => event.event === 'server-closed' && event.attempt === 1)
+      const replacementStarted = events.findIndex(event => event.event === 'fixture-started' && event.attempt === 2)
+      const replacementReady = events.findIndex(event => event.event === 'ready' && event.attempt === 2)
+      expect(listenerClosed).toBeGreaterThanOrEqual(0)
+      expect(replacementStarted).toBeGreaterThan(listenerClosed)
+      expect(replacementReady).toBeGreaterThan(replacementStarted)
     })
   }
 
