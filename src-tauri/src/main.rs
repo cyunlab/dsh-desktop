@@ -417,7 +417,11 @@ fn wait_for_web_listener(
     let address = parse_loopback_address(origin)?;
     wait_for_readiness(
         || is_current(state, generation),
-        || process.try_exit(generation).map(|exit| exit.is_some()),
+        || {
+            process
+                .try_exit(state.generation.load(Ordering::Acquire))
+                .map(|exit| exit.is_some())
+        },
         || Ok(probe_client_page(address)),
         attempt_started,
         PROLONGED_STARTUP_AFTER,
@@ -487,6 +491,7 @@ fn map_supervisor_error(error: SupervisorError) -> DiagnosticCode {
     match error {
         SupervisorError::RuntimeUnavailable => DiagnosticCode::AppDataUnavailable,
         SupervisorError::PortConflict => DiagnosticCode::PortConflict,
+        SupervisorError::PreflightFailed => DiagnosticCode::InternalFailure,
         SupervisorError::SpawnFailed => DiagnosticCode::SpawnFailed,
         SupervisorError::CleanupFailed => DiagnosticCode::CleanupFailed,
     }
@@ -593,7 +598,12 @@ fn record_cleanup_failure(state: &RuntimeState, process: &CliProcess) {
 
 /// 对一个 CLI generation 执行八秒宽限停止并持久保留监督结果。
 fn stop_cli(state: &RuntimeState, process: &Arc<CliProcess>) -> Result<StopReport, String> {
-    let report = match process.stop(SIDECAR_STOP_AFTER, SIDECAR_FORCE_CONFIRM_AFTER) {
+    let current_generation = state.generation.load(Ordering::Acquire);
+    let report = match process.stop(
+        current_generation,
+        SIDECAR_STOP_AFTER,
+        SIDECAR_FORCE_CONFIRM_AFTER,
+    ) {
         Ok(report) => report,
         Err(error) => {
             record_cleanup_failure(state, process);
@@ -767,7 +777,7 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
         }
         Err(ReadinessWaitError::Cancelled) => return,
         Err(ReadinessWaitError::ProcessExited) => {
-            match process.try_exit(generation) {
+            match process.try_exit(state.generation.load(Ordering::Acquire)) {
                 Ok(Some(exit)) => {
                     record_process_observation(&state, &process, &exit, None);
                     if exit.reason == ExitReason::StaleGeneration {
@@ -807,7 +817,7 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
         if !is_current(&state, generation) {
             return;
         }
-        match process.try_exit(generation) {
+        match process.try_exit(state.generation.load(Ordering::Acquire)) {
             Ok(Some(exit)) => {
                 record_process_observation(&state, &process, &exit, None);
                 if matches!(

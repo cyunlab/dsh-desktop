@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 /// 一个由桌面端拥有的进程树控制接口。
 pub trait ProcessControl: Send + Sync {
-    /// 请求被管理进程优雅地停止。
-    fn request_graceful_stop(&self) -> Result<(), String>;
+    /// 按调用当下的轮次请求被管理进程优雅地停止。
+    fn request_graceful_stop(&self, current_generation: u64) -> Result<(), String>;
 
     /// 检查直接子进程和拥有的进程树是否已经全部退出。
     fn has_exited(&self) -> Result<bool, String>;
@@ -47,10 +47,11 @@ fn wait_until_exited(process: &dyn ProcessControl, timeout: Duration) -> Result<
 /// 先优雅停止、再强杀进程树，并在两个有界期限内确认退出和回收结果。
 pub fn stop_process(
     process: &dyn ProcessControl,
+    current_generation: u64,
     graceful_timeout: Duration,
     forced_timeout: Duration,
 ) -> Result<StopOutcome, String> {
-    let gracefully_exited = process.request_graceful_stop().is_ok()
+    let gracefully_exited = process.request_graceful_stop(current_generation).is_ok()
         && wait_until_exited(process, graceful_timeout).unwrap_or(false);
     if gracefully_exited {
         process.reap()?;
@@ -68,12 +69,20 @@ pub fn stop_process(
 /// 确认旧进程树清理成功后才执行替代轮次启动回调。
 pub fn cleanup_then_restart(
     process: Option<&dyn ProcessControl>,
+    current_generation: u64,
     graceful_timeout: Duration,
     forced_timeout: Duration,
     restart: impl FnOnce(),
 ) -> Result<Option<StopOutcome>, String> {
     let outcome = process
-        .map(|process| stop_process(process, graceful_timeout, forced_timeout))
+        .map(|process| {
+            stop_process(
+                process,
+                current_generation,
+                graceful_timeout,
+                forced_timeout,
+            )
+        })
         .transpose()?;
     restart();
     Ok(outcome)
@@ -271,7 +280,7 @@ impl FakeProcess {
 #[cfg(test)]
 impl ProcessControl for FakeProcess {
     /// 记录优雅停止，并让普通进程立即退出。
-    fn request_graceful_stop(&self) -> Result<(), String> {
+    fn request_graceful_stop(&self, _current_generation: u64) -> Result<(), String> {
         self.events.lock().unwrap().push("graceful");
         if !self.stubborn {
             self.state.lock().unwrap().exited = true;
@@ -355,6 +364,7 @@ mod tests {
         assert_eq!(
             stop_process(
                 process.as_ref(),
+                1,
                 Duration::from_millis(10),
                 Duration::from_millis(10)
             ),
@@ -368,7 +378,12 @@ mod tests {
     fn stubborn_descendants_are_force_killed_and_reaped() {
         let process = FakeProcess::new(true, false, false);
         assert_eq!(
-            stop_process(process.as_ref(), Duration::ZERO, Duration::from_millis(10)),
+            stop_process(
+                process.as_ref(),
+                1,
+                Duration::ZERO,
+                Duration::from_millis(10)
+            ),
             Ok(StopOutcome::Forced)
         );
         assert_eq!(
@@ -381,7 +396,7 @@ mod tests {
     #[test]
     fn force_kill_error_is_propagated() {
         let process = FakeProcess::new(true, true, false);
-        assert!(stop_process(process.as_ref(), Duration::ZERO, Duration::ZERO).is_err());
+        assert!(stop_process(process.as_ref(), 1, Duration::ZERO, Duration::ZERO).is_err());
         assert_eq!(*process.events.lock().unwrap(), ["graceful", "force"]);
     }
 
@@ -390,7 +405,12 @@ mod tests {
     fn graceful_probe_error_still_forces_and_confirms_cleanup() {
         let process = FakeProcess::with_graceful_probe_error();
         assert_eq!(
-            stop_process(process.as_ref(), Duration::ZERO, Duration::from_millis(10)),
+            stop_process(
+                process.as_ref(),
+                1,
+                Duration::ZERO,
+                Duration::from_millis(10)
+            ),
             Ok(StopOutcome::Forced)
         );
         assert_eq!(
@@ -403,7 +423,7 @@ mod tests {
     #[test]
     fn post_force_probe_error_reports_cleanup_failure() {
         let process = FakeProcess::with_persistent_probe_error();
-        assert!(stop_process(process.as_ref(), Duration::ZERO, Duration::ZERO).is_err());
+        assert!(stop_process(process.as_ref(), 1, Duration::ZERO, Duration::ZERO).is_err());
         assert_eq!(*process.events.lock().unwrap(), ["graceful", "force"]);
     }
 
@@ -411,7 +431,7 @@ mod tests {
     #[test]
     fn post_kill_confirmation_is_bounded() {
         let process = FakeProcess::new(true, false, true);
-        assert!(stop_process(process.as_ref(), Duration::ZERO, Duration::ZERO).is_err());
+        assert!(stop_process(process.as_ref(), 1, Duration::ZERO, Duration::ZERO).is_err());
         assert_eq!(*process.events.lock().unwrap(), ["graceful", "force"]);
     }
 
@@ -422,6 +442,7 @@ mod tests {
         let events = Arc::clone(&process.events);
         cleanup_then_restart(
             Some(process.as_ref()),
+            2,
             Duration::ZERO,
             Duration::from_millis(10),
             move || events.lock().unwrap().push("restart"),
@@ -441,6 +462,7 @@ mod tests {
         let restarted_for_callback = Arc::clone(&restarted);
         assert!(cleanup_then_restart(
             Some(process.as_ref()),
+            2,
             Duration::ZERO,
             Duration::ZERO,
             move || *restarted_for_callback.lock().unwrap() = true,

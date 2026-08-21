@@ -4,6 +4,7 @@ use crate::lifecycle::{stop_process, ProcessControl, StopOutcome};
 use serde::Deserialize;
 use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -124,6 +125,7 @@ pub(crate) struct StopReport {
 pub(crate) enum SupervisorError {
     RuntimeUnavailable,
     PortConflict,
+    PreflightFailed,
     SpawnFailed,
     CleanupFailed,
 }
@@ -209,14 +211,13 @@ fn prepend_node_path(
 }
 
 /// 对固定 Host 地址做一次普通端口冲突预检并立即释放。
-fn preflight_host_port() -> Result<(), String> {
+fn preflight_host_port() -> io::Result<()> {
     preflight_address(SocketAddrV4::new(Ipv4Addr::LOCALHOST, HOST_PORT))
 }
 
 /// 绑定并立即释放一个地址，供固定端口实现和冲突测试共用。
-fn preflight_address(address: SocketAddrV4) -> Result<(), String> {
-    let listener = TcpListener::bind(address)
-        .map_err(|error| format!("fixed Host port {} is unavailable: {error}", address.port()))?;
+fn preflight_address(address: SocketAddrV4) -> io::Result<()> {
+    let listener = TcpListener::bind(address)?;
     drop(listener);
     Ok(())
 }
@@ -467,13 +468,19 @@ fn terminate_unowned_child(child: &mut Child) -> Result<(), String> {
 fn spawn_owned_command(
     mut command: Command,
     generation: u64,
-    preflight: impl FnOnce() -> Result<(), String>,
+    preflight: impl FnOnce() -> io::Result<()>,
 ) -> Result<Arc<CliProcess>, SupervisorError> {
     #[cfg(windows)]
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
     #[cfg(unix)]
     command.process_group(0);
-    preflight().map_err(|_| SupervisorError::PortConflict)?;
+    if let Err(error) = preflight() {
+        return Err(if error.kind() == io::ErrorKind::AddrInUse {
+            SupervisorError::PortConflict
+        } else {
+            SupervisorError::PreflightFailed
+        });
+    }
     let mut child = command.spawn().map_err(|_| SupervisorError::SpawnFailed)?;
     let ownership = match ProcessOwnership::attach(child.id()) {
         Ok(ownership) => ownership,
@@ -535,14 +542,25 @@ impl CliProcess {
     /// 串行完成宽限停止并把 cleanup outcome 与真实退出状态一起返回。
     pub(crate) fn stop(
         &self,
+        current_generation: u64,
         graceful_timeout: std::time::Duration,
         forced_timeout: std::time::Duration,
     ) -> Result<StopReport, String> {
         self.with_stop_lock(|| {
-            let outcome = stop_process(self, graceful_timeout, forced_timeout)?;
-            let exit = self.try_exit(self.generation)?;
+            let outcome = stop_process(self, current_generation, graceful_timeout, forced_timeout)?;
+            let exit = self.try_exit(current_generation)?;
             Ok(StopReport { outcome, exit })
         })?
+    }
+
+    /// 缓存第一次观察到的直接子进程真实退出状态。
+    fn cache_observed_status(&self, status: ExitStatus) -> Result<(), String> {
+        let mut observed = self
+            .observed_status
+            .lock()
+            .map_err(|_| "CLI exit status lock poisoned".to_string())?;
+        observed.get_or_insert(status);
+        Ok(())
     }
 
     /// 记录并返回直接 CLI 子进程的真实退出状态。
@@ -561,10 +579,7 @@ impl CliProcess {
             .try_wait()
             .map_err(|error| error.to_string())?;
         if let Some(status) = status {
-            *self
-                .observed_status
-                .lock()
-                .map_err(|_| "CLI exit status lock poisoned".to_string())? = Some(status);
+            self.cache_observed_status(status)?;
         }
         Ok(status)
     }
@@ -594,24 +609,56 @@ impl CliProcess {
 
 impl ProcessControl for CliProcess {
     /// Unix 仅向 CLI leader 发送 SIGTERM；Windows 本票交由 Job fallback。
-    fn request_graceful_stop(&self) -> Result<(), String> {
-        self.requested_generation
-            .store(self.generation, Ordering::Release);
+    fn request_graceful_stop(&self, current_generation: u64) -> Result<(), String> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| "CLI child lock poisoned".to_string())?;
+        let already_observed = *self
+            .observed_status
+            .lock()
+            .map_err(|_| "CLI exit status lock poisoned".to_string())?;
+        let status = match already_observed {
+            Some(status) => Some(status),
+            None => child.try_wait().map_err(|error| error.to_string())?,
+        };
+        if let Some(status) = status {
+            self.cache_observed_status(status)?;
+            drop(child);
+            self.try_exit(current_generation)?;
+            return Ok(());
+        }
         #[cfg(unix)]
         {
-            let pid = self
-                .child
-                .lock()
-                .map_err(|_| "CLI child lock poisoned".to_string())?
-                .id() as i32;
+            if current_generation == self.generation {
+                self.requested_generation
+                    .store(current_generation, Ordering::Release);
+            }
+            let pid = child.id() as i32;
             let result = unsafe { libc::kill(pid, libc::SIGTERM) };
             if result == 0 {
                 return Ok(());
             }
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ESRCH) {
+                if let Some(status) = child
+                    .try_wait()
+                    .map_err(|wait_error| wait_error.to_string())?
+                {
+                    self.cache_observed_status(status)?;
+                    drop(child);
+                    self.try_exit(current_generation)?;
+                }
                 Ok(())
             } else {
+                if current_generation == self.generation {
+                    let _ = self.requested_generation.compare_exchange(
+                        current_generation,
+                        0,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
                 Err(format!("failed to signal CLI leader {pid}: {error}"))
             }
         }
@@ -663,6 +710,7 @@ mod tests {
     use crate::lifecycle::StopOutcome;
     use std::ffi::{OsStr, OsString};
     use std::fs;
+    use std::io;
     use std::net::{Ipv4Addr, TcpListener};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -825,6 +873,30 @@ mod tests {
         assert!(preflight_address(address).is_err());
     }
 
+    /// 验证注入的地址占用错误只映射为稳定端口冲突。
+    #[test]
+    fn maps_only_injected_address_in_use_to_port_conflict() {
+        let command = Command::new("/definitely/missing/dsh-desktop-node");
+        assert!(matches!(
+            spawn_owned_command(command, 8, || Err(io::Error::from(
+                io::ErrorKind::AddrInUse
+            ))),
+            Err(SupervisorError::PortConflict)
+        ));
+    }
+
+    /// 验证注入的非冲突预检错误不会伪装成端口占用。
+    #[test]
+    fn maps_other_injected_bind_errors_to_preflight_failure() {
+        let command = Command::new("/definitely/missing/dsh-desktop-node");
+        assert!(matches!(
+            spawn_owned_command(command, 8, || Err(io::Error::from(
+                io::ErrorKind::PermissionDenied
+            ))),
+            Err(SupervisorError::PreflightFailed)
+        ));
+    }
+
     /// 验证 executable 不存在时返回稳定 spawn failure，而非伪造进程状态。
     #[test]
     fn reports_spawn_failure() {
@@ -846,37 +918,40 @@ mod tests {
         panic!("CLI process did not exit");
     }
 
-    /// 验证真实非零退出会保留 ExitStatus 并分类为 unexpected。
+    /// 验证未被轮询的真实非零退出在随后 stop 时仍保持 unexpected。
     #[cfg(unix)]
     #[test]
-    fn retains_real_unexpected_exit_status() {
+    fn stop_observes_prior_unexpected_exit_before_marking_requested() {
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", "exit 17"])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let process = spawn_owned_command(command, 11, || Ok(())).unwrap();
-        let exit = wait_for_exit(&process, 11);
+        thread::sleep(Duration::from_millis(100));
+        let report = process
+            .stop(11, Duration::from_secs(1), Duration::from_secs(1))
+            .unwrap();
+        let exit = report.exit.unwrap();
         assert_eq!(exit.status.code(), Some(17));
         assert_eq!(exit.reason, ExitReason::Unexpected);
-        let _ = crate::lifecycle::ProcessControl::request_graceful_stop(process.as_ref());
-        assert_eq!(wait_for_exit(&process, 11).reason, ExitReason::Unexpected);
+        assert_eq!(wait_for_exit(&process, 12).reason, ExitReason::Unexpected);
     }
 
-    /// 验证旧轮次的真实退出不会污染替代 generation。
+    /// 验证 generation 推进后的真实 stop seam 把旧进程退出分类为 stale。
     #[cfg(unix)]
     #[test]
-    fn classifies_real_exit_from_stale_generation() {
+    fn stop_classifies_active_process_from_stale_generation() {
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "exit 0"])
+            .args(["-c", "exec sleep 60"])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let process = spawn_owned_command(command, 12, || Ok(())).unwrap();
-        assert_eq!(
-            wait_for_exit(&process, 13).reason,
-            ExitReason::StaleGeneration
-        );
+        let report = process
+            .stop(13, Duration::from_secs(2), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(report.exit.unwrap().reason, ExitReason::StaleGeneration);
     }
 
     /// 子进程 helper 在 SIGTERM 后主动关闭 listener 和后代，模拟官方 CLI disposal。
@@ -940,7 +1015,7 @@ mod tests {
         }
         assert!(ready.is_file());
         let report = process
-            .stop(Duration::from_secs(3), Duration::from_secs(2))
+            .stop(21, Duration::from_secs(3), Duration::from_secs(2))
             .unwrap();
         assert_eq!(report.outcome, StopOutcome::Graceful);
         assert_eq!(report.exit.unwrap().reason, ExitReason::Requested);
@@ -959,7 +1034,7 @@ mod tests {
             .stderr(Stdio::null());
         let process = spawn_owned_command(command, 22, || Ok(())).unwrap();
         let report = process
-            .stop(Duration::ZERO, Duration::from_secs(2))
+            .stop(22, Duration::ZERO, Duration::from_secs(2))
             .unwrap();
         assert_eq!(report.outcome, StopOutcome::Forced);
         assert_eq!(report.exit.unwrap().reason, ExitReason::Requested);
