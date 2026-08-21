@@ -38,6 +38,9 @@ export function waitForListenerClosed(origin?: string, timeoutMilliseconds?: num
 /** 等待 direct CLI 返回有效 HTML。 */
 export function waitForHtmlReadiness(child: ChildProcess, options?: { readonly origin?: string; readonly timeoutMilliseconds?: number; readonly ownership?: ProcessTreeOwnership }): Promise<string>
 
+/** 请求 CLI 关闭，并在正常请求失败时强制回收 owned tree。 */
+export function stopCliProcess(child: ChildProcess, ownership: ProcessTreeOwnership, timeoutMilliseconds?: number): Promise<void>
+
 /** 启动固定 direct CLI、验证 HTML 并确认进程树回收。 */
 export function probeDirectDshWeb(options: {
   readonly nodeExecutable: string

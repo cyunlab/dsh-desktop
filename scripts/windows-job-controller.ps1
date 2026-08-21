@@ -155,6 +155,7 @@ namespace DshDesktop.WindowsJobController
         public const uint OPEN_EXISTING = 3;
         public const uint CTRL_BREAK_EVENT = 1;
         public const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+        public const uint WAIT_OBJECT_0 = 0x00000000;
         private const int JobObjectBasicAccountingInformation = 1;
         private const int JobObjectExtendedLimitInformation = 9;
 
@@ -214,6 +215,15 @@ namespace DshDesktop.WindowsJobController
         // 在 Job 接管完成后恢复根进程唯一的初始线程。
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern uint ResumeThread(SafeKernelHandle thread);
+
+        // 在 Job 接管失败时终止尚未恢复的根进程。
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool TerminateProcess(SafeKernelHandle process, uint exitCode);
+
+        // 有界等待接管失败后的 suspended 根进程真正退出。
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint WaitForSingleObject(SafeKernelHandle handle, uint milliseconds);
 
         // 仅向以根进程 PID 标识的新进程组发送 CTRL_BREAK。
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -495,7 +505,22 @@ function Start-JobControlledProcess {
         if (-not [DshDesktop.WindowsJobController.NativeMethods]::AssignProcessToJobObject(
                 $Job,
                 $process)) {
-            throw [DshDesktop.WindowsJobController.NativeMethods]::LastError()
+            $assignError = [DshDesktop.WindowsJobController.NativeMethods]::LastError()
+            $terminateError = $null
+            if (-not [DshDesktop.WindowsJobController.NativeMethods]::TerminateProcess($process, 1)) {
+                $terminateError = [DshDesktop.WindowsJobController.NativeMethods]::LastError()
+            }
+            $waitResult = [DshDesktop.WindowsJobController.NativeMethods]::WaitForSingleObject(
+                $process,
+                2000
+            )
+            if ($waitResult -ne [DshDesktop.WindowsJobController.NativeMethods]::WAIT_OBJECT_0) {
+                if ($null -ne $terminateError) {
+                    throw $terminateError
+                }
+                throw "assign-failure root did not exit within 2000ms (wait=$waitResult)"
+            }
+            throw $assignError
         }
         $resumeResult = [DshDesktop.WindowsJobController.NativeMethods]::ResumeThread($thread)
         if ($resumeResult -eq [uint32]::MaxValue) {

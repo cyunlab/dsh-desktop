@@ -381,11 +381,9 @@ export async function waitForHtmlReadiness(child, options = {}) {
 }
 
 /** 先请求 direct CLI 正常关闭，超时后强制回收完整进程树。 */
-async function stopCliProcess(child, ownership, timeoutMilliseconds = 8_000) {
+export async function stopCliProcess(child, ownership, timeoutMilliseconds = 8_000) {
   if (await processTreeHasExited(ownership)) return
-  if (ownership.platformName === 'win32') {
-    await requestWindowsController(ownership, 'STOP', Math.min(WINDOWS_COMMAND_TIMEOUT_MS, timeoutMilliseconds))
-  } else {
+  if (ownership.platformName !== 'win32') {
     try {
       process.kill(child.pid, 'SIGTERM')
     } catch (error) {
@@ -395,6 +393,9 @@ async function stopCliProcess(child, ownership, timeoutMilliseconds = 8_000) {
     }
   }
   try {
+    if (ownership.platformName === 'win32') {
+      await requestWindowsController(ownership, 'STOP', Math.min(WINDOWS_COMMAND_TIMEOUT_MS, timeoutMilliseconds))
+    }
     await waitForProcessTreeExit(ownership, timeoutMilliseconds)
     if (ownership.platformName === 'win32' && child.exitCode === null && child.signalCode === null) {
       await requestWindowsController(ownership, 'EXIT', WINDOWS_COMMAND_TIMEOUT_MS)

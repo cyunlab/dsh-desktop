@@ -2,7 +2,7 @@ import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
-import { ownProcessTree, processTreeHasExited, terminateProcessTree, waitForListenerClosed, windowsJobControllerArguments } from '../../scripts/smoke-dsh-cli.mjs'
+import { ownProcessTree, processTreeHasExited, stopCliProcess, terminateProcessTree, waitForListenerClosed, windowsJobControllerArguments } from '../../scripts/smoke-dsh-cli.mjs'
 
 describe('published dsh CLI smoke cleanup', () => {
   it('waits until the Harness listener actually stops accepting connections', async () => {
@@ -82,6 +82,29 @@ describe('published dsh CLI smoke cleanup', () => {
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true)
   })
 
+  it('forces the Windows Job when the graceful STOP request fails', async () => {
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    const commands: string[] = []
+    let activeCount = 1
+    const ownership = ownProcessTree(child, {
+      platformName: 'win32',
+      rootPid: 22,
+      controllerProcess: child,
+      windowsController: {
+        request: async command => {
+          commands.push(command)
+          if (command === 'STOP') throw new Error('CTRL_BREAK unavailable')
+          if (command === 'FORCE') activeCount = 0
+          if (command === 'EXIT') child.kill('SIGKILL')
+          return activeCount
+        }
+      }
+    })
+    await expect(stopCliProcess(child, ownership, 100)).resolves.toBeUndefined()
+    expect(commands).toEqual(['STATUS', 'STOP', 'FORCE', 'STATUS', 'EXIT'])
+    expect(child.exitCode !== null || child.signalCode !== null).toBe(true)
+  })
+
   it('keeps the Win32 launch order suspended, assigned, then resumed', async () => {
     const source = await readFile(new URL('../../scripts/windows-job-controller.ps1', import.meta.url), 'utf8')
     const create = source.indexOf('::CreateProcess(')
@@ -92,6 +115,18 @@ describe('published dsh CLI smoke cleanup', () => {
     expect(create).toBeGreaterThanOrEqual(0)
     expect(assign).toBeGreaterThan(create)
     expect(resume).toBeGreaterThan(assign)
+  })
+
+  it('terminates and bounded-waits a suspended root when Job assignment fails', async () => {
+    const source = await readFile(new URL('../../scripts/windows-job-controller.ps1', import.meta.url), 'utf8')
+    const assign = source.indexOf('::AssignProcessToJobObject(')
+    const terminate = source.indexOf('::TerminateProcess(', assign)
+    const wait = source.indexOf('::WaitForSingleObject(', terminate)
+    const resume = source.indexOf('::ResumeThread(', assign)
+    expect(terminate).toBeGreaterThan(assign)
+    expect(wait).toBeGreaterThan(terminate)
+    expect(resume).toBeGreaterThan(wait)
+    expect(source.slice(terminate, resume)).toContain('2000')
   })
 
   it('passes the packaged executable, exact argv and cwd through the Job controller', () => {
