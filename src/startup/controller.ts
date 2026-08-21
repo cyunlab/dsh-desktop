@@ -18,11 +18,9 @@ export function connectStartupPage(api: StartupApi, document: StartupDocument): 
   const actions = requiredElement(document, '#actions')
   const retry = requiredElement(document, '#retry')
   const copy = requiredElement(document, '#copy')
-  const logs = requiredElement(document, '#logs')
   let retryInFlight = false
   const headings: Record<LifecycleSnapshot['state'], string> = {
     starting: 'Starting…',
-    'starting-sidecar': 'Starting local Host…',
     'waiting-for-client': 'Waiting for client to start…',
     'prolonged-startup': 'Still starting…',
     ready: 'Ready',
@@ -37,7 +35,6 @@ export function connectStartupPage(api: StartupApi, document: StartupDocument): 
     actions.hidden = !recoveryAvailable
     retry.disabled = retryInFlight || !recoveryAvailable
     copy.disabled = !recoveryAvailable
-    logs.disabled = !recoveryAvailable
   }
   retry.addEventListener('click', () => {
     if (retry.disabled) return
@@ -49,7 +46,6 @@ export function connectStartupPage(api: StartupApi, document: StartupDocument): 
     })
   })
   copy.addEventListener('click', () => { void api.copyDiagnostics().catch(() => undefined) })
-  logs.addEventListener('click', () => { void api.revealLogs().catch(() => undefined) })
   const unsubscribe = api.onSnapshot(render)
   void api.getSnapshot().then(render).catch(() => undefined)
   return unsubscribe

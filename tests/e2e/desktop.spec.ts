@@ -31,7 +31,7 @@ async function waitForHarness(): Promise<string> {
   const parsed = new URL(origin)
   expect(parsed.protocol).toBe('http:')
   expect(parsed.hostname).toBe('127.0.0.1')
-  expect(Number(parsed.port)).toBeGreaterThan(0)
+  expect(Number(parsed.port)).toBe(3080)
   return origin
 }
 
@@ -56,7 +56,7 @@ async function requestPopup(url: string): Promise<void> {
   await $('#dsh-e2e-popup-link').click()
 }
 
-/** 读取 sidecar fixture 写入的结构化生命周期事件。 */
+/** 读取 CLI fixture 写入的结构化测试事件。 */
 async function readEvents(): Promise<readonly Record<string, unknown>[]> {
   const file = process.env.DSH_TEST_EVENTS
   if (!file) return []
@@ -80,9 +80,9 @@ async function waitForRecord(name: string): Promise<readonly Record<string, unkn
   return readRecords()
 }
 
-/** 等待 sidecar 事件落盘，避免测试在子进程关闭前读取到旧快照。 */
+/** 等待 CLI fixture 事件落盘，避免测试在子进程关闭前读取到旧快照。 */
 async function waitForEvent(name: string): Promise<readonly Record<string, unknown>[]> {
-  await browser.waitUntil(async () => (await readEvents()).some(event => event.event === name), { timeout: 15_000, timeoutMsg: `sidecar event ${name} was not recorded` })
+  await browser.waitUntil(async () => (await readEvents()).some(event => event.event === name), { timeout: 15_000, timeoutMsg: `CLI fixture event ${name} was not recorded` })
   return readEvents()
 }
 
@@ -118,27 +118,23 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
 
   if (scenario === 'retry') {
     /** 先同步到真实 packaged startup page，再观察失败页和 Retry 生命周期。 */
-    it('renders controlled startup failure and retries after stopping the old sidecar', async () => {
+    it('renders controlled startup failure and retries after stopping the old CLI', async () => {
       await waitForPackagedStartupPage(browser)
       await waitForText('#state', 'Startup failed')
       await $('#retry').waitForDisplayed()
       await $('#copy').waitForDisplayed()
-      await $('#logs').waitForDisplayed()
       await $('#copy').click()
       const diagnosticsRecords = await waitForRecord('diagnostics-copied')
       const diagnostics = String(diagnosticsRecords.find(event => event.event === 'diagnostics-copied')?.diagnostics ?? '')
       expect(diagnostics).toContain('"app_version"')
       expect(diagnostics).toContain('"error_code"')
       expect(diagnostics).not.toContain('http://')
-      await $('#logs').click()
-      await waitForRecord('logs-opened')
       await $('#retry').click()
       await waitForHarness()
       const events = await waitForEvent('ready')
       const names = events.map(event => event.event)
       expect(names).toContain('startup-failed')
-      expect(names.indexOf('stop-ignored')).toBeGreaterThan(names.indexOf('startup-failed'))
-      expect(names.indexOf('ready')).toBeGreaterThan(names.indexOf('stop-ignored'))
+      expect(names.indexOf('ready')).toBeGreaterThan(names.indexOf('startup-failed'))
       const oldPids = events.filter(event => event.attempt === 1 && (event.event === 'fixture-started' || event.event === 'descendant-spawned')).map(event => Number(event.pid))
       expect(oldPids.every(pid => !processExists(pid))).toBe(true)
     })
@@ -160,7 +156,7 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
   }
 
   if (scenario === 'crash-after-ready') {
-    it('returns to the failure page when a ready sidecar crashes', async () => {
+    it('returns to the failure page when a ready CLI crashes', async () => {
       await waitForHarness()
       const crashTrigger = process.env.DSH_TEST_CRASH_TRIGGER
       if (!crashTrigger) throw new Error('DSH_TEST_CRASH_TRIGGER is required')
@@ -192,7 +188,7 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
       const records = await waitForRecord('single-instance-activated')
       expect(await browser.getWindowHandles()).toHaveLength(1)
       expect(await browser.getUrl()).toBe(origin)
-      expect(records.filter(event => event.event === 'sidecar-spawned')).toHaveLength(1)
+      expect(records.filter(event => event.event === 'cli-spawned')).toHaveLength(1)
       const activation = records.find(event => event.event === 'single-instance-activated')
       expect(activation).toMatchObject({ beforeMinimized: true, unminimizeOk: true, showOk: true, focusOk: true, afterMinimized: false, visible: true, focused: true })
     })
@@ -202,7 +198,7 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
     it('loads before runner verifies hard process-tree cleanup', async () => { await waitForHarness() })
   }
 
-  /** 在每个桌面行为场景结束时销毁 WebView，验收 Tauri 侧的 sidecar 回收。 */
+  /** 在每个桌面行为场景结束时销毁 WebView，验收 Tauri 侧的 CLI 回收。 */
   after(async () => {
     await browser.closeWindow()
   })

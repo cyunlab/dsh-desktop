@@ -7,9 +7,9 @@ function startupSnapshot(overrides: Record<string, unknown> = {}) {
     url: 'http://tauri.localhost/index.html',
     readyState: 'complete',
     title: 'DeepSeek Harness Desktop',
-    state: 'Starting local Host…',
+    state: 'Starting…',
     message: 'Starting.',
-    requiredElements: [true, true, true, true, true, true],
+    requiredElements: [true, true, true, true, true],
     ...overrides
   }
 }
@@ -63,6 +63,7 @@ describe('packaged startup page synchronization', () => {
 
   /** 验证 packaged URL、生命周期文案和必需 DOM 缺一不可。 */
   it('requires the committed packaged URL, lifecycle state, and required DOM', () => {
+    expect(isPackagedStartupUrl('tauri://localhost')).toBe(true)
     expect(isPackagedStartupUrl('http://tauri.localhost/')).toBe(true)
     expect(isPackagedStartupUrl('http://tauri.localhost/index.html')).toBe(true)
     expect(isPackagedStartupUrl('tauri://localhost/')).toBe(true)
@@ -71,6 +72,6 @@ describe('packaged startup page synchronization', () => {
     expect(isPackagedStartupPage(startupSnapshot())).toBe(true)
     expect(isPackagedStartupPage(startupSnapshot({ url: 'http://127.0.0.1:4312/' }))).toBe(false)
     expect(isPackagedStartupPage(startupSnapshot({ state: 'Ready' }))).toBe(false)
-    expect(isPackagedStartupPage(startupSnapshot({ requiredElements: [true, true, false, true, true, true] }))).toBe(false)
+    expect(isPackagedStartupPage(startupSnapshot({ requiredElements: [true, true, false, true, true] }))).toBe(false)
   })
 })

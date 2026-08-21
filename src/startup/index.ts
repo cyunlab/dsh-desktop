@@ -19,7 +19,6 @@ const api: StartupApi = {
     return () => { disposed = true; unlisten?.() }
   },
   retry: () => invoke('startup_retry'),
-  copyDiagnostics: () => invoke('startup_copy_diagnostics'),
-  revealLogs: () => invoke('startup_reveal_logs')
+  copyDiagnostics: () => invoke('startup_copy_diagnostics')
 }
 connectStartupPage(api, document)

@@ -1,7 +1,6 @@
 import { appendFile, readFile, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
-import { createInterface } from 'node:readline'
 
 const scenario = process.env.DSH_TEST_SCENARIO ?? 'success'
 const eventsFile = process.env.DSH_TEST_EVENTS
@@ -13,16 +12,19 @@ let stopping = false
 let crashTimer
 let listenerTimer
 let stubborn = false
+const host = argumentValue('--host') ?? '127.0.0.1'
+const hostPort = Number.parseInt(argumentValue('--port') ?? '3080', 10)
+
+/** 读取 direct CLI fixture 收到的命令行参数。 */
+function argumentValue(name) {
+  const index = process.argv.indexOf(name)
+  return index >= 0 ? process.argv[index + 1] : undefined
+}
 
 /** 将测试生命周期事件写入独立文件，供 WebDriver 测试确认进程回收和单实例行为。 */
 async function record(event, details = {}) {
   if (!eventsFile) return
   await appendFile(eventsFile, `${JSON.stringify({ event, ...details })}\n`, 'utf8')
-}
-
-/** 向 Tauri Rust 父进程发送一条与生产 sidecar 相同形状的生命周期消息。 */
-function send(message) {
-  process.stdout.write(`${JSON.stringify(message)}\n`)
 }
 
 /** 返回一个仅绑定 127.0.0.1 的确定性测试 Harness 页面。 */
@@ -62,15 +64,15 @@ function createHttpServer() {
 }
 
 /** 监听指定的 loopback 端口，返回操作系统分配的端口号。 */
-async function listenServer(port = 0) {
+async function listenServer(port = hostPort) {
   if (server) return server.address().port
   server = createHttpServer()
   await new Promise((resolve, reject) => {
     server.once('error', reject)
-    server.listen(port, '127.0.0.1', resolve)
+    server.listen(port, host, resolve)
   })
   const address = server.address()
-  if (!address || typeof address === 'string') throw new Error('test sidecar did not receive a TCP binding')
+  if (!address || typeof address === 'string') throw new Error('test CLI did not receive a TCP binding')
   return address.port
 }
 
@@ -78,33 +80,21 @@ async function listenServer(port = 0) {
 async function startServer() {
   if (server) return
   const port = await listenServer()
-  origin = `http://127.0.0.1:${port}/`
+  origin = `http://${host}:${port}/`
   await record('ready', { origin })
-  send({ type: 'ready', origin })
 }
 
-/** 先报告合法 origin 再延迟开启 listener，用于稳定覆盖 prolonged-startup 状态。 */
+/** 延迟开启固定 listener，用于稳定覆盖 prolonged-startup 状态。 */
 async function announceBeforeListener() {
-  const probe = createHttpServer()
-  await new Promise((resolve, reject) => {
-    probe.once('error', reject)
-    probe.listen(0, '127.0.0.1', resolve)
-  })
-  const address = probe.address()
-  if (!address || typeof address === 'string') throw new Error('test sidecar did not receive a delayed TCP binding')
-  const port = address.port
-  await new Promise(resolve => probe.close(resolve))
-  origin = `http://127.0.0.1:${port}/`
-  await record('ready', { origin })
-  send({ type: 'ready', origin })
+  origin = `http://${host}:${hostPort}/`
   listenerTimer = setTimeout(() => {
-    void listenServer(port).then(() => record('listener-started', { origin })).catch(async error => {
+    void listenServer(hostPort).then(() => record('listener-started', { origin })).catch(async error => {
       await record('fixture-error', { message: String(error) })
     })
   }, 120_000)
 }
 
-/** 终止测试 sidecar 的 HTTP 服务和附属进程，并发送 stopped 消息。 */
+/** 终止测试 CLI 的 HTTP 服务和附属进程。 */
 async function stop(exitCode = 0) {
   if (stopping) return
   stopping = true
@@ -121,7 +111,6 @@ async function stop(exitCode = 0) {
     server = undefined
   }
   await record('stopped', { origin })
-  send({ type: 'stopped' })
   process.exit(exitCode)
 }
 
@@ -154,7 +143,7 @@ async function runScenario() {
   }
   if (scenario === 'failure' || (scenario === 'retry' && attempt === 1)) {
     await record('startup-failed', { attempt })
-    send({ type: 'startup-failed', error: { name: 'TestStartupError', message: `controlled failure (attempt ${attempt})` } })
+    process.exit(17)
     return
   }
   if (scenario === 'delayed-success') {
@@ -176,12 +165,8 @@ async function runScenario() {
   }
 }
 
-/** 监听 Rust 的优雅停止请求，并处理操作系统终止信号。 */
+/** 处理 Desktop 发送的操作系统终止信号。 */
 function installShutdownHandlers() {
-  const input = createInterface({ input: process.stdin, crlfDelay: Infinity })
-  input.on('line', line => {
-    if (line.trim() === '{"type":"stop"}') void stop()
-  })
   process.once('SIGINT', () => { void stop() })
   process.once('SIGTERM', () => { void stop() })
 }
@@ -189,6 +174,5 @@ function installShutdownHandlers() {
 installShutdownHandlers()
 void runScenario().catch(async error => {
   await record('fixture-error', { message: String(error) })
-  send({ type: 'startup-failed', error: { name: error?.name ?? 'Error', message: error?.message ?? String(error) } })
   process.exitCode = 1
 })

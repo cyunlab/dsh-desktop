@@ -1,8 +1,7 @@
-const PACKAGED_STARTUP_URL = /^(?:http:\/\/tauri\.localhost|tauri:\/\/localhost)\/(?:index\.html)?$/
+const PACKAGED_STARTUP_URL = /^(?:http:\/\/tauri\.localhost|tauri:\/\/localhost)(?:\/(?:index\.html)?)?$/
 
 const STARTUP_STATE_TEXT = new Set([
   'Starting…',
-  'Starting local Host…',
   'Waiting for client to start…',
   'Still starting…',
   'Startup failed',
@@ -36,7 +35,7 @@ async function readStartupPage(browser) {
     title: document.title,
     state: document.querySelector('#state')?.textContent?.trim(),
     message: document.querySelector('#message')?.textContent?.trim(),
-    requiredElements: ['#state', '#message', '#actions', '#retry', '#copy', '#logs']
+    requiredElements: ['#state', '#message', '#actions', '#retry', '#copy']
       .map(selector => Boolean(document.querySelector(selector)))
   }))
 }

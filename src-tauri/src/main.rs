@@ -12,7 +12,6 @@ use cli_supervisor::{
 };
 use lifecycle::{wait_for_readiness, ReadinessWaitError};
 use serde::Serialize;
-use std::fs;
 #[cfg(all(debug_assertions, feature = "wdio"))]
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -33,8 +32,8 @@ use std::os::unix::process::ExitStatusExt;
 
 const SNAPSHOT_EVENT: &str = "startup:snapshot";
 const PROLONGED_STARTUP_AFTER: Duration = Duration::from_secs(30);
-const SIDECAR_STOP_AFTER: Duration = Duration::from_secs(8);
-const SIDECAR_FORCE_CONFIRM_AFTER: Duration = Duration::from_secs(5);
+const CLI_STOP_AFTER: Duration = Duration::from_secs(8);
+const CLI_FORCE_CONFIRM_AFTER: Duration = Duration::from_secs(5);
 const BUNDLED_NODE_VERSION: &str = "24.19.0";
 
 /// 生命周期状态，序列化后作为启动页的稳定协议。
@@ -42,12 +41,24 @@ const BUNDLED_NODE_VERSION: &str = "24.19.0";
 #[serde(rename_all = "kebab-case")]
 enum LifecycleState {
     Starting,
-    StartingSidecar,
     WaitingForClient,
     ProlongedStartup,
     Ready,
     Failed,
     Stopping,
+}
+
+#[cfg(test)]
+impl LifecycleState {
+    /// 列出 Startup 协议允许的全部 direct CLI 状态。
+    const ALL: [Self; 6] = [
+        Self::Starting,
+        Self::WaitingForClient,
+        Self::ProlongedStartup,
+        Self::Ready,
+        Self::Failed,
+        Self::Stopping,
+    ];
 }
 
 /// 启动页可见的生命周期快照。
@@ -96,11 +107,19 @@ enum DiagnosticCode {
 struct RuntimeState {
     snapshot: Mutex<LifecycleSnapshot>,
     process: Mutex<Option<Arc<CliProcess>>>,
+    /// 串行 generation 切换与 generation-bound 事件发布。
+    generation_event_gate: Mutex<()>,
+    /// 串行主线程导航与 generation 切换，不在 WebView 回调期间持有。
+    navigation_operation_gate: Mutex<()>,
     /// 串行化 spawn、Retry 和 shutdown，避免旧进程尚未回收时创建替代 Host。
     lifecycle_gate: Mutex<()>,
     host_origin: Mutex<Option<String>>,
     /// 当前 Host origin 所属的启动轮次，防止旧页面加载误报新轮次 Ready。
     host_generation: Mutex<Option<u64>>,
+    /// 已调度到主线程的 Host 导航所属轮次。
+    webview_navigation_generation: Mutex<Option<u64>>,
+    /// 当前受控 Host 页面加载所属轮次。
+    webview_load_generation: Mutex<Option<u64>>,
     startup_url: Mutex<Option<String>>,
     generation: AtomicU64,
     retrying: AtomicBool,
@@ -111,7 +130,6 @@ struct RuntimeState {
     node_path_status: Mutex<String>,
     /// 最近一次 CLI 的真实退出分类与清理结果。
     last_process_observation: Mutex<Option<ProcessObservation>>,
-    logs_dir: PathBuf,
     last_error: Mutex<Option<DiagnosticCode>>,
 }
 
@@ -121,7 +139,7 @@ fn is_packaged_startup_url(target: &tauri::Url) -> bool {
         && target.host_str() == Some("tauri.localhost"))
         || (target.scheme() == "tauri" && target.host_str() == Some("localhost"));
     packaged_origin
-        && matches!(target.path(), "/" | "/index.html")
+        && matches!(target.path(), "" | "/" | "/index.html")
         && target.query().is_none()
         && target.fragment().is_none()
 }
@@ -217,7 +235,7 @@ fn resolve_node_path(resource_dir: &Path) -> Result<PathBuf, String> {
         return Ok(bundled);
     }
     Err(format!(
-        "official Node sidecar is missing: {}",
+        "official Node executable is missing: {}",
         bundled.display()
     ))
 }
@@ -276,6 +294,51 @@ fn transition(
     );
 }
 
+/// 仅当 generation 仍处于等待阶段时发布计时器状态，拒绝迟到 timer。
+fn transition_waiting_generation(
+    app: &AppHandle,
+    state: &RuntimeState,
+    generation: u64,
+    lifecycle: LifecycleState,
+    message: impl Into<String>,
+) -> bool {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return false;
+    };
+    if !is_current(state, generation) {
+        return false;
+    }
+    let waiting = state.snapshot.lock().ok().is_some_and(|snapshot| {
+        matches!(
+            snapshot.state,
+            LifecycleState::WaitingForClient | LifecycleState::ProlongedStartup
+        )
+    });
+    if !waiting || !is_current(state, generation) {
+        return false;
+    }
+    transition(app, state, lifecycle, message);
+    true
+}
+
+/// 仅为当前 generation 发布生命周期快照，拒绝迟到进程事件。
+fn transition_generation(
+    app: &AppHandle,
+    state: &RuntimeState,
+    generation: u64,
+    lifecycle: LifecycleState,
+    message: impl Into<String>,
+) -> bool {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return false;
+    };
+    if !is_current(state, generation) {
+        return false;
+    }
+    transition(app, state, lifecycle, message);
+    true
+}
+
 /// 判断某个启动轮次是否仍然有效。
 fn is_current(state: &RuntimeState, generation: u64) -> bool {
     !state.shutting_down.load(Ordering::Acquire)
@@ -292,16 +355,110 @@ fn parse_loopback_address(origin: &str) -> Result<SocketAddr, ReadinessWaitError
         .map_err(|_| ReadinessWaitError::ProbeFailed)
 }
 
-/// 将当前轮次的 Host origin 与 generation 一起保存，供页面加载回调进行竞态校验。
-fn set_host_origin(state: &RuntimeState, generation: u64, origin: String) {
-    if !is_current(state, generation) {
-        return;
+/// 清除 Host readiness 与 WebView 观察令牌，使迟到事件无法穿过 Retry 边界。
+fn reset_host_observation(state: &RuntimeState) {
+    if let Ok(mut current) = state.host_origin.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = state.host_generation.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = state.webview_navigation_generation.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = state.webview_load_generation.lock() {
+        *current = None;
+    }
+}
+
+/// 在 HTTP readiness 二次确认后才公布当前 Host origin。
+fn set_ready_host_origin(state: &RuntimeState, generation: u64, origin: String) -> bool {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return false;
+    };
+    if !current_cli_is_alive(state, generation) {
+        return false;
     }
     if let Ok(mut current) = state.host_origin.lock() {
         *current = Some(origin);
+    } else {
+        return false;
     }
     if let Ok(mut current) = state.host_generation.lock() {
         *current = Some(generation);
+        true
+    } else {
+        reset_host_observation(state);
+        false
+    }
+}
+
+/// 确认该 generation 仍是当前轮次，且拥有的 CLI leader 尚未退出。
+fn current_cli_is_alive(state: &RuntimeState, generation: u64) -> bool {
+    if !is_current(state, generation) {
+        return false;
+    }
+    let process = state
+        .process
+        .lock()
+        .ok()
+        .and_then(|current| current.as_ref().map(Arc::clone));
+    process.is_some_and(|process| {
+        process.generation() == generation
+            && process
+                .try_exit(generation)
+                .is_ok_and(|exit| exit.is_none())
+    })
+}
+
+/// 用纯值判断 WebView Finished 是否属于当前受控 Host 加载。
+fn is_current_host_page_event(
+    current_generation: u64,
+    host_generation: Option<u64>,
+    load_generation: Option<u64>,
+    lifecycle: LifecycleState,
+    cli_alive: bool,
+    origin: Option<&str>,
+    loaded_url: &tauri::Url,
+) -> bool {
+    host_generation == Some(current_generation)
+        && load_generation == Some(current_generation)
+        && cli_alive
+        && matches!(
+            lifecycle,
+            LifecycleState::WaitingForClient | LifecycleState::ProlongedStartup
+        )
+        && origin.is_some_and(|origin| {
+            loaded_url.as_str().trim_end_matches('/') == origin.trim_end_matches('/')
+        })
+}
+
+/// 把 Host Started 事件绑定到已在主线程调度的当前导航轮次。
+fn begin_client_page_load(state: &RuntimeState, loaded_url: &tauri::Url) {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return;
+    };
+    let generation = state.generation.load(Ordering::Acquire);
+    let expected = state
+        .webview_navigation_generation
+        .lock()
+        .ok()
+        .and_then(|value| *value);
+    let origin = state
+        .host_origin
+        .lock()
+        .ok()
+        .and_then(|value| value.clone());
+    if expected != Some(generation)
+        || !current_cli_is_alive(state, generation)
+        || !origin.is_some_and(|origin| {
+            loaded_url.as_str().trim_end_matches('/') == origin.trim_end_matches('/')
+        })
+    {
+        return;
+    }
+    if let Ok(mut loading) = state.webview_load_generation.lock() {
+        *loading = Some(generation);
     }
 }
 
@@ -313,18 +470,26 @@ fn is_current_host_page(state: &RuntimeState, loaded_url: &tauri::Url) -> bool {
         .lock()
         .ok()
         .and_then(|value| value.clone());
-    let origin_generation = state.host_generation.lock().ok().and_then(|value| *value);
-    let waiting_for_client = state.snapshot.lock().ok().is_some_and(|snapshot| {
-        matches!(
-            snapshot.state,
-            LifecycleState::WaitingForClient | LifecycleState::ProlongedStartup
-        )
-    });
-    origin_generation == Some(generation)
-        && waiting_for_client
-        && origin.is_some_and(|origin| {
-            loaded_url.as_str().trim_end_matches('/') == origin.trim_end_matches('/')
-        })
+    let host_generation = state.host_generation.lock().ok().and_then(|value| *value);
+    let load_generation = state
+        .webview_load_generation
+        .lock()
+        .ok()
+        .and_then(|value| *value);
+    let lifecycle = state
+        .snapshot
+        .lock()
+        .map(|snapshot| snapshot.state)
+        .unwrap_or(LifecycleState::Failed);
+    is_current_host_page_event(
+        generation,
+        host_generation,
+        load_generation,
+        lifecycle,
+        current_cli_is_alive(state, generation),
+        origin.as_deref(),
+        loaded_url,
+    )
 }
 
 /// 仅在 WebView 完成页面加载后推进 client readiness，避免 Started 事件过早宣告 Ready。
@@ -334,6 +499,9 @@ fn is_finished_page_load(event: PageLoadEvent) -> bool {
 
 /// 在主 WebView 确认当前 Host 页面加载完成后，才对启动页发布客户端 Ready。
 fn mark_client_page_loaded(app: &AppHandle, state: &RuntimeState, loaded_url: &tauri::Url) {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return;
+    };
     if !is_current_host_page(state, loaded_url) {
         return;
     }
@@ -342,6 +510,12 @@ fn mark_client_page_loaded(app: &AppHandle, state: &RuntimeState, loaded_url: &t
         "event": "client-page-loaded",
         "url": loaded_url.as_str()
     }));
+    if let Ok(mut navigation) = state.webview_navigation_generation.lock() {
+        *navigation = None;
+    }
+    if let Ok(mut loading) = state.webview_load_generation.lock() {
+        *loading = None;
+    }
     transition(app, state, LifecycleState::Ready, "Ready.");
 }
 
@@ -427,9 +601,10 @@ fn wait_for_web_listener(
         PROLONGED_STARTUP_AFTER,
         Duration::from_millis(100),
         || {
-            transition(
+            transition_waiting_generation(
                 app,
                 state,
+                generation,
                 LifecycleState::ProlongedStartup,
                 "Startup is taking longer than expected. You can retry when ready.",
             );
@@ -514,7 +689,7 @@ fn spawn_direct_cli(
     let process = spawn_cli(&plan, generation).map_err(map_supervisor_error)?;
     #[cfg(all(debug_assertions, feature = "wdio"))]
     record_wdio_event(serde_json::json!({
-        "event": "sidecar-spawned",
+        "event": "cli-spawned",
         "generation": generation,
         "nodePathPrepended": true
     }));
@@ -599,11 +774,7 @@ fn record_cleanup_failure(state: &RuntimeState, process: &CliProcess) {
 /// 对一个 CLI generation 执行八秒宽限停止并持久保留监督结果。
 fn stop_cli(state: &RuntimeState, process: &Arc<CliProcess>) -> Result<StopReport, String> {
     let current_generation = state.generation.load(Ordering::Acquire);
-    let report = match process.stop(
-        current_generation,
-        SIDECAR_STOP_AFTER,
-        SIDECAR_FORCE_CONFIRM_AFTER,
-    ) {
+    let report = match process.stop(current_generation, CLI_STOP_AFTER, CLI_FORCE_CONFIRM_AFTER) {
         Ok(report) => report,
         Err(error) => {
             record_cleanup_failure(state, process);
@@ -619,8 +790,8 @@ fn stop_cli(state: &RuntimeState, process: &Arc<CliProcess>) -> Result<StopRepor
     }
     Ok(report)
 }
-/// 将窗口导航到打包启动页，供失败和崩溃恢复复用。
-fn navigate_to_startup(app: &AppHandle, state: &RuntimeState) {
+/// 将窗口导航到打包启动页，主线程执行前再次校验 generation。
+fn navigate_to_startup(app: &AppHandle, state: &RuntimeState, generation: u64) {
     let Some(raw_url) = state
         .startup_url
         .lock()
@@ -629,14 +800,25 @@ fn navigate_to_startup(app: &AppHandle, state: &RuntimeState) {
     else {
         return;
     };
-    let Ok(url) = raw_url.parse() else { return };
+    let Ok(url) = raw_url.parse::<tauri::Url>() else {
+        return;
+    };
     let app = app.clone();
     let app_for_task = app.clone();
     let _ = app.run_on_main_thread(move || {
+        let state = app_for_task.state::<Arc<RuntimeState>>();
+        let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+            return;
+        };
+        let Ok(_gate) = state.generation_event_gate.lock() else {
+            return;
+        };
+        if !is_current(&state, generation) {
+            return;
+        }
+        reset_host_observation(&state);
+        drop(_gate);
         if let Some(window) = app_for_task.get_webview_window("main") {
-            if window.url().is_ok_and(|current| current == url) {
-                return;
-            }
             let result = window.navigate(url.clone());
             #[cfg(not(all(debug_assertions, feature = "wdio")))]
             let _ = result;
@@ -650,16 +832,41 @@ fn navigate_to_startup(app: &AppHandle, state: &RuntimeState) {
     });
 }
 
-/// 将窗口导航到当前启动轮次的 Host 页面。
-fn navigate_to_host(app: &AppHandle, origin: &str) {
+/// 将窗口导航到当前启动轮次的 Host 页面，拒绝迟到主线程任务。
+fn navigate_to_host(app: &AppHandle, generation: u64, origin: &str) {
     let Ok(url) = origin.parse::<tauri::Url>() else {
         return;
     };
     let app = app.clone();
     let app_for_task = app.clone();
     let _ = app.run_on_main_thread(move || {
+        let state = app_for_task.state::<Arc<RuntimeState>>();
+        let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+            return;
+        };
+        let Ok(_gate) = state.generation_event_gate.lock() else {
+            return;
+        };
+        let host_generation = state.host_generation.lock().ok().and_then(|value| *value);
+        if host_generation != Some(generation) || !current_cli_is_alive(&state, generation) {
+            return;
+        }
+        if let Ok(mut expected) = state.webview_navigation_generation.lock() {
+            *expected = Some(generation);
+        } else {
+            return;
+        }
+        if let Ok(mut loading) = state.webview_load_generation.lock() {
+            *loading = None;
+        }
+        drop(_gate);
         if let Some(window) = app_for_task.get_webview_window("main") {
             let result = window.navigate(url.clone());
+            if result.is_err() {
+                if let Ok(mut expected) = state.webview_navigation_generation.lock() {
+                    *expected = None;
+                }
+            }
             #[cfg(not(all(debug_assertions, feature = "wdio")))]
             let _ = result;
             #[cfg(all(debug_assertions, feature = "wdio"))]
@@ -674,15 +881,13 @@ fn navigate_to_host(app: &AppHandle, origin: &str) {
 
 /// 记录启动失败并恢复到统一启动页。
 fn fail_attempt(app: &AppHandle, state: &RuntimeState, generation: u64, code: DiagnosticCode) {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return;
+    };
     if !is_current(state, generation) {
         return;
     }
-    if let Ok(mut origin) = state.host_origin.lock() {
-        *origin = None;
-    }
-    if let Ok(mut origin_generation) = state.host_generation.lock() {
-        *origin_generation = None;
-    }
+    reset_host_observation(state);
     if let Ok(mut last_error) = state.last_error.lock() {
         *last_error = Some(code);
     }
@@ -690,9 +895,10 @@ fn fail_attempt(app: &AppHandle, state: &RuntimeState, generation: u64, code: Di
         app,
         state,
         LifecycleState::Failed,
-        "Startup failed. Retry, copy diagnostics, or open logs.",
+        "Startup failed. Retry or copy diagnostics.",
     );
-    navigate_to_startup(app, state);
+    drop(_gate);
+    navigate_to_startup(app, state, generation);
 }
 
 /// 仅在状态仍指向同一个 CLI 时清除共享句柄，避免误删替代轮次。
@@ -731,14 +937,17 @@ fn abort_attempt(
     );
 }
 
+/// 只有当前 generation 的非预期退出才应转入 Failed。
+fn exit_requires_failure(
+    process_generation: u64,
+    current_generation: u64,
+    reason: ExitReason,
+) -> bool {
+    process_generation == current_generation && reason == ExitReason::Unexpected
+}
+
 /// 执行 direct CLI 启动轮次，并只从进程、固定 HTTP 与 WebView 观察生命周期。
 fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
-    transition(
-        &app,
-        &state,
-        LifecycleState::StartingSidecar,
-        "Starting local Host.",
-    );
     let attempt_started = state
         .attempt_started
         .lock()
@@ -752,13 +961,15 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
             return;
         }
     };
-    set_host_origin(&state, generation, HOST_ORIGIN.into());
-    transition(
+    if !transition_generation(
         &app,
         &state,
+        generation,
         LifecycleState::WaitingForClient,
         "Waiting for client to start.",
-    );
+    ) {
+        return;
+    }
     match wait_for_web_listener(
         &app,
         &state,
@@ -768,19 +979,38 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
         attempt_started,
     ) {
         Ok(()) => {
+            if !set_ready_host_origin(&state, generation, HOST_ORIGIN.into()) {
+                if is_current(&state, generation) {
+                    abort_attempt(
+                        &app,
+                        &state,
+                        generation,
+                        &process,
+                        DiagnosticCode::UnexpectedExit,
+                    );
+                }
+                return;
+            }
             #[cfg(all(debug_assertions, feature = "wdio"))]
             record_wdio_event(serde_json::json!({
                 "event": "client-page-served",
                 "origin": HOST_ORIGIN
             }));
-            navigate_to_host(&app, HOST_ORIGIN);
+            navigate_to_host(&app, generation, HOST_ORIGIN);
         }
         Err(ReadinessWaitError::Cancelled) => return,
         Err(ReadinessWaitError::ProcessExited) => {
+            if !is_current(&state, generation) {
+                return;
+            }
             match process.try_exit(state.generation.load(Ordering::Acquire)) {
                 Ok(Some(exit)) => {
                     record_process_observation(&state, &process, &exit, None);
-                    if exit.reason == ExitReason::StaleGeneration {
+                    if !exit_requires_failure(
+                        process.generation(),
+                        state.generation.load(Ordering::Acquire),
+                        exit.reason,
+                    ) {
                         return;
                     }
                     abort_attempt(
@@ -802,6 +1032,9 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
             return;
         }
         Err(ReadinessWaitError::ProbeFailed) => {
+            if !is_current(&state, generation) {
+                return;
+            }
             abort_attempt(
                 &app,
                 &state,
@@ -820,9 +1053,10 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
         match process.try_exit(state.generation.load(Ordering::Acquire)) {
             Ok(Some(exit)) => {
                 record_process_observation(&state, &process, &exit, None);
-                if matches!(
+                if !exit_requires_failure(
+                    process.generation(),
+                    state.generation.load(Ordering::Acquire),
                     exit.reason,
-                    ExitReason::StaleGeneration | ExitReason::Requested
                 ) {
                     return;
                 }
@@ -851,17 +1085,19 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
 }
 /// 启动一个新的、唯一的 CLI 启动轮次。
 fn start_attempt(app: &AppHandle, state: &Arc<RuntimeState>) {
+    let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+        return;
+    };
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return;
+    };
     let generation = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
     if let Ok(mut started) = state.attempt_started.lock() {
         *started = Some(Instant::now());
     }
-    if let Ok(mut origin) = state.host_origin.lock() {
-        *origin = None;
-    }
-    if let Ok(mut origin_generation) = state.host_generation.lock() {
-        *origin_generation = None;
-    }
+    reset_host_observation(state);
     transition(app, state, LifecycleState::Starting, "Starting.");
+    drop(_gate);
     let app = app.clone();
     let state = Arc::clone(state);
     thread::spawn(move || run_attempt(app, state, generation));
@@ -872,13 +1108,23 @@ fn request_retry(app: &AppHandle, state: &Arc<RuntimeState>) {
     if state.shutting_down.load(Ordering::Acquire) || state.retrying.swap(true, Ordering::AcqRel) {
         return;
     }
+    let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+        state.retrying.store(false, Ordering::Release);
+        return;
+    };
+    let Ok(_event_gate) = state.generation_event_gate.lock() else {
+        state.retrying.store(false, Ordering::Release);
+        return;
+    };
     let cleanup_generation = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
+    reset_host_observation(state);
     transition(
         app,
         state,
         LifecycleState::Stopping,
         "Stopping the previous Host before retry.",
     );
+    drop(_event_gate);
     let app = app.clone();
     let state = Arc::clone(state);
     thread::spawn(move || {
@@ -923,8 +1169,18 @@ fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>) {
     if state.shutting_down.swap(true, Ordering::AcqRel) {
         return;
     }
+    let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+        app.exit(1);
+        return;
+    };
+    let Ok(_event_gate) = state.generation_event_gate.lock() else {
+        app.exit(1);
+        return;
+    };
     state.generation.fetch_add(1, Ordering::AcqRel);
+    reset_host_observation(state);
     transition(app, state, LifecycleState::Stopping, "Stopping local Host.");
+    drop(_event_gate);
     let app = app.clone();
     let state = Arc::clone(state);
     thread::spawn(move || {
@@ -1059,23 +1315,8 @@ fn startup_copy_diagnostics(
         .map_err(|error| error.to_string())
 }
 
-/// 在系统文件管理器中打开日志目录。
-#[tauri::command]
-fn startup_reveal_logs(app: AppHandle, state: State<'_, Arc<RuntimeState>>) -> Result<(), String> {
-    fs::create_dir_all(&state.logs_dir).map_err(|error| error.to_string())?;
-    #[cfg(all(debug_assertions, feature = "wdio"))]
-    if std::env::var_os("DSH_TEST_RECORD_FILE").is_some() {
-        record_wdio_event(serde_json::json!({ "event": "logs-opened" }));
-        return Ok(());
-    }
-    app.opener()
-        .open_path(state.logs_dir.to_string_lossy().to_string(), None::<String>)
-        .map_err(|error| error.to_string())
-}
-
-/// 创建 startup window，注册 Tauri IPC，并启动 sidecar 生命周期监督线程。
+/// 创建 Startup window，注册 Tauri IPC，并启动 direct CLI 生命周期监督线程。
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let logs_dir = app.path().app_data_dir()?.join("logs");
     let state = Arc::new(RuntimeState {
         snapshot: Mutex::new(LifecycleSnapshot {
             state: LifecycleState::Starting,
@@ -1083,9 +1324,13 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             origin: None,
         }),
         process: Mutex::new(None),
+        generation_event_gate: Mutex::new(()),
+        navigation_operation_gate: Mutex::new(()),
         lifecycle_gate: Mutex::new(()),
         host_origin: Mutex::new(None),
         host_generation: Mutex::new(None),
+        webview_navigation_generation: Mutex::new(None),
+        webview_load_generation: Mutex::new(None),
         startup_url: Mutex::new(None),
         generation: AtomicU64::new(0),
         retrying: AtomicBool::new(false),
@@ -1093,7 +1338,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         attempt_started: Mutex::new(None),
         node_path_status: Mutex::new("not-checked".into()),
         last_process_observation: Mutex::new(None),
-        logs_dir,
         last_error: Mutex::new(None),
     });
     app.manage(Arc::clone(&state));
@@ -1108,10 +1352,14 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let state = Arc::clone(&state);
                 let app = app.handle().clone();
                 move |_window, payload| {
+                    let url = payload.url();
+                    if payload.event() == PageLoadEvent::Started {
+                        begin_client_page_load(&state, url);
+                        return;
+                    }
                     if !is_finished_page_load(payload.event()) {
                         return;
                     }
-                    let url = payload.url();
                     let is_app_page = (url.scheme() == "http"
                         && url.host_str() == Some("tauri.localhost"))
                         || (url.scheme() == "tauri" && url.host_str() == Some("localhost"));
@@ -1163,6 +1411,18 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 }
             })
             .build()?;
+    if let Ok(url) = startup_window.url() {
+        if is_packaged_startup_url(&url) {
+            if let Ok(mut startup_url) = state.startup_url.lock() {
+                *startup_url = Some(url.to_string());
+            }
+        }
+        #[cfg(all(debug_assertions, feature = "wdio"))]
+        record_wdio_event(serde_json::json!({
+            "event": "startup-window-created",
+            "url": url.as_str()
+        }));
+    }
     let state_for_close = Arc::clone(&state);
     startup_window.on_window_event(move |event| match event {
         WindowEvent::CloseRequested { api, .. } => {
@@ -1220,8 +1480,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             startup_snapshot,
             startup_retry,
-            startup_copy_diagnostics,
-            startup_reveal_logs
+            startup_copy_diagnostics
         ]);
     #[cfg(feature = "wdio")]
     let builder = builder
@@ -1237,11 +1496,11 @@ fn main() {
 mod tests {
     use super::{
         build_startup_diagnostics, bundled_node_relative_path, decide_navigation,
-        is_current_host_page, is_finished_page_load, is_html_client_response,
-        is_packaged_startup_url, parse_loopback_address, DiagnosticCode, LifecycleSnapshot,
-        LifecycleState, NavigationDecision, PageLoadEvent, ProcessObservation, RuntimeState,
+        exit_requires_failure, is_current_host_page_event, is_finished_page_load,
+        is_html_client_response, is_packaged_startup_url, parse_loopback_address, DiagnosticCode,
+        ExitReason, LifecycleSnapshot, LifecycleState, NavigationDecision, PageLoadEvent,
+        ProcessObservation, RuntimeState,
     };
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Mutex;
     /// 验证生命周期保留可恢复状态。
@@ -1249,8 +1508,19 @@ mod tests {
     fn lifecycle_has_recoverable_states() {
         assert_ne!(LifecycleState::Failed, LifecycleState::Ready);
         assert_ne!(LifecycleState::Stopping, LifecycleState::Starting);
+        assert_eq!(
+            LifecycleState::ALL,
+            [
+                LifecycleState::Starting,
+                LifecycleState::WaitingForClient,
+                LifecycleState::ProlongedStartup,
+                LifecycleState::Ready,
+                LifecycleState::Failed,
+                LifecycleState::Stopping,
+            ]
+        );
     }
-    /// 验证 sidecar 返回的规范 origin 尾斜杠不会破坏 TCP readiness 探测。
+    /// 验证固定 origin 的尾斜杠不会破坏 TCP readiness 探测。
     #[test]
     fn parses_loopback_origin_with_trailing_slash() {
         assert_eq!(
@@ -1270,6 +1540,12 @@ mod tests {
         ));
         assert!(!is_html_client_response(
             b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n\r\n<html></html>"
+        ));
+        assert!(!is_html_client_response(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:3080/login\r\nContent-Type: text/html\r\n\r\n<html></html>"
+        ));
+        assert!(!is_html_client_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n   \n"
         ));
     }
 
@@ -1299,6 +1575,9 @@ mod tests {
         ));
         assert!(is_packaged_startup_url(
             &"tauri://localhost/index.html".parse().unwrap()
+        ));
+        assert!(is_packaged_startup_url(
+            &"tauri://localhost".parse().unwrap()
         ));
         assert_eq!(
             decide_navigation("https://example.com", startup, host),
@@ -1331,9 +1610,13 @@ mod tests {
                 origin: None,
             }),
             process: Mutex::new(None),
+            generation_event_gate: Mutex::new(()),
+            navigation_operation_gate: Mutex::new(()),
             lifecycle_gate: Mutex::new(()),
             host_origin: Mutex::new(None),
             host_generation: Mutex::new(None),
+            webview_navigation_generation: Mutex::new(None),
+            webview_load_generation: Mutex::new(None),
             startup_url: Mutex::new(None),
             generation: AtomicU64::new(1),
             retrying: AtomicBool::new(false),
@@ -1347,7 +1630,6 @@ mod tests {
                 exit_reason: "unexpected".into(),
                 cleanup_outcome: Some("forced".into()),
             })),
-            logs_dir: PathBuf::from(r#"C:\Users\alice\secret"#),
             last_error: Mutex::new(Some(DiagnosticCode::SpawnFailed)),
         };
         let snapshot = LifecycleSnapshot {
@@ -1367,34 +1649,62 @@ mod tests {
     /// 验证旧轮次或非等待状态的 Host 页面加载不会将桌面端误标为 Ready。
     #[test]
     fn only_current_waiting_host_page_is_client_ready() {
-        let state = RuntimeState {
-            snapshot: Mutex::new(LifecycleSnapshot {
-                state: LifecycleState::WaitingForClient,
-                message: "ignored".into(),
-                origin: Some("http://127.0.0.1:1234/".into()),
-            }),
-            process: Mutex::new(None),
-            lifecycle_gate: Mutex::new(()),
-            host_origin: Mutex::new(Some("http://127.0.0.1:1234/".into())),
-            host_generation: Mutex::new(Some(3)),
-            startup_url: Mutex::new(None),
-            generation: AtomicU64::new(3),
-            retrying: AtomicBool::new(false),
-            shutting_down: AtomicBool::new(false),
-            attempt_started: Mutex::new(None),
-            node_path_status: Mutex::new("bundled".into()),
-            last_process_observation: Mutex::new(None),
-            logs_dir: PathBuf::from("logs"),
-            last_error: Mutex::new(None),
-        };
         let current = "http://127.0.0.1:1234/".parse().unwrap();
         let stale = "http://127.0.0.1:4321/".parse().unwrap();
-        assert!(is_current_host_page(&state, &current));
-        assert!(!is_current_host_page(&state, &stale));
-        state
-            .generation
-            .store(4, std::sync::atomic::Ordering::Release);
-        assert!(!is_current_host_page(&state, &current));
+        assert!(is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            true,
+            Some("http://127.0.0.1:1234/"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            4,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            true,
+            Some("http://127.0.0.1:1234/"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            Some(2),
+            LifecycleState::WaitingForClient,
+            true,
+            Some("http://127.0.0.1:1234/"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            false,
+            Some("http://127.0.0.1:1234/"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::Ready,
+            true,
+            Some("http://127.0.0.1:1234/"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            true,
+            Some("http://127.0.0.1:1234/"),
+            &stale,
+        ));
     }
 
     /// 验证 WebView Started 事件不会提前满足 client readiness。
@@ -1402,5 +1712,14 @@ mod tests {
     fn client_readiness_requires_finished_page_load() {
         assert!(!is_finished_page_load(PageLoadEvent::Started));
         assert!(is_finished_page_load(PageLoadEvent::Finished));
+    }
+
+    /// 验证 Ready 后当前 CLI 的非预期退出会失败，而预期或旧轮次退出被忽略。
+    #[test]
+    fn classifies_runtime_exit_against_current_generation() {
+        assert!(exit_requires_failure(3, 3, ExitReason::Unexpected));
+        assert!(!exit_requires_failure(3, 3, ExitReason::Requested));
+        assert!(!exit_requires_failure(2, 3, ExitReason::Unexpected));
+        assert!(!exit_requires_failure(2, 3, ExitReason::StaleGeneration));
     }
 }
