@@ -26,6 +26,10 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 #[cfg(windows)]
+use windows_sys::Win32::Globalization::{
+    CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN,
+};
+#[cfg(windows)]
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
@@ -46,9 +50,11 @@ use windows_sys::Win32::System::JobObjects::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetCurrentProcess, GetExitCodeProcess, ResumeThread, TerminateProcess,
-    WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION,
-    STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESHOWWINDOW,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 pub(crate) const HOST_ADDRESS: &str = "127.0.0.1";
 pub(crate) const HOST_PORT: u16 = 3080;
@@ -65,22 +71,12 @@ const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
 #[cfg(any(windows, test))]
 const SW_HIDE_VALUE: u16 = 0;
 
-/// 描述 Windows 启动期间必须保持的进程接管顺序。
-#[cfg(any(windows, test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowsLaunchStep {
-    CreateSuspended,
-    AssignJob,
-    ResumePrimaryThread,
-}
-
-/// 描述 Windows CLI 创建标志、窗口可见性和 Job 接管顺序。
+/// 描述 Windows CLI 创建标志和窗口可见性。
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WindowsLaunchContract {
     creation_flags: u32,
     show_window: u16,
-    steps: [WindowsLaunchStep; 3],
 }
 
 /// 返回 Windows direct CLI 的稳定创建契约，供实现与跨平台测试共用。
@@ -89,13 +85,25 @@ fn windows_launch_contract() -> WindowsLaunchContract {
     WindowsLaunchContract {
         creation_flags: CREATE_NEW_CONSOLE_FLAG | CREATE_SUSPENDED_FLAG,
         show_window: SW_HIDE_VALUE,
-        steps: [
-            WindowsLaunchStep::CreateSuspended,
-            WindowsLaunchStep::AssignJob,
-            WindowsLaunchStep::ResumePrimaryThread,
-        ],
     }
 }
+
+/// 用生产相同控制流保证挂起进程先接管 Job，再恢复初始线程。
+#[cfg(any(windows, test))]
+fn assign_then_resume<C, O, E>(
+    child: &mut C,
+    assign: impl FnOnce(&C) -> Result<O, E>,
+    resume: impl FnOnce(&mut C) -> Result<(), E>,
+) -> Result<O, (Option<O>, E)> {
+    let ownership = assign(child).map_err(|error| (None, error))?;
+    match resume(child) {
+        Ok(()) => Ok(ownership),
+        Err(error) => Err((Some(ownership), error)),
+    }
+}
+
+#[cfg(windows)]
+static WINDOWS_CONSOLE_CONTROL: Mutex<()> = Mutex::new(());
 
 /// 按 CommandLineToArgvW 兼容规则引用一个 Windows UTF-16 参数。
 #[cfg(any(windows, test))]
@@ -223,6 +231,87 @@ struct WindowsStartupHandles {
     owned: Vec<HANDLE>,
 }
 
+/// 保存 Windows STARTUPINFOEX attribute list 的对齐内存并负责释放内部资源。
+#[cfg(windows)]
+struct WindowsAttributeList {
+    storage: Vec<usize>,
+}
+
+#[cfg(windows)]
+impl WindowsAttributeList {
+    /// 创建只允许指定标准流句柄继承的 PROC_THREAD_ATTRIBUTE_HANDLE_LIST。
+    fn for_handles(handles: &mut [HANDLE]) -> Result<Self, String> {
+        let mut bytes = 0usize;
+        unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut bytes);
+        }
+        if bytes == 0 {
+            return Err(format!(
+                "failed to size Windows process attribute list: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let words = bytes.div_ceil(std::mem::size_of::<usize>());
+        let mut list = Self {
+            storage: vec![0usize; words],
+        };
+        if unsafe { InitializeProcThreadAttributeList(list.as_mut_ptr(), 1, 0, &mut bytes) } == 0 {
+            list.storage.clear();
+            return Err(format!(
+                "failed to initialize Windows process attribute list: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if unsafe {
+            UpdateProcThreadAttribute(
+                list.as_mut_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast(),
+                std::mem::size_of_val(handles),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
+            unsafe { DeleteProcThreadAttributeList(list.as_mut_ptr()) };
+            list.storage.clear();
+            return Err(format!(
+                "failed to restrict Windows inherited handles: {error}"
+            ));
+        }
+        Ok(list)
+    }
+
+    /// 返回供 STARTUPINFOEXW 使用的 attribute list 地址。
+    fn as_mut_ptr(&mut self) -> *mut std::ffi::c_void {
+        self.storage.as_mut_ptr().cast()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsAttributeList {
+    /// 在 backing memory 释放前销毁已初始化的 attribute list。
+    fn drop(&mut self) {
+        if !self.storage.is_empty() {
+            unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) };
+        }
+    }
+}
+
+/// 去除无效和重复句柄，构造唯一的 Windows 继承 allowlist。
+#[cfg(any(windows, test))]
+fn unique_handle_allowlist(handles: impl IntoIterator<Item = isize>) -> Vec<isize> {
+    let mut allowed = Vec::new();
+    for handle in handles {
+        if handle != 0 && handle != -1 && !allowed.contains(&handle) {
+            allowed.push(handle);
+        }
+    }
+    allowed
+}
+
 #[cfg(windows)]
 impl Drop for WindowsStartupHandles {
     /// CreateProcessW 返回后关闭父进程侧临时标准流句柄。
@@ -236,7 +325,7 @@ impl Drop for WindowsStartupHandles {
 /// 创建一个可继承的 Windows NUL 句柄。
 #[cfg(windows)]
 fn open_inheritable_null(access: u32) -> Result<HANDLE, String> {
-    let mut security = SECURITY_ATTRIBUTES {
+    let security = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: std::ptr::null_mut(),
         bInheritHandle: 1,
@@ -247,7 +336,7 @@ fn open_inheritable_null(access: u32) -> Result<HANDLE, String> {
             name.as_ptr(),
             access,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &mut security,
+            &security,
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
             std::ptr::null_mut(),
@@ -604,33 +693,60 @@ fn windows_command_line(command: &Command) -> Result<Vec<u16>, String> {
     Ok(command_line)
 }
 
-/// 按 Windows 大小写不敏感语义合并、去重并排序进程环境。
-#[cfg(any(windows, test))]
+/// 用 Windows ordinal case-insensitive 规则比较两个 UTF-16 环境变量名。
+#[cfg(windows)]
+fn compare_windows_environment_names(
+    left: &std::ffi::OsStr,
+    right: &std::ffi::OsStr,
+) -> std::cmp::Ordering {
+    let left = left.encode_wide().collect::<Vec<_>>();
+    let right = right.encode_wide().collect::<Vec<_>>();
+    assert!(left.len() <= i32::MAX as usize && right.len() <= i32::MAX as usize);
+    match unsafe {
+        CompareStringOrdinal(
+            left.as_ptr(),
+            left.len() as i32,
+            right.as_ptr(),
+            right.len() as i32,
+            1,
+        )
+    } {
+        CSTR_LESS_THAN => std::cmp::Ordering::Less,
+        CSTR_EQUAL => std::cmp::Ordering::Equal,
+        CSTR_GREATER_THAN => std::cmp::Ordering::Greater,
+        unexpected => panic!("CompareStringOrdinal returned {unexpected}"),
+    }
+}
+
+/// 按 Windows ordinal case-insensitive 语义合并、去重并排序进程环境。
+#[cfg(windows)]
 fn merge_windows_environment(
     inherited: impl IntoIterator<Item = (OsString, OsString)>,
     overrides: impl IntoIterator<Item = (OsString, Option<OsString>)>,
 ) -> Vec<(OsString, OsString)> {
     let mut environment = Vec::new();
-    for (name, value) in inherited
-        .into_iter()
-        .map(|(name, value)| (name, Some(value)))
-        .chain(overrides)
-    {
-        let folded = name.to_string_lossy();
+    for (name, value) in inherited {
         environment.retain(|(existing, _): &(OsString, OsString)| {
-            !existing
-                .to_string_lossy()
-                .eq_ignore_ascii_case(folded.as_ref())
+            compare_windows_environment_names(existing, &name) != std::cmp::Ordering::Equal
         });
-        if let Some(value) = value {
-            environment.push((name, value));
-        }
+        environment.push((name, value));
     }
-    environment.sort_by(|(left, _), (right, _)| {
-        left.to_string_lossy()
-            .to_lowercase()
-            .cmp(&right.to_string_lossy().to_lowercase())
-    });
+    let overrides = overrides.into_iter().collect::<Vec<_>>();
+    for (name, _) in overrides.iter().filter(|(_, value)| value.is_none()) {
+        environment.retain(|(existing, _)| {
+            compare_windows_environment_names(existing, name) != std::cmp::Ordering::Equal
+        });
+    }
+    for (name, value) in overrides
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|value| (name, value)))
+    {
+        environment.retain(|(existing, _)| {
+            compare_windows_environment_names(existing, &name) != std::cmp::Ordering::Equal
+        });
+        environment.push((name, value));
+    }
+    environment.sort_by(|(left, _), (right, _)| compare_windows_environment_names(left, right));
     environment
 }
 
@@ -665,6 +781,9 @@ fn windows_environment_block(command: &Command) -> Result<Vec<u16>, String> {
 /// 通过隐藏的专属 console 创建挂起 CLI，并保留主线程句柄供 Job 接管后恢复。
 #[cfg(windows)]
 fn spawn_windows_command(command: &Command) -> Result<PlatformChild, String> {
+    let _console = WINDOWS_CONSOLE_CONTROL
+        .lock()
+        .map_err(|_| "Windows console control lock poisoned".to_string())?;
     let contract = windows_launch_contract();
     let application = windows_wide(command.get_program())?;
     let mut command_line = windows_command_line(command)?;
@@ -674,13 +793,23 @@ fn spawn_windows_command(command: &Command) -> Result<PlatformChild, String> {
         .map(|directory| windows_wide(directory.as_os_str()))
         .transpose()?;
     let handles = windows_startup_handles()?;
-    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
-    startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-    startup.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
-    startup.wShowWindow = contract.show_window;
-    startup.hStdInput = handles.input;
-    startup.hStdOutput = handles.output;
-    startup.hStdError = handles.error;
+    let mut inherited_handles = unique_handle_allowlist([
+        handles.input as isize,
+        handles.output as isize,
+        handles.error as isize,
+    ])
+    .into_iter()
+    .map(|handle| handle as HANDLE)
+    .collect::<Vec<_>>();
+    let mut attributes = WindowsAttributeList::for_handles(&mut inherited_handles)?;
+    let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    startup.StartupInfo.wShowWindow = contract.show_window;
+    startup.StartupInfo.hStdInput = handles.input;
+    startup.StartupInfo.hStdOutput = handles.output;
+    startup.StartupInfo.hStdError = handles.error;
+    startup.lpAttributeList = attributes.as_mut_ptr();
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let created = unsafe {
         CreateProcessW(
@@ -689,12 +818,12 @@ fn spawn_windows_command(command: &Command) -> Result<PlatformChild, String> {
             std::ptr::null(),
             std::ptr::null(),
             1,
-            contract.creation_flags | CREATE_UNICODE_ENVIRONMENT,
+            contract.creation_flags | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
             environment.as_ptr().cast(),
             working_directory
                 .as_ref()
                 .map_or(std::ptr::null(), |directory| directory.as_ptr()),
-            &startup,
+            &startup.StartupInfo,
             &mut process,
         )
     };
@@ -905,6 +1034,32 @@ fn spawn_owned_command_with_graceful_action(
     let mut child = spawn_windows_command(&command).map_err(|_| SupervisorError::SpawnFailed)?;
     #[cfg(not(windows))]
     let mut child = command.spawn().map_err(|_| SupervisorError::SpawnFailed)?;
+    #[cfg(windows)]
+    let ownership = match assign_then_resume(
+        &mut child,
+        ProcessOwnership::attach,
+        PlatformChild::resume_initial_thread,
+    ) {
+        Ok(ownership) => ownership,
+        Err((None, _)) => {
+            return Err(if terminate_unowned_child(&mut child).is_ok() {
+                SupervisorError::SpawnFailed
+            } else {
+                SupervisorError::CleanupFailed
+            });
+        }
+        Err((Some(ownership), _)) => {
+            let cleanup = ownership
+                .force_kill_tree()
+                .and_then(|_| child.wait().map(|_| ()).map_err(|error| error.to_string()));
+            return Err(if cleanup.is_ok() {
+                SupervisorError::SpawnFailed
+            } else {
+                SupervisorError::CleanupFailed
+            });
+        }
+    };
+    #[cfg(not(windows))]
     let ownership = match ProcessOwnership::attach(&child) {
         Ok(ownership) => ownership,
         Err(_) => {
@@ -915,17 +1070,6 @@ fn spawn_owned_command_with_graceful_action(
             });
         }
     };
-    #[cfg(windows)]
-    if child.resume_initial_thread().is_err() {
-        let cleanup = ownership
-            .force_kill_tree()
-            .and_then(|_| child.wait().map(|_| ()).map_err(|error| error.to_string()));
-        return Err(if cleanup.is_ok() {
-            SupervisorError::SpawnFailed
-        } else {
-            SupervisorError::CleanupFailed
-        });
-    }
     Ok(Arc::new(CliProcess {
         generation,
         child: Mutex::new(child),
@@ -967,14 +1111,12 @@ fn platform_graceful_action(pid: u32) -> Result<(), String> {
     }
 }
 
-#[cfg(windows)]
-static WINDOWS_CONSOLE_CONTROL: Mutex<()> = Mutex::new(());
-
 /// 管理 Desktop 临时附着 child console 及 debug 父 console 恢复。
 #[cfg(windows)]
 struct WindowsConsoleAttachment {
     restore_parent: bool,
     child_attached: bool,
+    ignore_enabled: bool,
 }
 
 #[cfg(windows)]
@@ -993,6 +1135,7 @@ impl WindowsConsoleAttachment {
             let mut attachment = Self {
                 restore_parent,
                 child_attached: false,
+                ignore_enabled: false,
             };
             let restore = attachment.restore();
             return Err(match restore {
@@ -1003,6 +1146,7 @@ impl WindowsConsoleAttachment {
         let mut attachment = Self {
             restore_parent,
             child_attached: true,
+            ignore_enabled: false,
         };
         if unsafe { SetConsoleCtrlHandler(None, 1) } == 0 {
             let handler_error = io::Error::last_os_error();
@@ -1014,36 +1158,59 @@ impl WindowsConsoleAttachment {
                 }
             });
         }
+        attachment.ignore_enabled = true;
         Ok(attachment)
     }
 
-    /// 从 child console 分离，并恢复当前无自定义 handler 的 Desktop 默认 Ctrl+C 属性。
+    /// 从 child console 分离，并在有无父 console 时都撤销 Desktop 的 Ctrl+C ignore 属性。
     fn restore(&mut self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if self.ignore_enabled {
+            if unsafe { SetConsoleCtrlHandler(None, 0) } == 0 {
+                errors.push(format!(
+                    "failed to restore Desktop Ctrl+C handling before detach: {}",
+                    io::Error::last_os_error()
+                ));
+            } else {
+                self.ignore_enabled = false;
+            }
+        }
         if self.child_attached {
             if unsafe { FreeConsole() } == 0 {
-                return Err(format!(
+                errors.push(format!(
                     "failed to detach CLI console: {}",
                     io::Error::last_os_error()
                 ));
+            } else {
+                self.child_attached = false;
             }
-            self.child_attached = false;
         }
-        if self.restore_parent {
+        if self.restore_parent && !self.child_attached {
             if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } == 0 {
-                return Err(format!(
+                errors.push(format!(
                     "failed to restore Desktop parent console: {}",
                     io::Error::last_os_error()
                 ));
+            } else {
+                self.restore_parent = false;
             }
-            self.restore_parent = false;
+        }
+        // 前一次撤销若失败，在 console 切换完成后再尝试一次，Drop 仍会继续兜底。
+        if self.ignore_enabled {
             if unsafe { SetConsoleCtrlHandler(None, 0) } == 0 {
-                return Err(format!(
+                errors.push(format!(
                     "failed to restore Desktop Ctrl+C handling: {}",
                     io::Error::last_os_error()
                 ));
+            } else {
+                self.ignore_enabled = false;
             }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     /// 向专属 console 广播真实 Ctrl+C，并给 handler thread 一个启动窗口后恢复 Desktop。
@@ -1249,17 +1416,21 @@ mod tests {
     #[cfg(any(unix, windows))]
     use super::spawn_owned_command_with_graceful_action;
     use super::{
-        classify_exit, classify_exit_with_code, merge_windows_environment, preflight_address,
+        assign_then_resume, classify_exit, classify_exit_with_code, preflight_address,
         prepend_node_path, quote_windows_argument, resolve_dsh_cli_entry, spawn_owned_command,
-        windows_launch_contract, CliCommandPlan, ExitReason, SupervisorError, WindowsLaunchStep,
-        CREATE_NEW_CONSOLE_FLAG, CREATE_NEW_PROCESS_GROUP_FLAG, CREATE_NO_WINDOW_FLAG,
-        CREATE_SUSPENDED_FLAG, HOST_ADDRESS, SW_HIDE_VALUE,
+        unique_handle_allowlist, windows_launch_contract, CliCommandPlan, ExitReason,
+        SupervisorError, CREATE_NEW_CONSOLE_FLAG, CREATE_NEW_PROCESS_GROUP_FLAG,
+        CREATE_NO_WINDOW_FLAG, CREATE_SUSPENDED_FLAG, HOST_ADDRESS, SW_HIDE_VALUE,
     };
+    #[cfg(windows)]
+    use super::{merge_windows_environment, open_inheritable_null};
     use crate::lifecycle::StopOutcome;
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io;
     use std::net::{Ipv4Addr, TcpListener};
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     #[cfg(unix)]
@@ -1269,6 +1440,14 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+    #[cfg(windows)]
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetHandleInformation, GENERIC_READ, HANDLE, WAIT_OBJECT_0,
+    };
+    #[cfg(windows)]
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     #[cfg(unix)]
     static HELPER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -1408,23 +1587,42 @@ mod tests {
         assert_eq!(classify_exit(7, 8, Some(8)), ExitReason::StaleGeneration);
     }
 
-    /// 验证 Windows CLI 必须隐藏创建、先挂起接管 Job，再恢复主线程。
+    /// 验证 Windows CLI 必须在隐藏的专属 console 中以挂起态创建。
     #[test]
-    fn windows_launch_contract_uses_hidden_dedicated_console_and_job_ordering() {
+    fn windows_launch_contract_uses_hidden_dedicated_console() {
         let contract = windows_launch_contract();
         assert_ne!(contract.creation_flags & CREATE_NEW_CONSOLE_FLAG, 0);
         assert_ne!(contract.creation_flags & CREATE_SUSPENDED_FLAG, 0);
         assert_eq!(contract.creation_flags & CREATE_NEW_PROCESS_GROUP_FLAG, 0);
         assert_eq!(contract.creation_flags & CREATE_NO_WINDOW_FLAG, 0);
         assert_eq!(contract.show_window, SW_HIDE_VALUE);
-        assert_eq!(
-            contract.steps,
-            [
-                WindowsLaunchStep::CreateSuspended,
-                WindowsLaunchStep::AssignJob,
-                WindowsLaunchStep::ResumePrimaryThread,
-            ]
-        );
+    }
+
+    /// 验证生产消费的接管 seam 始终先 Assign Job，再 Resume 初始线程。
+    #[test]
+    fn windows_takeover_sequence_assigns_before_resume() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let mut child = ();
+        let ownership = assign_then_resume(
+            &mut child,
+            |_| {
+                calls.borrow_mut().push("assign");
+                Ok::<_, ()>("job")
+            },
+            |_| {
+                calls.borrow_mut().push("resume");
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(ownership, "job");
+        assert_eq!(calls.into_inner(), ["assign", "resume"]);
+    }
+
+    /// 验证 Windows 继承 allowlist 会过滤无效句柄并保持唯一。
+    #[test]
+    fn windows_handle_allowlist_contains_only_unique_valid_handles() {
+        assert_eq!(unique_handle_allowlist([0, 41, -1, 42, 41]), [41, 42]);
     }
 
     /// 验证 CreateProcessW 命令行对空白、引号、Unicode 和结尾反斜杠正确转义。
@@ -1445,27 +1643,38 @@ mod tests {
     }
 
     /// 验证 Windows 环境继承与覆盖会忽略变量名大小写、删除项并稳定排序。
+    #[cfg(windows)]
     #[test]
     fn merges_windows_environment_without_case_duplicates() {
+        let unpaired_upper = OsString::from_wide(&[0xd800, b'X' as u16]);
+        let unpaired_lower = OsString::from_wide(&[0xd800, b'x' as u16]);
         let environment = merge_windows_environment(
             [
                 (OsString::from("Path"), OsString::from("old")),
-                (OsString::from("ZETA"), OsString::from("last")),
-                (OsString::from("path"), OsString::from("newer")),
+                (OsString::from("ÄVAR"), OsString::from("old-nonascii")),
+                (unpaired_upper, OsString::from("old-unpaired")),
             ],
             [
                 (OsString::from("PATH"), Some(OsString::from("owned"))),
-                (OsString::from("zeta"), None),
-                (OsString::from("Alpha"), Some(OsString::from("first"))),
+                (OsString::from("Path"), None),
+                (OsString::from("ävar"), Some(OsString::from("new-nonascii"))),
+                (unpaired_lower, Some(OsString::from("new-unpaired"))),
+                (OsString::from("DSH_HOME"), Some(OsString::from("home"))),
             ],
         );
-        assert_eq!(
-            environment,
-            [
-                (OsString::from("Alpha"), OsString::from("first")),
-                (OsString::from("PATH"), OsString::from("owned")),
-            ]
-        );
+        assert_eq!(environment.len(), 4);
+        assert!(environment
+            .iter()
+            .any(|(name, value)| name == "PATH" && value == "owned"));
+        assert!(environment
+            .iter()
+            .any(|(name, value)| name == "ävar" && value == "new-nonascii"));
+        assert!(environment.iter().any(|(name, value)| name
+            == &OsString::from_wide(&[0xd800, b'x' as u16])
+            && value == "new-unpaired"));
+        assert!(environment
+            .iter()
+            .any(|(name, value)| name == "DSH_HOME" && value == "home"));
     }
 
     /// 验证 code 130 只有在同一 owned generation 已登记停止请求时才是 requested。
@@ -1728,6 +1937,105 @@ mod tests {
         assert_eq!(report.exit.unwrap().reason, ExitReason::Requested);
     }
 
+    /// 持有 Windows 后代进程的独立等待句柄，避免 PID 复用影响清理断言。
+    #[cfg(windows)]
+    struct WindowsTestProcessHandle(HANDLE);
+
+    #[cfg(windows)]
+    impl WindowsTestProcessHandle {
+        /// 在停止前打开后代句柄，供停止后明确等待该后代退出。
+        fn open(pid_file: &Path) -> Self {
+            for _ in 0..200 {
+                let pid = fs::read_to_string(pid_file)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                if let Some(pid) = pid {
+                    let handle = unsafe {
+                        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid)
+                    };
+                    if !handle.is_null() {
+                        return Self(handle);
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("cannot open descendant process from {}", pid_file.display());
+        }
+
+        /// 断言监督停止后该后代进程句柄已进入 signalled 状态。
+        fn assert_exited(&self) {
+            assert_eq!(unsafe { WaitForSingleObject(self.0, 2_000) }, WAIT_OBJECT_0);
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for WindowsTestProcessHandle {
+        /// 关闭测试持有的后代等待句柄。
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// 子测试检查一个不在 allowlist 中的父进程可继承句柄是否泄漏。
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn windows_inherited_handle_probe_helper() {
+        let Some(raw_handle) = std::env::var_os("DSH_WINDOWS_SENTINEL_HANDLE") else {
+            return;
+        };
+        let handle = raw_handle.to_string_lossy().parse::<isize>().unwrap() as HANDLE;
+        let mut flags = 0;
+        let inherited = unsafe { GetHandleInformation(handle, &mut flags) } != 0;
+        fs::write(
+            std::env::var_os("DSH_WINDOWS_SENTINEL_RESULT").unwrap(),
+            if inherited {
+                b"inherited".as_slice()
+            } else {
+                b"closed".as_slice()
+            },
+        )
+        .unwrap();
+    }
+
+    /// 验证 STARTUPINFOEX allowlist 不会把额外 inheritable sentinel 泄漏给 child。
+    #[cfg(windows)]
+    #[test]
+    fn windows_child_does_not_inherit_unlisted_handle() {
+        let root = temporary_directory("windows-handle-allowlist");
+        let result = root.join("result");
+        let sentinel = open_inheritable_null(GENERIC_READ).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "cli_supervisor::tests::windows_inherited_handle_probe_helper",
+                "--ignored",
+            ])
+            .env(
+                "DSH_WINDOWS_SENTINEL_HANDLE",
+                (sentinel as isize).to_string(),
+            )
+            .env("DSH_WINDOWS_SENTINEL_RESULT", &result);
+        let process = spawn_owned_command(command, 30, || Ok(())).unwrap();
+        for _ in 0..200 {
+            if result.is_file() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(fs::read(&result).unwrap(), b"closed");
+        for _ in 0..200 {
+            if process.try_exit(30).unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(process.try_exit(30).unwrap().is_some());
+        unsafe { CloseHandle(sentinel) };
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// 定位当前 Windows 架构随包交付的官方 Node executable。
     #[cfg(windows)]
     fn packaged_windows_node() -> PathBuf {
@@ -1744,10 +2052,9 @@ mod tests {
             .join("node.exe")
     }
 
-    /// 用官方 Node SIGINT helper 验证真实 Ctrl+C、code 130、listener 与 Job tree 回收。
+    /// 运行一轮官方 Node Ctrl+C 集成场景，并独立确认 leader listener 与后代句柄均退出。
     #[cfg(windows)]
-    #[test]
-    fn windows_ctrl_c_reaches_node_and_reclaims_owned_tree() {
+    fn run_windows_ctrl_c_round(round: u64) {
         let node = packaged_windows_node();
         assert!(
             node.is_file(),
@@ -1756,7 +2063,7 @@ mod tests {
         let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = probe.local_addr().unwrap();
         drop(probe);
-        let root = temporary_directory("windows-ctrl-c-深度");
+        let root = temporary_directory(&format!("windows-ctrl-c-深度-{round}"));
         let script = root.join("sigint-helper.cjs");
         let ready = root.join("ready");
         fs::write(
@@ -1789,7 +2096,7 @@ server.listen(Number(port), host, () => fs.writeFileSync(process.env.DSH_WINDOWS
             .current_dir(&root)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let process = spawn_owned_command(command, 31, || Ok(())).unwrap();
+        let process = spawn_owned_command(command, 31 + round, || Ok(())).unwrap();
         for _ in 0..400 {
             if ready.is_file() {
                 break;
@@ -1797,15 +2104,25 @@ server.listen(Number(port), host, () => fs.writeFileSync(process.env.DSH_WINDOWS
             thread::sleep(Duration::from_millis(25));
         }
         assert!(ready.is_file(), "Node SIGINT helper did not become ready");
+        let descendant = WindowsTestProcessHandle::open(&ready);
         let report = process
-            .stop(31, Duration::from_secs(8), Duration::from_secs(2))
+            .stop(31 + round, Duration::from_secs(8), Duration::from_secs(2))
             .unwrap();
         assert_eq!(report.outcome, StopOutcome::Graceful);
         let exit = report.exit.unwrap();
         assert_eq!(exit.status.code(), Some(130));
         assert_eq!(exit.reason, ExitReason::Requested);
+        descendant.assert_exited();
         assert!(TcpListener::bind(address).is_ok());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 连续两轮验证 Desktop ignore 状态已撤销，下一代 Node 仍能收到真实 Ctrl+C。
+    #[cfg(windows)]
+    #[test]
+    fn windows_ctrl_c_reaches_node_across_consecutive_spawns() {
+        run_windows_ctrl_c_round(0);
+        run_windows_ctrl_c_round(1);
     }
 
     /// 验证 Windows console 发送失败会立即转入 Job Object 强制回收。
@@ -1814,16 +2131,44 @@ server.listen(Number(port), host, () => fs.writeFileSync(process.env.DSH_WINDOWS
     fn windows_console_failure_forces_job_tree_cleanup() {
         let node = packaged_windows_node();
         assert!(node.is_file());
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let root = temporary_directory("windows-console-failure");
+        let ready = root.join("descendant-ready");
+        let script = root.join("failure-tree.cjs");
+        fs::write(
+            &script,
+            r#"const { spawn } = require('node:child_process')
+spawn(process.execPath, ['-e', `const fs=require('node:fs');const net=require('node:net');const [host,port]=process.env.DSH_WINDOWS_DESCENDANT_ADDRESS.split(':');net.createServer(()=>{}).listen(Number(port),host,()=>fs.writeFileSync(process.env.DSH_WINDOWS_DESCENDANT_READY,String(process.pid)));setInterval(()=>{},1000)`], { stdio: 'ignore', env: process.env })
+setInterval(() => {}, 1000)
+"#,
+        )
+        .unwrap();
         let mut command = Command::new(node);
-        command.args(["-e", "setInterval(() => {}, 1000)"]);
+        command
+            .arg(script)
+            .env("DSH_WINDOWS_DESCENDANT_ADDRESS", address.to_string())
+            .env("DSH_WINDOWS_DESCENDANT_READY", &ready);
         let process =
             spawn_owned_command_with_graceful_action(command, 32, || Ok(()), fail_graceful_action)
                 .unwrap();
+        for _ in 0..400 {
+            if ready.is_file() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(ready.is_file(), "failure descendant did not become ready");
+        let descendant = WindowsTestProcessHandle::open(&ready);
         let report = process
             .stop(32, Duration::from_secs(8), Duration::from_secs(2))
             .unwrap();
         assert_eq!(report.outcome, StopOutcome::Forced);
         assert_eq!(report.exit.unwrap().reason, ExitReason::Requested);
+        descendant.assert_exited();
+        assert!(TcpListener::bind(address).is_ok());
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// 验证 Windows CLI 忽略 Ctrl+C 时会在宽限期后由 Job Object 回收完整进程树。
@@ -1835,19 +2180,24 @@ server.listen(Number(port), host, () => fs.writeFileSync(process.env.DSH_WINDOWS
         let root = temporary_directory("windows-ctrl-c-timeout");
         let ready = root.join("ready");
         let script = root.join("stubborn-sigint.cjs");
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
         fs::write(
             &script,
             r#"const fs = require('node:fs')
 const { spawn } = require('node:child_process')
-spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+spawn(process.execPath, ['-e', `const fs=require('node:fs');const net=require('node:net');const [host,port]=process.env.DSH_WINDOWS_DESCENDANT_ADDRESS.split(':');net.createServer(()=>{}).listen(Number(port),host,()=>fs.writeFileSync(process.env.DSH_WINDOWS_CTRL_C_READY,String(process.pid)));setInterval(()=>{},1000)`], { stdio: 'ignore', env: process.env })
 process.on('SIGINT', () => {})
-fs.writeFileSync(process.env.DSH_WINDOWS_CTRL_C_READY, 'ready')
 setInterval(() => {}, 1000)
 "#,
         )
         .unwrap();
         let mut command = Command::new(node);
-        command.arg(script).env("DSH_WINDOWS_CTRL_C_READY", &ready);
+        command
+            .arg(script)
+            .env("DSH_WINDOWS_CTRL_C_READY", &ready)
+            .env("DSH_WINDOWS_DESCENDANT_ADDRESS", address.to_string());
         let process = spawn_owned_command(command, 33, || Ok(())).unwrap();
         for _ in 0..400 {
             if ready.is_file() {
@@ -1856,11 +2206,14 @@ setInterval(() => {}, 1000)
             thread::sleep(Duration::from_millis(25));
         }
         assert!(ready.is_file(), "stubborn Node helper did not become ready");
+        let descendant = WindowsTestProcessHandle::open(&ready);
         let report = process
             .stop(33, Duration::ZERO, Duration::from_secs(2))
             .unwrap();
         assert_eq!(report.outcome, StopOutcome::Forced);
         assert_eq!(report.exit.unwrap().reason, ExitReason::Requested);
+        descendant.assert_exited();
+        assert!(TcpListener::bind(address).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 }
