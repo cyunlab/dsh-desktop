@@ -7,7 +7,8 @@ export const DIRECT_DSH_WEB_ARGS: readonly ['web', '--host', '127.0.0.1', '--por
 export interface ProcessTreeOwnership {
   readonly rootPid?: number
   readonly platformName: NodeJS.Platform
-  readonly queryWindowsProcesses: () => Promise<readonly { readonly pid: number; readonly parentPid: number }[]>
+  readonly queryWindowsProcesses: (timeoutMilliseconds?: number) => Promise<readonly { readonly pid: number; readonly parentPid: number; readonly creationDate: string }[]>
+  readonly knownProcessIdentities: Map<number, string>
 }
 
 /** 串行执行固定端口探测。 */
@@ -17,13 +18,13 @@ export function withFixedPortProbeLock<T>(action: () => Promise<T>, options?: { 
 export function waitForChildExit(child: ChildProcess, timeoutMilliseconds?: number): Promise<void>
 
 /** 从 Windows 进程表解析由稳定 root PID 拥有的仍存活进程。 */
-export function windowsOwnedProcessIds(rootPid: number, rows: readonly { readonly pid: number; readonly parentPid: number }[]): number[]
+export function windowsOwnedProcessIds(rootPid: number, rootCreationDate: string, rows: readonly { readonly pid: number; readonly parentPid: number; readonly creationDate: string }[]): number[]
 
 /** 建立不依赖 leader 持续存活的进程树 ownership。 */
-export function ownProcessTree(child: ChildProcess, options?: { readonly platformName?: NodeJS.Platform; readonly queryWindowsProcesses?: ProcessTreeOwnership['queryWindowsProcesses'] }): ProcessTreeOwnership
+export function ownProcessTree(child: ChildProcess, options?: { readonly platformName?: NodeJS.Platform; readonly queryWindowsProcesses?: ProcessTreeOwnership['queryWindowsProcesses']; readonly captureTimeoutMilliseconds?: number }): Promise<ProcessTreeOwnership>
 
 /** 查询 owned process tree 是否完全消失。 */
-export function processTreeHasExited(ownership: ProcessTreeOwnership): Promise<boolean>
+export function processTreeHasExited(ownership: ProcessTreeOwnership, timeoutMilliseconds?: number): Promise<boolean>
 
 /** 等待 owned process tree 完全消失。 */
 export function waitForProcessTreeExit(ownership: ProcessTreeOwnership, timeoutMilliseconds?: number): Promise<void>
@@ -35,7 +36,7 @@ export function terminateProcessTree(child: ChildProcess, timeoutMilliseconds?: 
 export function waitForListenerClosed(origin?: string, timeoutMilliseconds?: number): Promise<void>
 
 /** 等待 direct CLI 返回有效 HTML。 */
-export function waitForHtmlReadiness(child: ChildProcess, options?: { readonly origin?: string; readonly timeoutMilliseconds?: number }): Promise<string>
+export function waitForHtmlReadiness(child: ChildProcess, options?: { readonly origin?: string; readonly timeoutMilliseconds?: number; readonly ownership?: ProcessTreeOwnership }): Promise<string>
 
 /** 启动固定 direct CLI、验证 HTML 并确认进程树回收。 */
 export function probeDirectDshWeb(options: {

@@ -29,10 +29,44 @@ describe('published dsh CLI smoke cleanup', () => {
   })
 
   it('retains Windows descendants through a stable root PID after the leader disappears', async () => {
-    const rows = [{ pid: 22, parentPid: 11 }, { pid: 33, parentPid: 22 }, { pid: 44, parentPid: 1 }]
-    expect(windowsOwnedProcessIds(11, rows)).toEqual([22, 33])
+    const initialRows = [
+      { pid: 11, parentPid: 1, creationDate: 'root-created' },
+      { pid: 22, parentPid: 11, creationDate: 'child-created' },
+      { pid: 33, parentPid: 22, creationDate: 'grandchild-created' }
+    ]
+    const afterLeaderExit = initialRows.slice(1)
+    expect(windowsOwnedProcessIds(11, 'root-created', initialRows)).toEqual([11, 22, 33])
     const fakeChild = { pid: 11 } as ReturnType<typeof spawn>
-    const ownership = ownProcessTree(fakeChild, { platformName: 'win32', queryWindowsProcesses: async () => rows })
+    let queryCount = 0
+    const ownership = await ownProcessTree(fakeChild, {
+      platformName: 'win32',
+      queryWindowsProcesses: async () => queryCount++ === 0 ? initialRows : afterLeaderExit
+    })
     await expect(processTreeHasExited(ownership)).resolves.toBe(false)
+  })
+
+  it('rejects a reused Windows PID whose creation identity does not match', async () => {
+    const rows = [
+      { pid: 11, parentPid: 1, creationDate: 'reused-root' },
+      { pid: 22, parentPid: 11, creationDate: 'unrelated-child' }
+    ]
+    expect(windowsOwnedProcessIds(11, 'original-root', rows)).toEqual([])
+    const ownership = {
+      rootPid: 11,
+      platformName: 'win32' as const,
+      queryWindowsProcesses: async () => rows,
+      knownProcessIdentities: new Map([[11, 'original-root']])
+    }
+    await expect(processTreeHasExited(ownership)).resolves.toBe(true)
+  })
+
+  it('bounds a hung Windows process query by the caller deadline', async () => {
+    const ownership = {
+      rootPid: 11,
+      platformName: 'win32' as const,
+      queryWindowsProcesses: async () => new Promise<never>(() => {}),
+      knownProcessIdentities: new Map([[11, 'root-created']])
+    }
+    await expect(processTreeHasExited(ownership, 25)).rejects.toThrow('exceeded 25ms')
   })
 })

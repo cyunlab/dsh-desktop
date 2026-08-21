@@ -1580,11 +1580,46 @@ fn request_retry(app: &AppHandle, state: &Arc<RuntimeState>) {
     });
 }
 
+/// 标识触发应用退出的真实原生窗口事件。
+#[derive(Clone, Copy)]
+enum ShutdownSource {
+    /// 最终窗口收到关闭请求。
+    CloseRequested,
+    /// 最终窗口已被销毁后的兜底事件。
+    Destroyed,
+}
+
+#[cfg(all(debug_assertions, feature = "wdio"))]
+impl ShutdownSource {
+    /// 返回结构化测试记录使用的 shutdown 来源。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CloseRequested => "close-requested",
+            Self::Destroyed => "destroyed",
+        }
+    }
+}
+
 /// 请求应用退出，并保证 CLI 进程树被回收。
-fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>) {
+fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>, source: ShutdownSource) {
     if state.shutting_down.swap(true, Ordering::AcqRel) {
         return;
     }
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    let shutdown_generation = state
+        .process
+        .lock()
+        .ok()
+        .and_then(|process| process.as_ref().map(|process| process.generation()))
+        .unwrap_or_else(|| state.generation.load(Ordering::Acquire));
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    record_wdio_event(serde_json::json!({
+        "event": "native-shutdown-requested",
+        "generation": shutdown_generation,
+        "source": source.as_str()
+    }));
+    #[cfg(not(all(debug_assertions, feature = "wdio")))]
+    let _ = source;
     let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
         app.exit(1);
         return;
@@ -1613,6 +1648,12 @@ fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>) {
             .as_ref()
             .is_some_and(|process| stop_cli(&state, process).is_err());
         drop(_gate);
+        #[cfg(all(debug_assertions, feature = "wdio"))]
+        record_wdio_event(serde_json::json!({
+            "event": "native-shutdown-completed",
+            "generation": shutdown_generation,
+            "cleanupSucceeded": !cleanup_failed
+        }));
         app.exit(if cleanup_failed { 1 } else { 0 });
     });
 }
@@ -1739,14 +1780,6 @@ fn startup_copy_diagnostics(
         .map_err(|error| error.to_string())
 }
 
-/// 仅在 debug+WDIO 构建中触发与最终窗口关闭相同的原生 shutdown 路径。
-#[cfg(all(debug_assertions, feature = "wdio"))]
-#[tauri::command]
-fn e2e_request_shutdown(app: AppHandle, state: State<'_, Arc<RuntimeState>>) {
-    record_wdio_event(serde_json::json!({ "event": "native-shutdown-requested" }));
-    request_shutdown(&app, state.inner());
-}
-
 /// 创建 Startup window，注册 Tauri IPC，并启动 direct CLI 生命周期监督线程。
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(all(debug_assertions, feature = "wdio"))]
@@ -1866,9 +1899,15 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     startup_window.on_window_event(move |event| match event {
         WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
-            request_shutdown(&app_handle, &state_for_close);
+            request_shutdown(
+                &app_handle,
+                &state_for_close,
+                ShutdownSource::CloseRequested,
+            );
         }
-        WindowEvent::Destroyed => request_shutdown(&app_handle, &state_for_close),
+        WindowEvent::Destroyed => {
+            request_shutdown(&app_handle, &state_for_close, ShutdownSource::Destroyed)
+        }
         _ => {}
     });
     start_attempt(app.handle(), &state);
@@ -1916,18 +1955,10 @@ fn main() {
                 .build(),
         )
         .plugin(tauri_plugin_clipboard_manager::init());
-    #[cfg(not(all(debug_assertions, feature = "wdio")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         startup_snapshot,
         startup_retry,
         startup_copy_diagnostics
-    ]);
-    #[cfg(all(debug_assertions, feature = "wdio"))]
-    let builder = builder.invoke_handler(tauri::generate_handler![
-        startup_snapshot,
-        startup_retry,
-        startup_copy_diagnostics,
-        e2e_request_shutdown
     ]);
     #[cfg(feature = "wdio")]
     let builder = builder

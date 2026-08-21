@@ -87,21 +87,43 @@ async function waitForEvent(name: string): Promise<readonly Record<string, unkno
   return readEvents()
 }
 
-/** 不依赖 WebDriver 命令轮询 recorder，等待原生 shutdown 完成 CLI 回收。 */
-async function waitForNativeCleanup(): Promise<void> {
+/** 不依赖 WebDriver 轮询文件系统，验收最后 generation、进程树和 listener 全部关闭。 */
+async function waitForNativeCleanup(): Promise<number> {
   const deadline = Date.now() + 20_000
   while (Date.now() < deadline) {
     const records = await readRecords()
+    const events = await readEvents()
     const backendPid = Number(records.find(event => event.event === 'backend-started')?.pid)
-    if (records.some(event => event.event === 'cli-cleaned') && Number.isInteger(backendPid) && !processExists(backendPid)) return
+    const lastSpawn = records.filter(event => event.event === 'cli-spawned').at(-1)
+    const generation = Number(lastSpawn?.generation)
+    const requestIndex = records.findIndex(event => event.event === 'native-shutdown-requested'
+      && event.source === 'close-requested' && event.generation === generation)
+    const completionIndex = records.findIndex(event => event.event === 'native-shutdown-completed'
+      && event.generation === generation && event.cleanupSucceeded === true)
+    const cliCleaned = records.some(event => event.event === 'cli-cleaned' && event.generation === generation)
+    const pids = [...new Set([
+      ...records.filter(event => event.event === 'cli-spawned').map(event => Number(event.pid)),
+      ...events.filter(event => event.event === 'descendant-spawned').map(event => Number(event.pid)),
+      backendPid
+    ].filter(Number.isInteger))]
+    const origins = records.filter(event => event.event === 'client-page-served').map(event => String(event.origin))
+    const listenersClosed = (await Promise.all(origins.map(async origin => {
+      try { await fetch(origin, { signal: AbortSignal.timeout(300) }); return false } catch { return true }
+    }))).every(Boolean)
+    if (Number.isInteger(generation)
+      && requestIndex >= 0
+      && completionIndex > requestIndex
+      && cliCleaned
+      && pids.every(pid => !processExists(pid))
+      && listenersClosed) return generation
     await new Promise(resolve => setTimeout(resolve, 100))
   }
-  throw new Error(`Native shutdown did not complete CLI cleanup and backend exit: ${JSON.stringify(await readRecords())}`)
+  throw new Error(`Final-window shutdown did not complete owned generation cleanup: ${JSON.stringify(await readRecords())}`)
 }
 
 /** 使用平台进程接口判断 Retry 前的旧 PID 是否仍存活。 */
 function processExists(pid: number): boolean {
-  if (process.platform === 'win32') return spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true }).stdout.includes(`"${pid}"`)
+  if (process.platform === 'win32') return spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true, timeout: 2_000, killSignal: 'SIGKILL' }).stdout.includes(`"${pid}"`)
   try { process.kill(pid, 0); return true } catch { return false }
 }
 
@@ -224,25 +246,17 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
     it('loads before runner verifies hard process-tree cleanup', async () => { await waitForHarness() })
   }
 
-  /** 通过 debug-only 原生命令走最终窗口同一 shutdown 路径，并在 runner 存活时等待回收。 */
+  /** 调用真实 Tauri Window.close 触发 CloseRequested，并在 WebDriver session 断开后只轮询文件系统。 */
   after(async () => {
     const completionFile = process.env.DSH_TEST_COMPLETION_FILE
-    if (scenarioTestsPassed && completionFile) await writeFile(completionFile, 'passed', 'utf8')
-    const startupUrl = String((await readRecords()).find(event => event.event === 'startup-window-created')?.url ?? '')
-    if (!isPackagedStartupUrl(startupUrl)) throw new Error(`Packaged startup URL unavailable before shutdown: ${startupUrl}`)
-    await browser.url(startupUrl)
-    await browser.waitUntil(async () => isPackagedStartupUrl(await browser.getUrl()), { timeout: 5_000 })
-    await new Promise(resolve => setTimeout(resolve, 250))
-    try {
-      await browser.execute(() => {
-        const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke(command: string): Promise<unknown> } }).__TAURI_INTERNALS__
-        if (!internals) throw new Error('Tauri internals are unavailable')
-        setTimeout(() => { void internals.invoke('e2e_request_shutdown').catch(() => {}) }, 100)
-      })
-    } catch (error) {
-      const shutdownStarted = (await readRecords()).some(event => event.event === 'lifecycle-transition' && event.state === 'stopping')
-      if (!shutdownStarted) throw error
+    await browser.execute(async () => {
+      const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke(command: string, args?: Record<string, unknown>): Promise<unknown> } }).__TAURI_INTERNALS__
+      if (!internals) throw new Error('Tauri internals are unavailable')
+      await internals.invoke('plugin:window|close', { label: 'main' })
+    })
+    const generation = await waitForNativeCleanup()
+    if (scenarioTestsPassed && completionFile) {
+      await writeFile(completionFile, JSON.stringify({ status: 'passed', generation }), 'utf8')
     }
-    await waitForNativeCleanup()
   })
 })

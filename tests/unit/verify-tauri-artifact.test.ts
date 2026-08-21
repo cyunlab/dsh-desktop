@@ -163,9 +163,32 @@ server.listen(3080, '127.0.0.1')
 `
 }
 
+/** 返回 leader 可优雅退出、descendant 会记录并忽略 TERM 的 POSIX 夹具源码。 */
+function gracefulLeaderStubbornDescendantSource(): string {
+  const descendant = JSON.stringify(`
+const { appendFileSync } = require('node:fs')
+process.on('SIGTERM', () => appendFileSync(process.env.DSH_FIXTURE_EVENTS, 'descendant-term\\n'))
+process.send?.('ready')
+setInterval(() => {}, 1000)
+`)
+  return `
+import { appendFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { createServer } from 'node:http'
+const stubborn = spawn(process.execPath, ['-e', ${descendant}], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
+appendFileSync(process.env.DSH_FIXTURE_EVENTS, 'descendant-alive:' + stubborn.pid + '\\n')
+const server = createServer((_request, response) => {
+  response.writeHead(200, { 'content-type': 'text/html' })
+  response.end('<!doctype html><p>graceful leader</p>')
+})
+stubborn.once('message', () => server.listen(3080, '127.0.0.1'))
+process.once('SIGTERM', () => server.close(() => process.exit(0)))
+`
+}
+
 /** 使用平台接口判断记录的 descendant PID 是否仍存活。 */
 function processExists(pid: number): boolean {
-  if (process.platform === 'win32') return spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true }).stdout.includes(`"${pid}"`)
+  if (process.platform === 'win32') return spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true, timeout: 2_000, killSignal: 'SIGKILL' }).stdout.includes(`"${pid}"`)
   try { process.kill(pid, 0); return true } catch { return false }
 }
 
@@ -287,6 +310,21 @@ describe.sequential('Tauri artifact verification', () => {
       expect(Number.isInteger(descendantPid)).toBe(true)
       expect(processExists(descendantPid)).toBe(false)
       await expect(waitForListenerClosed()).resolves.toBeUndefined()
+    } finally {
+      delete process.env.DSH_FIXTURE_EVENTS
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  }, 20_000)
+
+  it.skipIf(process.platform === 'win32')('signals only the POSIX leader during the graceful window', async () => {
+    const fixture = await createRuntimeFixture(gracefulLeaderStubbornDescendantSource())
+    try {
+      process.env.DSH_FIXTURE_EVENTS = fixture.eventsFile
+      await expect(probeBundledRuntime(fixture.contentRoot, fixture.platformName, fixture.runtimeArch)).resolves.toBeUndefined()
+      const events = await readFile(fixture.eventsFile, 'utf8')
+      expect(events).not.toContain('descendant-term')
+      const descendantPid = Number(events.match(/descendant-alive:(\d+)/)?.[1])
+      expect(processExists(descendantPid)).toBe(false)
     } finally {
       delete process.env.DSH_FIXTURE_EVENTS
       await rm(fixture.root, { recursive: true, force: true })

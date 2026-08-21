@@ -11,6 +11,7 @@ import { packagedDshCliCommand } from './runtime-closure.mjs'
 const root = path.resolve(import.meta.dirname, '..')
 const execFileAsync = promisify(execFile)
 const MAX_HTML_BYTES = 64 * 1024
+const WINDOWS_COMMAND_TIMEOUT_MS = 2_000
 export const FIXED_HOST_ORIGIN = 'http://127.0.0.1:3080/'
 export const DIRECT_DSH_WEB_ARGS = Object.freeze(['web', '--host', '127.0.0.1', '--port', '3080'])
 
@@ -58,59 +59,120 @@ export function waitForChildExit(child, timeoutMilliseconds = 10_000) {
 }
 
 /** 查询 Windows 当前进程表，保留已退出 leader 的 ParentProcessId 关系。 */
-async function windowsProcessTable() {
-  const script = 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress'
+async function windowsProcessTable(timeoutMilliseconds = WINDOWS_COMMAND_TIMEOUT_MS) {
+  const script = 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate | ConvertTo-Json -Compress'
   const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
     encoding: 'utf8',
     windowsHide: true,
-    maxBuffer: 16 * 1024 * 1024
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: Math.max(1, timeoutMilliseconds),
+    killSignal: 'SIGKILL'
   })
   const parsed = JSON.parse(stdout || '[]')
   return (Array.isArray(parsed) ? parsed : [parsed]).map(row => ({
     pid: Number(row.ProcessId),
-    parentPid: Number(row.ParentProcessId)
-  })).filter(row => Number.isInteger(row.pid) && Number.isInteger(row.parentPid))
+    parentPid: Number(row.ParentProcessId),
+    creationDate: String(row.CreationDate ?? '')
+  })).filter(row => Number.isInteger(row.pid) && Number.isInteger(row.parentPid) && row.creationDate.length > 0)
 }
 
-/** 从稳定 root PID 和进程表解析仍存活的完整 Windows descendant 集合。 */
-export function windowsOwnedProcessIds(rootPid, rows) {
-  const owned = new Set([rootPid])
+/** 以 PID+CreationDate 身份解析 Windows 进程树，并拒绝复用的 root PID。 */
+export function windowsOwnedProcessIds(rootPid, rootCreationDate, rows) {
+  const root = rows.find(row => row.pid === rootPid && row.creationDate === rootCreationDate)
+  if (!root) return []
+  const owned = new Map([[rootPid, rootCreationDate]])
   let changed = true
   while (changed) {
     changed = false
     for (const row of rows) {
-      if (owned.has(row.parentPid) && !owned.has(row.pid)) {
-        owned.add(row.pid)
+      const parentCreationDate = owned.get(row.parentPid)
+      const parent = rows.find(candidate => candidate.pid === row.parentPid && candidate.creationDate === parentCreationDate)
+      if (parent && !owned.has(row.pid)) {
+        owned.set(row.pid, row.creationDate)
         changed = true
       }
     }
   }
-  const live = new Set(rows.map(row => row.pid))
-  return [...owned].filter(pid => live.has(pid))
+  return [...owned.keys()]
 }
 
-/** 建立不依赖 leader 持续存活的跨平台进程树 ownership。 */
-export function ownProcessTree(child, options = {}) {
-  return Object.freeze({
+/** 对任意 Windows 查询施加调用方剩余 deadline，测试 seam 也不得无限挂起。 */
+async function queryWindowsProcessesWithin(ownership, timeoutMilliseconds) {
+  let timer
+  try {
+    return await Promise.race([
+      ownership.queryWindowsProcesses(timeoutMilliseconds),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Windows process query exceeded ${timeoutMilliseconds}ms`)), timeoutMilliseconds)
+      })
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 刷新已确认的 Windows PID+CreationDate ownership；只从仍匹配身份的 parent 扩张。 */
+function absorbWindowsRows(ownership, rows) {
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const row of rows) {
+      const parentCreationDate = ownership.knownProcessIdentities.get(row.parentPid)
+      const parentMatches = rows.some(candidate => candidate.pid === row.parentPid && candidate.creationDate === parentCreationDate)
+      if (parentMatches && !ownership.knownProcessIdentities.has(row.pid)) {
+        ownership.knownProcessIdentities.set(row.pid, row.creationDate)
+        changed = true
+      }
+    }
+  }
+  return rows.filter(row => ownership.knownProcessIdentities.get(row.pid) === row.creationDate)
+}
+
+/** 在 deadline 内查询并吸收 Windows 进程身份。 */
+async function refreshWindowsOwnership(ownership, timeoutMilliseconds) {
+  return absorbWindowsRows(ownership, await queryWindowsProcessesWithin(ownership, timeoutMilliseconds))
+}
+
+/** 建立 PID+CreationDate 绑定的跨平台进程树 ownership。 */
+export async function ownProcessTree(child, options = {}) {
+  const ownership = {
     rootPid: Number.isInteger(child.pid) ? child.pid : undefined,
     platformName: options.platformName ?? platform(),
-    queryWindowsProcesses: options.queryWindowsProcesses ?? windowsProcessTable
-  })
+    queryWindowsProcesses: options.queryWindowsProcesses ?? windowsProcessTable,
+    knownProcessIdentities: new Map()
+  }
+  if (ownership.platformName === 'win32' && Number.isInteger(ownership.rootPid)) {
+    const deadline = Date.now() + (options.captureTimeoutMilliseconds ?? WINDOWS_COMMAND_TIMEOUT_MS)
+    while (Date.now() < deadline) {
+      const remaining = Math.max(1, deadline - Date.now())
+      const rows = await queryWindowsProcessesWithin(ownership, remaining)
+      const root = rows.find(row => row.pid === ownership.rootPid)
+      if (root) {
+        ownership.knownProcessIdentities.set(root.pid, root.creationDate)
+        absorbWindowsRows(ownership, rows)
+        break
+      }
+      await new Promise(resolve => setTimeout(resolve, Math.min(50, remaining)))
+    }
+    if (!ownership.knownProcessIdentities.has(ownership.rootPid)) {
+      throw new Error(`Windows process identity unavailable for PID ${ownership.rootPid}`)
+    }
+  }
+  return ownership
 }
 
 /** 返回 owned process group 或 Windows descendant 集是否已经完全消失。 */
-export async function processTreeHasExited(ownership) {
+export async function processTreeHasExited(ownership, timeoutMilliseconds = WINDOWS_COMMAND_TIMEOUT_MS) {
   if (!Number.isInteger(ownership.rootPid)) return true
   if (ownership.platformName === 'win32') {
-    const rows = await ownership.queryWindowsProcesses()
-    return windowsOwnedProcessIds(ownership.rootPid, rows).length === 0
+    return (await refreshWindowsOwnership(ownership, timeoutMilliseconds)).length === 0
   }
   try {
     process.kill(-ownership.rootPid, 0)
     return false
   } catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'ESRCH') return true
-    throw error
+    throw new Error(`Cannot inspect POSIX process group ${ownership.rootPid}: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
@@ -118,7 +180,8 @@ export async function processTreeHasExited(ownership) {
 export async function waitForProcessTreeExit(ownership, timeoutMilliseconds = 10_000) {
   const deadline = Date.now() + timeoutMilliseconds
   while (Date.now() < deadline) {
-    if (await processTreeHasExited(ownership)) return
+    const remaining = Math.max(1, deadline - Date.now())
+    if (await processTreeHasExited(ownership, Math.min(WINDOWS_COMMAND_TIMEOUT_MS, remaining))) return
     await new Promise(resolve => setTimeout(resolve, 50))
   }
   throw new Error(`dsh CLI process tree did not exit within ${timeoutMilliseconds}ms`)
@@ -126,24 +189,36 @@ export async function waitForProcessTreeExit(ownership, timeoutMilliseconds = 10
 
 /** 强制终止 CLI 整棵进程树并验收 owned tree 消失。 */
 export async function terminateProcessTree(child, timeoutMilliseconds = 10_000, ownership = ownProcessTree(child)) {
+  ownership = await ownership
   if (child.pid === undefined) return
+  const deadline = Date.now() + timeoutMilliseconds
   try {
     if (ownership.platformName === 'win32') {
-      const rows = await ownership.queryWindowsProcesses()
-      const owned = windowsOwnedProcessIds(ownership.rootPid, rows).reverse()
-      for (const pid of owned) {
-        try { await execFileAsync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }) } catch {}
+      const owned = (await refreshWindowsOwnership(ownership, Math.max(1, deadline - Date.now()))).reverse()
+      for (const processIdentity of owned) {
+        const remaining = Math.max(1, deadline - Date.now())
+        try {
+          await execFileAsync('taskkill.exe', ['/PID', String(processIdentity.pid), '/T', '/F'], {
+            windowsHide: true,
+            timeout: remaining,
+            killSignal: 'SIGKILL'
+          })
+        } catch {}
       }
     } else {
-      process.kill(-ownership.rootPid, 'SIGKILL')
+      try {
+        process.kill(-ownership.rootPid, 'SIGKILL')
+      } catch (error) {
+        throw new Error(`Cannot force POSIX process group ${ownership.rootPid}: ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
   } catch (error) {
     const alreadyExited = await processTreeHasExited(ownership).catch(() => false)
       || (error instanceof Error && 'code' in error && error.code === 'ESRCH')
     if (!alreadyExited) throw error
   }
-  await waitForChildExit(child, timeoutMilliseconds)
-  await waitForProcessTreeExit(ownership, timeoutMilliseconds)
+  await waitForChildExit(child, Math.max(1, deadline - Date.now()))
+  await waitForProcessTreeExit(ownership, Math.max(1, deadline - Date.now()))
 }
 
 /** 尝试连接 loopback listener，并确保 socket 总能关闭。 */
@@ -226,6 +301,9 @@ export async function waitForHtmlReadiness(child, options = {}) {
       if (child.exitCode !== null || child.signalCode !== null) {
         throw new Error(`Packaged dsh CLI exited before HTML readiness with ${child.exitCode ?? child.signalCode ?? 'unknown'}`)
       }
+      if (options.ownership?.platformName === 'win32') {
+        await refreshWindowsOwnership(options.ownership, Math.min(WINDOWS_COMMAND_TIMEOUT_MS, Math.max(1, timeoutMilliseconds - (Date.now() - started))))
+      }
       try {
         const response = await fetch(origin, { redirect: 'manual', signal: AbortSignal.timeout(1_000) })
         return await requireHtmlResponse(response)
@@ -246,13 +324,19 @@ async function stopCliProcess(child, ownership, timeoutMilliseconds = 8_000) {
   if (await processTreeHasExited(ownership)) return
   if (ownership.platformName === 'win32') {
     try {
-      await execFileAsync('taskkill.exe', ['/PID', String(ownership.rootPid), '/T'], { windowsHide: true })
+      await execFileAsync('taskkill.exe', ['/PID', String(ownership.rootPid), '/T'], {
+        windowsHide: true,
+        timeout: Math.min(WINDOWS_COMMAND_TIMEOUT_MS, timeoutMilliseconds),
+        killSignal: 'SIGKILL'
+      })
     } catch {}
   } else {
     try {
-      process.kill(-ownership.rootPid, 'SIGTERM')
+      process.kill(child.pid, 'SIGTERM')
     } catch (error) {
-      if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error
+      if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) {
+        throw new Error(`Cannot signal POSIX CLI leader ${child.pid}: ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
   }
   try {
@@ -290,13 +374,13 @@ export async function probeDirectDshWeb(options) {
       detached: platform() !== 'win32',
       windowsHide: true
     })
-    const ownership = ownProcessTree(child)
+    const ownership = await ownProcessTree(child)
     let stderr = ''
     child.stderr.on('data', chunk => { stderr = `${stderr}${chunk}`.slice(-8_000) })
     child.stdout.resume()
     let cleanupConfirmed = false
     try {
-      const html = await waitForHtmlReadiness(child, { timeoutMilliseconds: options.timeoutMilliseconds })
+      const html = await waitForHtmlReadiness(child, { timeoutMilliseconds: options.timeoutMilliseconds, ownership })
       await stopCliProcess(child, ownership)
       await waitForListenerClosed()
       cleanupConfirmed = true
