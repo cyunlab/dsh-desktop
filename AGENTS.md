@@ -29,4 +29,9 @@ Domain documentation uses the single-context layout. See `docs/agents/domain.md`
 ## 注意
 本项目使用 tauri，在构建过程中可能会产生大量的构建产物，占满内存，需要及时清理。
 
+## Cargo 验证节奏
+- 首次 Rust 验证前先运行 `pnpm build` 生成 Tauri 所需的 `dist/`。
+- 多个 worktree 中的 Agent 统一通过 `scripts/cargo-agent.sh` 运行 Cargo，避免并发冷编译争抢内存和磁盘。
+- 实现期间优先运行 `scripts/cargo-agent.sh check` 和聚焦测试；每个 Issue 交付前再运行一次 Rust 全量测试。
+- 不同 worktree 保持各自的 `src-tauri/target`；Issue 合并且 worktree 不再使用后，清理其 target。
 
