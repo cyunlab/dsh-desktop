@@ -23,11 +23,17 @@ describe('Tauri resource layout', () => {
     ])
   })
 
-  /** 验证 Tauri hook 是唯一构建入口，避免运行命令在资源扫描前重复删除 dist。 */
-  it('runs the frontend build exactly once through Tauri hooks', async () => {
+  /** 验证 dev hook 会准备完整资源并等待结束，避免 Cargo 在 dist 重建期间扫描资源。 */
+  it('waits for the complete development resource build before starting Cargo', async () => {
     const config = JSON.parse(await readFile(path.join(root, 'src-tauri/tauri.conf.json'), 'utf8'))
     const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'))
-    expect(config.build).toMatchObject({ beforeDevCommand: 'pnpm build', beforeBuildCommand: 'pnpm build' })
+    expect(config.build).toMatchObject({
+      beforeDevCommand: {
+        script: 'pnpm ensure:official-node && pnpm build',
+        wait: true
+      },
+      beforeBuildCommand: 'pnpm build'
+    })
     expect(manifest.scripts['tauri:dev']).toBe('pnpm ensure:official-node && node scripts/run-tauri.mjs dev')
     expect(manifest.scripts['tauri:build']).toBe('pnpm ensure:official-node && node scripts/run-tauri.mjs build')
   })

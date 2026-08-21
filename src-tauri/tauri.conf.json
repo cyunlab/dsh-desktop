@@ -4,7 +4,10 @@
   "version": "1.1.1",
   "identifier": "io.github.xlcyun.dsh-desktop",
   "build": {
-    "beforeDevCommand": "pnpm build",
+    "beforeDevCommand": {
+      "script": "pnpm ensure:official-node && pnpm build",
+      "wait": true
+    },
     "beforeBuildCommand": "pnpm build",
     "frontendDist": "../dist/startup"
   },
