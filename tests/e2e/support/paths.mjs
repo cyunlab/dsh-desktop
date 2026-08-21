@@ -7,7 +7,7 @@ export function applicationPath() {
   return path.resolve('src-tauri', 'target', 'debug', name)
 }
 
-/** 返回 ensure-node-sidecar 下载的官方 Node 路径。 */
+/** 返回 ensure-official-node 下载的官方 Node 路径。 */
 export function officialNodePath() {
   const names = { win32: 'windows', darwin: 'macos', linux: 'linux' }
   const arches = { x64: 'x86_64', arm64: 'aarch64' }

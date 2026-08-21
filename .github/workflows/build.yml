@@ -80,13 +80,13 @@ jobs:
       - name: Install stable Rust toolchain
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
-      - name: Build native Tauri package with the official Node sidecar
+      - name: Build native Tauri package with official Node and published CLI
         run: pnpm package
         env:
           # Ubuntu 24.04 system libraries use DT_RELR; linuxdeploy's bundled strip cannot parse it.
           NO_STRIP: ${{ runner.os == 'Linux' && 'true' || '' }}
-      - name: Smoke test the official Node + Harness runtime
-        run: pnpm smoke:node-sidecar
+      - name: Smoke test official Node plus published dsh web
+        run: pnpm smoke:dsh-cli
       - name: Verify the exact native Tauri artifact
         shell: bash
         run: node scripts/verify-tauri-artifact.mjs "${{ matrix.platform }}"

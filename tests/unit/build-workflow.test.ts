@@ -28,9 +28,9 @@ describe('native build workflow contract', () => {
 
   it('builds the Tauri package through the public package command', () => {
     expect(workflow).toContain('pnpm package')
-    expect(workflow).toContain('Build native Tauri package with the official Node sidecar')
-    expect(workflow).toContain('Smoke test the official Node + Harness runtime')
-    expect(workflow).toContain('pnpm smoke:node-sidecar')
+    expect(workflow).toContain('Build native Tauri package with official Node and published CLI')
+    expect(workflow).toContain('Smoke test official Node plus published dsh web')
+    expect(workflow).toContain('pnpm smoke:dsh-cli')
     expect(workflow).toContain('verify-tauri-artifact.mjs')
     expect(workflow).not.toContain('electron-builder')
   })
@@ -42,7 +42,7 @@ describe('native build workflow contract', () => {
   })
 
   it('disables linuxdeploy stripping for the Linux AppImage build', () => {
-    expect(workflow).toMatch(/Build native Tauri package with the official Node sidecar[\s\S]*NO_STRIP: \$\{\{ runner\.os == 'Linux' && 'true' \|\| '' \}\}/)
+    expect(workflow).toMatch(/Build native Tauri package with official Node and published CLI[\s\S]*NO_STRIP: \$\{\{ runner\.os == 'Linux' && 'true' \|\| '' \}\}/)
   })
 
   it.each([

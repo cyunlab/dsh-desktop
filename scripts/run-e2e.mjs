@@ -30,7 +30,7 @@ function run(command, args, environment = process.env) {
 
 /** 构建带 debug-only WDIO 插件和 frontend test seam 的 Tauri 可执行文件。 */
 function prepareApplication() {
-  run('pnpm', ['ensure:node-sidecar'])
+  run('pnpm', ['ensure:official-node'])
   run('node', ['scripts/run-tauri.mjs', 'build', '--debug', '--no-bundle', '--features', 'wdio', '--config', 'src-tauri/tauri.e2e.conf.json'])
 }
 
@@ -78,12 +78,12 @@ async function scenarioEnvironment(scenario) {
   const records = path.join(root, 'desktop-records.jsonl')
   const state = path.join(root, 'scenario-state.txt')
   const crashTrigger = path.join(root, 'crash-trigger')
-  const fixture = path.resolve('tests', 'e2e', 'fixtures', 'test-sidecar.mjs')
+  const fixture = path.resolve('tests', 'e2e', 'fixtures', 'test-cli.mjs')
   await access(fixture)
   return {
     ...process.env,
     DSH_NODE_PATH: officialNodePath(),
-    ...(scenario === 'real-harness' ? {} : { DSH_TEST_SIDECAR: fixture }),
+    ...(scenario === 'real-harness' ? {} : { DSH_TEST_CLI_ENTRY: fixture }),
     DSH_TEST_SCENARIO: scenario,
     DSH_TEST_EVENTS: events,
     DSH_TEST_RECORD_FILE: records,

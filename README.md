@@ -93,7 +93,7 @@ corepack pnpm typecheck
 corepack pnpm build
 corepack pnpm test
 corepack pnpm test:integration
-corepack pnpm smoke:node-sidecar
+corepack pnpm smoke:dsh-cli
 ```
 
 运行真实桌面端到端测试。Windows、macOS 与 Linux CI 都使用 embedded `@wdio/tauri-service` provider；Linux 通过 Xvfb 运行。

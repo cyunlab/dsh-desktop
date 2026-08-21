@@ -79,7 +79,7 @@ Desktop owns the application lifecycle, security boundary, and operating-system 
 
 Use Node.js 24 with Corepack enabled. The repository pins pnpm 11.7.0.
 
-The first `pnpm dev` or `pnpm package` run downloads the fixed official Node 24 sidecar for the current target into `resources/node/<platform-arch>/node` (or `node.exe` on Windows). Existing executables are reused. Set `DSH_NODE_PATH` only when you intentionally need a runtime override; it never disables shipping the official sidecar.
+The first `pnpm dev` or `pnpm package` run downloads the fixed official Node 24 executable for the current target into `resources/node/<platform-arch>/node` (or `node.exe` on Windows). Existing executables are reused. Set `DSH_NODE_PATH` only when you intentionally need a runtime override; it never disables shipping the official executable.
 
 ```sh
 git clone --recurse-submodules https://github.com/XLCYun/dsh-desktop.git
@@ -95,7 +95,7 @@ corepack pnpm typecheck
 corepack pnpm build
 corepack pnpm test
 corepack pnpm test:integration
-corepack pnpm smoke:node-sidecar
+corepack pnpm smoke:dsh-cli
 ```
 
 Run the real desktop end-to-end suite. Windows, macOS, and Linux CI all use the embedded `@wdio/tauri-service` provider; Linux runs under Xvfb.

@@ -2067,7 +2067,7 @@ mod tests {
         let node = packaged_windows_node();
         assert!(
             node.is_file(),
-            "run pnpm ensure:node-sidecar for the Windows target before this test"
+            "run pnpm ensure:official-node for the Windows target before this test"
         );
         let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = probe.local_addr().unwrap();

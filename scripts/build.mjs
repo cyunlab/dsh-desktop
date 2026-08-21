@@ -9,11 +9,8 @@ const desktopLogoFileName = 'dsh-desktop-logo.svg'
 const desktopLogoSource = `assets/${desktopLogoFileName}`
 const desktopLogoRuntimePath = `dist/assets/${desktopLogoFileName.replace(/\.svg$/, '.png')}`
 await rm('dist', { recursive: true, force: true })
-await Promise.all([
-  build({ entryPoints: ['src/sidecar/index.ts'], outfile: 'dist/sidecar/index.js', bundle: true, platform: 'node', format: 'esm', external: ['@deepseek-ai/*', 'node-addon-require-builtin'], sourcemap: e2e, define }),
-  build({ entryPoints: ['src/startup/index.ts'], outfile: 'dist/startup/index.js', bundle: true, platform: 'browser', format: 'esm', sourcemap: true, define })
-])
-// Tauri 仅打包 sidecar 与启动页资源，桌面主程序由 Rust 构建。
+await build({ entryPoints: ['src/startup/index.ts'], outfile: 'dist/startup/index.js', bundle: true, platform: 'browser', format: 'esm', sourcemap: true, define })
+// Tauri 打包启动页与 published CLI runtime closure，桌面主程序由 Rust 构建。
 await mkdir('dist/startup', { recursive: true })
 await mkdir('dist/assets', { recursive: true })
 await Promise.all([
@@ -23,4 +20,3 @@ await Promise.all([
   sharp(desktopLogoSource).resize(1024, 1024).png().toFile(desktopLogoRuntimePath)
 ])
 await prepareRuntimeClosure({ projectRoot: process.cwd(), outputRoot: 'dist' })
-

@@ -17,14 +17,8 @@ export function readMachOArchitecture(file: string): Promise<string>
 /** 验证安装包展开目录内真正交付的应用和资源。 */
 export function verifyExtractedBundleContents(contentRoot: string, platformName: string, runtimeArch?: string): Promise<void>
 
-/** 使用解包后的官方 Node 启动真实 Harness 并验证其 loopback 生命周期。 */
+/** 使用解包后的官方 Node 和 published CLI 启动固定 dsh web 并验证清理。 */
 export function probeBundledRuntime(contentRoot: string, platformName: string, runtimeArch?: string): Promise<void>
-
-/** 从注入的 Windows 进程快照中深度优先收集指定 leader 的后代 PID。 */
-export function collectWindowsDescendantPids(
-  rootPid: number,
-  commandRunner?: (file: string, args: string[], options?: Readonly<Record<string, unknown>>) => Promise<{ readonly stdout?: string }>
-): Promise<number[]>
 
 /** 在真实 DMG 挂载点内执行检查，并在异常路径也确认卸载命令已发出。 */
 export function inspectMountedDmg(

@@ -1,9 +1,9 @@
 import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
-import { terminateProcessTree, waitForListenerClosed } from '../../scripts/smoke-node-sidecar.mjs'
+import { terminateProcessTree, waitForListenerClosed } from '../../scripts/smoke-dsh-cli.mjs'
 
-describe('official Node sidecar smoke cleanup', () => {
+describe('published dsh CLI smoke cleanup', () => {
   it('waits until the Harness listener actually stops accepting connections', async () => {
     const server = createServer()
     await new Promise<void>((resolve, reject) => {
@@ -18,7 +18,7 @@ describe('official Node sidecar smoke cleanup', () => {
     await expect(waitForListenerClosed(origin, 1_000)).resolves.toBeUndefined()
   })
 
-  it('force-terminates and awaits a sidecar process group', async () => {
+  it('force-terminates and awaits a CLI process group', async () => {
     const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
       detached: process.platform !== 'win32',
       stdio: 'ignore',

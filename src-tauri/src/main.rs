@@ -1019,7 +1019,7 @@ fn resolve_cli_plan(
     .map_err(|_| DiagnosticCode::BootstrapUnavailable)?;
     #[cfg(all(debug_assertions, feature = "wdio"))]
     let plan = if let Some(test_entry) =
-        std::env::var_os("DSH_TEST_SIDECAR").filter(|value| !value.is_empty())
+        std::env::var_os("DSH_TEST_CLI_ENTRY").filter(|value| !value.is_empty())
     {
         let test_entry = PathBuf::from(test_entry);
         if !test_entry.is_file() {

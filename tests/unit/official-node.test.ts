@@ -2,22 +2,16 @@ import { describe, expect, it } from 'vitest'
 import { mkdir, mkdtemp, readFile, rename, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { serializeError } from '../../src/sidecar/test-seams.js'
-import { NODE_VERSION, ensureNodeSidecar, getNodeCacheRoot, getNodeTarget, withDirectoryLock } from '../../scripts/ensure-node-sidecar.mjs'
+import { NODE_VERSION, ensureOfficialNode, getNodeCacheRoot, getNodeTarget, withDirectoryLock } from '../../scripts/ensure-official-node.mjs'
 
-describe('node sidecar seams', () => {
-  it('serializes unknown errors safely', () => {
-    expect(serializeError(new Error('boom'))).toEqual({ name: 'Error', message: 'boom' })
-    expect(serializeError('boom')).toEqual({ name: 'Error', message: 'boom' })
-  })
-
+describe('official Node resource', () => {
   it('keeps one fixed Node 24 release and maps the four supported targets', () => {
     expect(NODE_VERSION).toBe('24.19.0')
     expect(getNodeTarget('win32', 'x64')).toMatchObject({ resourceName: 'windows-x86_64', relativeExecutable: 'node.exe', archiveSha256: '57f71ab3652e797d84acddc79c81cc9ff1c6ddb2a1974cdb83f00fee9bff4c73' })
     expect(getNodeTarget('darwin', 'arm64')).toMatchObject({ resourceName: 'macos-aarch64', relativeExecutable: 'node', archiveSha256: '3f1cf157479c1480352083105e13faf9d008ede98e7e157746b6df940d197b94' })
     expect(getNodeTarget('darwin', 'x64')).toMatchObject({ resourceName: 'macos-x86_64', relativeExecutable: 'node', archiveSha256: 'd35e95230f46f6f0751df497c56622c6735e05d5e1fb1630996a005b9d328fe4' })
     expect(getNodeTarget('linux', 'x64')).toMatchObject({ resourceName: 'linux-x86_64', relativeExecutable: 'node', archiveSha256: '14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647' })
-    expect(() => getNodeTarget('linux', 'arm64')).toThrow('Unsupported Node sidecar target')
+    expect(() => getNodeTarget('linux', 'arm64')).toThrow('Unsupported official Node target')
   })
 
   it('uses platform cache conventions and never lets DSH_NODE_PATH change the download cache', () => {
@@ -32,7 +26,7 @@ describe('node sidecar seams', () => {
     const executable = path.join(root, 'resources', 'node', 'linux-x86_64', 'node')
     await mkdir(path.dirname(executable), { recursive: true })
     await writeFile(executable, 'existing')
-    await ensureNodeSidecar({
+    await ensureOfficialNode({
       projectRoot: root,
       runtimePlatform: 'linux',
       runtimeArch: 'x64',
