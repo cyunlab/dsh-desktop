@@ -36,5 +36,14 @@ describe('Desktop icon assets', () => {
       alphaAt(0, info.height - 1),
       alphaAt(info.width - 1, info.height - 1)
     ]).toEqual([0, 0, 0, 0])
+
+    const opaqueColumns = new Set<number>()
+    for (let y = 0; y < info.height; y += 1) {
+      for (let x = 0; x < info.width; x += 1) {
+        if (alphaAt(x, y) > 0) opaqueColumns.add(x)
+      }
+    }
+    expect(opaqueColumns.size / info.width).toBeGreaterThanOrEqual(0.8)
+    expect(opaqueColumns.size / info.width).toBeLessThanOrEqual(0.86)
   })
 })

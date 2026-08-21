@@ -36,9 +36,11 @@ function replaceRequired(source, expected, replacement) {
 
 /** 从唯一品牌源派生平台构图，不维护第二套鲸鱼或窗口素材。 */
 function createPlatformSvg(brandSource, platform) {
-  const croppedSource = replaceRequired(brandSource, sourceViewBox, desktopViewBox)
-  if (platform === macosPlatform || platform === windowsLinuxPlatform) {
-    return croppedSource
+  if (platform === macosPlatform) {
+    return brandSource
+  }
+  if (platform === windowsLinuxPlatform) {
+    return replaceRequired(brandSource, sourceViewBox, desktopViewBox)
   }
   throw new Error(`不支持的桌面图标平台：${platform}`)
 }
