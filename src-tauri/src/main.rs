@@ -3,23 +3,24 @@
 #[cfg(all(not(debug_assertions), feature = "wdio"))]
 compile_error!("the wdio feature is test-only and cannot be enabled in release builds");
 
+mod cli_supervisor;
 mod lifecycle;
 
-use lifecycle::{
-    cleanup_then_restart, stop_process, wait_for_readiness, LifecycleAction, LifecycleMachine,
-    ProcessControl, ReadinessWaitError, SidecarEvent,
+use cli_supervisor::{
+    build_command_plan, spawn_cli, CliProcess, ExitReason, ProcessExit, StopReport,
+    SupervisorError, HOST_ORIGIN,
 };
-use serde::{Deserialize, Serialize};
-use std::ffi::OsString;
+use lifecycle::{wait_for_readiness, ReadinessWaitError};
+use serde::Serialize;
 use std::fs;
 #[cfg(all(debug_assertions, feature = "wdio"))]
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::webview::PageLoadEvent;
@@ -28,56 +29,13 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-#[cfg(windows)]
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-};
-#[cfg(windows)]
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
-    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-    TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, OpenThread, ResumeThread, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
-};
+use std::os::unix::process::ExitStatusExt;
 
 const SNAPSHOT_EVENT: &str = "startup:snapshot";
 const PROLONGED_STARTUP_AFTER: Duration = Duration::from_secs(30);
 const SIDECAR_STOP_AFTER: Duration = Duration::from_secs(8);
 const SIDECAR_FORCE_CONFIRM_AFTER: Duration = Duration::from_secs(5);
 const BUNDLED_NODE_VERSION: &str = "24.19.0";
-
-/// Sidecar 生命周期消息的 JSON 表示。
-#[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "kebab-case", tag = "type")]
-enum SidecarMessage {
-    Ready {
-        origin: String,
-    },
-    StartupFailed {
-        #[serde(rename = "error")]
-        _error: SidecarError,
-    },
-    Stopped,
-    StopFailed {
-        #[serde(rename = "error")]
-        _error: SidecarError,
-    },
-}
-
-/// Sidecar 返回的可序列化错误。
-#[derive(Debug, Deserialize, Clone)]
-struct SidecarError {}
 
 /// 生命周期状态，序列化后作为启动页的稳定协议。
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +58,16 @@ struct LifecycleSnapshot {
     origin: Option<String>,
 }
 
+/// 供后续 lifecycle 和 Windows 信号分类复用的稳定进程观察结果。
+#[derive(Debug, Serialize, Clone)]
+struct ProcessObservation {
+    generation: u64,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+    exit_reason: String,
+    cleanup_outcome: Option<String>,
+}
+
 /// 允许复制到诊断信息中的安全错误分类。
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -108,19 +76,15 @@ enum DiagnosticCode {
     ResourceUnavailable,
     /// 官方 Node 不存在且没有显式覆盖。
     NodeUnavailable,
-    /// sidecar bootstrap 不存在。
+    /// 发布 CLI 入口或 runtime closure 不存在。
     BootstrapUnavailable,
     /// 无法准备应用数据目录。
     AppDataUnavailable,
-    /// 无法创建或接管 sidecar 进程树。
+    /// 固定的 127.0.0.1:3080 已被其它进程占用。
+    PortConflict,
+    /// 无法创建或接管 CLI 进程树。
     SpawnFailed,
-    /// sidecar 返回了启动失败消息。
-    StartupFailed,
-    /// sidecar 返回了停止失败消息。
-    StopFailed,
-    /// sidecar 返回了不允许的 origin。
-    InvalidOrigin,
-    /// sidecar 在 ready 或 listener 等待期间退出。
+    /// CLI 在 ready 或 listener 等待期间退出。
     UnexpectedExit,
     /// 进程树清理没有得到确认。
     CleanupFailed,
@@ -128,332 +92,10 @@ enum DiagnosticCode {
     InternalFailure,
 }
 
-/// 描述当前 sidecar 的进程树拥有关系。
-#[cfg(windows)]
-struct ProcessOwnership {
-    /// Windows Job Object 句柄；句柄关闭时会终止仍属于该 Job 的后代。
-    job: isize,
-}
-
-#[cfg(windows)]
-impl ProcessOwnership {
-    /// 为挂起的新进程创建并附加带有 kill-on-close 语义的 Job Object。
-    fn attach(pid: u32) -> Result<Self, String> {
-        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if job.is_null() {
-            return Err("failed to create sidecar Job Object".into());
-        }
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let configured = unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &mut limits as *mut _ as *mut std::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        } != 0;
-        if !configured {
-            unsafe { CloseHandle(job) };
-            return Err("failed to configure sidecar Job Object".into());
-        }
-        let process = unsafe {
-            OpenProcess(
-                PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-                0,
-                pid,
-            )
-        };
-        if process.is_null() {
-            unsafe { CloseHandle(job) };
-            return Err("failed to open suspended sidecar process".into());
-        }
-        let assigned = unsafe { AssignProcessToJobObject(job, process) != 0 };
-        unsafe { CloseHandle(process) };
-        if !assigned {
-            unsafe { CloseHandle(job) };
-            return Err("failed to assign suspended sidecar to Job Object".into());
-        }
-        Ok(Self { job: job as isize })
-    }
-
-    /// 在 Job Object 接管完成后恢复挂起 sidecar 的全部初始线程。
-    fn resume_suspended(&self, pid: u32) -> Result<(), String> {
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err("failed to enumerate suspended sidecar threads".into());
-        }
-        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
-        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-        let mut found = false;
-        let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) != 0 };
-        while has_entry {
-            if entry.th32OwnerProcessID == pid {
-                let thread_handle =
-                    unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-                if thread_handle.is_null() {
-                    unsafe { CloseHandle(snapshot) };
-                    return Err("failed to open suspended sidecar thread".into());
-                }
-                let resume_result = unsafe { ResumeThread(thread_handle) };
-                unsafe { CloseHandle(thread_handle) };
-                if resume_result == u32::MAX {
-                    unsafe { CloseHandle(snapshot) };
-                    return Err("failed to resume suspended sidecar thread".into());
-                }
-                found = true;
-            }
-            has_entry = unsafe { Thread32Next(snapshot, &mut entry) != 0 };
-        }
-        unsafe { CloseHandle(snapshot) };
-        if found {
-            Ok(())
-        } else {
-            Err("suspended sidecar thread was not found".into())
-        }
-    }
-
-    /// 终止 Job Object 中的整个 sidecar 进程树。
-    fn force_kill_tree(&self) -> Result<(), String> {
-        if unsafe { TerminateJobObject(self.job as HANDLE, 1) } != 0 {
-            Ok(())
-        } else {
-            Err("failed to terminate sidecar Job Object".into())
-        }
-    }
-
-    /// 查询 Job Object 中的 sidecar 和后代是否都已退出。
-    fn tree_has_exited(&self) -> Result<bool, String> {
-        let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
-        let queried = unsafe {
-            QueryInformationJobObject(
-                self.job as HANDLE,
-                JobObjectBasicAccountingInformation,
-                &mut accounting as *mut _ as *mut std::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            )
-        } != 0;
-        if queried {
-            Ok(accounting.ActiveProcesses == 0)
-        } else {
-            Err("failed to query sidecar Job Object".into())
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for ProcessOwnership {
-    /// 关闭 Job Object 句柄，确保仍存活的拥有进程树不会脱离桌面端。
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.job as HANDLE) };
-    }
-}
-
-#[cfg(unix)]
-struct ProcessOwnership {
-    /// sidecar 独立进程组的组长 PID。
-    pgid: i32,
-}
-
-#[cfg(unix)]
-impl ProcessOwnership {
-    /// 记录由 CommandExt 创建的独立进程组。
-    fn attach(pid: u32) -> Result<Self, String> {
-        Ok(Self { pgid: pid as i32 })
-    }
-
-    /// 向独立进程组发送 SIGKILL，覆盖 sidecar 生成的后代。
-    fn force_kill_tree(&self) -> Result<(), String> {
-        let result = unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
-        if result == 0 {
-            Ok(())
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "failed to kill sidecar process group {}: {error}",
-                    self.pgid
-                ))
-            }
-        }
-    }
-
-    /// 检查独立 Unix 进程组是否仍包含存活成员。
-    fn tree_has_exited(&self) -> Result<bool, String> {
-        let result = unsafe { libc::kill(-self.pgid, 0) };
-        if result == 0 {
-            return Ok(false);
-        }
-        let error = std::io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::ESRCH) => Ok(true),
-            Some(libc::EPERM) => Ok(false),
-            _ => Err(format!(
-                "failed to query sidecar process group {}: {error}",
-                self.pgid
-            )),
-        }
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-struct ProcessOwnership;
-
-#[cfg(not(any(unix, windows)))]
-impl ProcessOwnership {
-    /// 在未实现进程组 API 的平台上创建直接子进程拥有关系。
-    fn attach(_pid: u32) -> Result<Self, String> {
-        Ok(Self)
-    }
-
-    /// 未实现平台由 SidecarProcess 的 Child::kill 提供兜底。
-    fn force_kill_tree(&self) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// 未实现平台只能由直接子进程的退出状态决定树是否结束。
-    fn tree_has_exited(&self) -> Result<bool, String> {
-        Ok(true)
-    }
-}
-
-/// 由 Tauri 持有并可在重试期间共享的 Node sidecar 句柄。
-struct SidecarProcess {
-    /// 官方 Node 子进程句柄。
-    child: Mutex<Child>,
-    /// 发给 sidecar 的控制管道。
-    stdin: Mutex<Option<ChildStdin>>,
-    /// 当前进程树的拥有关系。
-    ownership: ProcessOwnership,
-    /// 串行化停止请求，防止关闭和 Retry 同时强杀同一棵树。
-    stop_lock: Mutex<()>,
-}
-
-impl ProcessControl for SidecarProcess {
-    /// 通过 sidecar 控制协议请求优雅停止。
-    fn request_graceful_stop(&self) -> Result<(), String> {
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| "sidecar stdin lock poisoned".to_string())?;
-        let Some(input) = stdin.as_mut() else {
-            return Err("sidecar stdin is unavailable".into());
-        };
-        writeln!(input, "{{\"type\":\"stop\"}}").map_err(|error| error.to_string())?;
-        input.flush().map_err(|error| error.to_string())
-    }
-
-    /// 查询官方 Node 子进程是否退出。
-    fn has_exited(&self) -> Result<bool, String> {
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| "sidecar child lock poisoned".to_string())?;
-        let child_exited = child
-            .try_wait()
-            .map(|status| status.is_some())
-            .map_err(|error| error.to_string())?;
-        Ok(child_exited && self.ownership.tree_has_exited()?)
-    }
-
-    /// 终止拥有的整个进程树，并在必要时直接终止组长。
-    fn force_kill_tree(&self) -> Result<(), String> {
-        self.ownership.force_kill_tree()
-    }
-
-    /// 等待并回收官方 Node 子进程句柄。
-    fn reap(&self) -> Result<(), String> {
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| "sidecar child lock poisoned".to_string())?;
-        child.wait().map_err(|error| error.to_string())?;
-        Ok(())
-    }
-}
-
-impl SidecarProcess {
-    /// 仅检查直接 Node 子进程，用于 readiness 期间快速识别 Host 崩溃。
-    fn child_has_exited(&self) -> Result<bool, String> {
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| "sidecar child lock poisoned".to_string())?;
-        child
-            .try_wait()
-            .map(|status| status.is_some())
-            .map_err(|error| error.to_string())
-    }
-}
-
-/// 在有界期限内确认并回收一个直接子进程。
-fn wait_and_reap_child(child: &mut Child, timeout: Duration) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child
-            .try_wait()
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("sidecar child did not exit before cleanup deadline".into());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-/// 在 Windows Job 接管失败时终止仍处于挂起状态且尚无后代的子进程。
-#[cfg(windows)]
-fn terminate_unowned_suspended_child(child: &mut Child) -> Result<(), String> {
-    let pid = child.id().to_string();
-    let taskkill_succeeded = Command::new("taskkill")
-        .args(["/PID", &pid, "/T", "/F"])
-        .status()
-        .is_ok_and(|status| status.success());
-    if !taskkill_succeeded {
-        child.kill().map_err(|error| error.to_string())?;
-    }
-    wait_and_reap_child(child, SIDECAR_FORCE_CONFIRM_AFTER)
-}
-
-/// 在非 Windows 平台终止尚未完成拥有关系初始化的直接子进程。
-#[cfg(not(windows))]
-fn terminate_unowned_suspended_child(child: &mut Child) -> Result<(), String> {
-    child.kill().map_err(|error| error.to_string())?;
-    wait_and_reap_child(child, SIDECAR_FORCE_CONFIRM_AFTER)
-}
-
-/// 强制终止已接管的进程树并在有界期限内确认树和组长全部退出。
-fn terminate_owned_child(ownership: &ProcessOwnership, child: &mut Child) -> Result<(), String> {
-    ownership.force_kill_tree()?;
-    let deadline = Instant::now() + SIDECAR_FORCE_CONFIRM_AFTER;
-    let mut child_exited = false;
-    loop {
-        if !child_exited {
-            child_exited = child
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                .is_some();
-        }
-        if child_exited && ownership.tree_has_exited()? {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("sidecar process tree did not exit before cleanup deadline".into());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
 /// Tauri shell 的共享运行时状态。
 struct RuntimeState {
     snapshot: Mutex<LifecycleSnapshot>,
-    process: Mutex<Option<Arc<SidecarProcess>>>,
+    process: Mutex<Option<Arc<CliProcess>>>,
     /// 串行化 spawn、Retry 和 shutdown，避免旧进程尚未回收时创建替代 Host。
     lifecycle_gate: Mutex<()>,
     host_origin: Mutex<Option<String>>,
@@ -467,26 +109,10 @@ struct RuntimeState {
     attempt_started: Mutex<Option<Instant>>,
     /// 官方 Node 可执行文件来源和路径状态的脱敏描述。
     node_path_status: Mutex<String>,
+    /// 最近一次 CLI 的真实退出分类与清理结果。
+    last_process_observation: Mutex<Option<ProcessObservation>>,
     logs_dir: PathBuf,
     last_error: Mutex<Option<DiagnosticCode>>,
-}
-
-/// 解析官方 Node sidecar 的生命周期输出。
-fn parse_sidecar_message(line: &str) -> Result<SidecarMessage, String> {
-    serde_json::from_str(line).map_err(|error| format!("invalid sidecar message: {error}"))
-}
-
-/// 判断一个 URL 是否是当前 Desktop 允许的精确 loopback origin。
-fn is_allowed_host_origin(origin: &str) -> bool {
-    let Ok(url) = origin.parse::<tauri::Url>() else {
-        return false;
-    };
-    url.scheme() == "http"
-        && url.host_str() == Some("127.0.0.1")
-        && url.port().is_some()
-        && url.path() == "/"
-        && url.query().is_none()
-        && url.fragment().is_none()
 }
 
 /// 判断 URL 是否是 Tauri 在不同 WebView 平台使用的精确打包启动入口。
@@ -594,31 +220,6 @@ fn resolve_node_path(resource_dir: &Path) -> Result<PathBuf, String> {
         "official Node sidecar is missing: {}",
         bundled.display()
     ))
-}
-
-/// 解析官方 sidecar 命令；可控测试替身只存在于 debug+wdio 构建。
-fn resolve_sidecar_command(resource_dir: &Path) -> Result<(PathBuf, PathBuf), DiagnosticCode> {
-    #[cfg(all(debug_assertions, feature = "wdio"))]
-    if let Some(raw_path) = std::env::var_os("DSH_TEST_SIDECAR").filter(|value| !value.is_empty()) {
-        let test_path = PathBuf::from(raw_path);
-        if !test_path.is_file() {
-            return Err(DiagnosticCode::BootstrapUnavailable);
-        }
-        return Ok((
-            resolve_node_path(resource_dir).map_err(|_| DiagnosticCode::NodeUnavailable)?,
-            test_path,
-        ));
-    }
-    let program = resolve_node_path(resource_dir).map_err(|_| DiagnosticCode::NodeUnavailable)?;
-    let script = if cfg!(debug_assertions) {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist/sidecar/index.js")
-    } else {
-        resource_dir.join("dist/sidecar/index.js")
-    };
-    if !script.is_file() {
-        return Err(DiagnosticCode::BootstrapUnavailable);
-    }
-    Ok((program, script))
 }
 
 /// 仅在 debug+wdio 构建中追加结构化测试事件。
@@ -809,14 +410,14 @@ fn wait_for_web_listener(
     app: &AppHandle,
     state: &RuntimeState,
     generation: u64,
-    process: &Arc<SidecarProcess>,
+    process: &Arc<CliProcess>,
     origin: &str,
     attempt_started: Instant,
 ) -> Result<(), ReadinessWaitError> {
     let address = parse_loopback_address(origin)?;
     wait_for_readiness(
         || is_current(state, generation),
-        || process.child_has_exited(),
+        || process.try_exit(generation).map(|exit| exit.is_some()),
         || Ok(probe_client_page(address)),
         attempt_started,
         PROLONGED_STARTUP_AFTER,
@@ -832,57 +433,20 @@ fn wait_for_web_listener(
     )
 }
 
-/// 将官方 Node 所在目录置于 PATH 首位，保证插件 spawn("node") 复用同一官方运行时。
-fn prepend_node_directory_to_path(
-    node_path: &Path,
-    inherited_path: Option<OsString>,
-) -> Result<OsString, DiagnosticCode> {
-    let node_directory = node_path.parent().ok_or(DiagnosticCode::NodeUnavailable)?;
-    let paths = std::iter::once(node_directory.to_path_buf()).chain(
-        inherited_path
-            .as_deref()
-            .map(std::env::split_paths)
-            .into_iter()
-            .flatten(),
-    );
-    std::env::join_paths(paths).map_err(|_| DiagnosticCode::SpawnFailed)
-}
-
-/// 向 sidecar Command 写入去重后的 PATH；Windows 同时清除 PATH 与 Path 等大小写变体。
-fn configure_sidecar_node_path(
-    command: &mut Command,
-    node_path: &Path,
-) -> Result<(), DiagnosticCode> {
-    let inherited_path = std::env::vars_os().find_map(|(name, value)| {
-        name.to_string_lossy()
-            .eq_ignore_ascii_case("path")
-            .then_some(value)
-    });
-    let path = prepend_node_directory_to_path(node_path, inherited_path)?;
-    command.env_remove("PATH");
-    command.env_remove("Path");
-    for (name, _) in
-        std::env::vars_os().filter(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("path"))
-    {
-        command.env_remove(name);
+/// 返回当前构建中物化的 production runtime closure 根目录。
+fn runtime_closure_root(resource_dir: &Path) -> PathBuf {
+    if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist/node_modules")
+    } else {
+        resource_dir.join("dist/node_modules")
     }
-    command.env("PATH", path);
-    Ok(())
 }
 
-/// 启动一个官方 Node sidecar，并返回共享进程句柄与生命周期消息通道。
-fn spawn_sidecar(
+/// 解析固定 Node、发布 CLI 入口、隔离 Home 与独立工作目录。
+fn resolve_cli_plan(
     app: &AppHandle,
     state: &RuntimeState,
-    generation: u64,
-) -> Result<(Arc<SidecarProcess>, mpsc::Receiver<SidecarMessage>), DiagnosticCode> {
-    let _gate = state
-        .lifecycle_gate
-        .lock()
-        .map_err(|_| DiagnosticCode::InternalFailure)?;
-    if !is_current(state, generation) {
-        return Err(DiagnosticCode::InternalFailure);
-    }
+) -> Result<cli_supervisor::CliCommandPlan, DiagnosticCode> {
     let resource_dir = app
         .path()
         .resource_dir()
@@ -890,111 +454,161 @@ fn spawn_sidecar(
     if let Ok(mut status) = state.node_path_status.lock() {
         *status = node_path_status(&resource_dir).into();
     }
-    let (node_path, script) = resolve_sidecar_command(&resource_dir)?;
-    let harness_home = app
+    let node_path =
+        resolve_node_path(&resource_dir).map_err(|_| DiagnosticCode::NodeUnavailable)?;
+    let app_data = app
         .path()
         .app_data_dir()
         .map_err(|_| DiagnosticCode::AppDataUnavailable)?;
-    fs::create_dir_all(&harness_home).map_err(|_| DiagnosticCode::AppDataUnavailable)?;
-    let mut command = Command::new(&node_path);
-    command
-        .arg(script)
-        .current_dir(&harness_home)
-        .env("DSH_HOME", &harness_home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    configure_sidecar_node_path(&mut command, &node_path)?;
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command.spawn().map_err(|_| DiagnosticCode::SpawnFailed)?;
+    let plan = build_command_plan(
+        node_path,
+        &runtime_closure_root(&resource_dir),
+        app_data.join("harness-home"),
+        app_data.join("working-directory"),
+    )
+    .map_err(|_| DiagnosticCode::BootstrapUnavailable)?;
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    let plan = if let Some(test_entry) =
+        std::env::var_os("DSH_TEST_SIDECAR").filter(|value| !value.is_empty())
+    {
+        let test_entry = PathBuf::from(test_entry);
+        if !test_entry.is_file() {
+            return Err(DiagnosticCode::BootstrapUnavailable);
+        }
+        plan.with_test_entry(test_entry)
+    } else {
+        plan
+    };
+    Ok(plan)
+}
+
+/// 把 supervisor 的稳定错误映射到 Desktop 诊断分类。
+fn map_supervisor_error(error: SupervisorError) -> DiagnosticCode {
+    match error {
+        SupervisorError::RuntimeUnavailable => DiagnosticCode::AppDataUnavailable,
+        SupervisorError::PortConflict => DiagnosticCode::PortConflict,
+        SupervisorError::SpawnFailed => DiagnosticCode::SpawnFailed,
+        SupervisorError::CleanupFailed => DiagnosticCode::CleanupFailed,
+    }
+}
+
+/// 在生命周期门禁内启动当前 generation 的官方 CLI。
+fn spawn_direct_cli(
+    app: &AppHandle,
+    state: &RuntimeState,
+    generation: u64,
+) -> Result<Arc<CliProcess>, DiagnosticCode> {
+    let _gate = state
+        .lifecycle_gate
+        .lock()
+        .map_err(|_| DiagnosticCode::InternalFailure)?;
+    if !is_current(state, generation) {
+        return Err(DiagnosticCode::InternalFailure);
+    }
+    let plan = resolve_cli_plan(app, state)?;
+    let process = spawn_cli(&plan, generation).map_err(map_supervisor_error)?;
     #[cfg(all(debug_assertions, feature = "wdio"))]
     record_wdio_event(serde_json::json!({
         "event": "sidecar-spawned",
-        "pid": child.id(),
+        "generation": generation,
         "nodePathPrepended": true
     }));
-    let pid = child.id();
-    let ownership = match ProcessOwnership::attach(pid) {
-        Ok(ownership) => ownership,
-        Err(_) => {
-            return Err(if terminate_unowned_suspended_child(&mut child).is_ok() {
-                DiagnosticCode::SpawnFailed
-            } else {
-                DiagnosticCode::CleanupFailed
-            });
-        }
+    if !is_current(state, generation) {
+        let _ = stop_cli(state, &process);
+        return Err(DiagnosticCode::InternalFailure);
+    }
+    let Ok(mut current) = state.process.lock() else {
+        return Err(if stop_cli(state, &process).is_ok() {
+            DiagnosticCode::InternalFailure
+        } else {
+            DiagnosticCode::CleanupFailed
+        });
     };
-    #[cfg(windows)]
-    if ownership.resume_suspended(pid).is_err() {
-        return Err(if terminate_owned_child(&ownership, &mut child).is_ok() {
-            DiagnosticCode::SpawnFailed
+    if current.is_some() {
+        drop(current);
+        return Err(if stop_cli(state, &process).is_ok() {
+            DiagnosticCode::InternalFailure
         } else {
             DiagnosticCode::CleanupFailed
         });
     }
-    let stdin = match child.stdin.take() {
-        Some(stdin) => stdin,
-        None => {
-            return Err(if terminate_owned_child(&ownership, &mut child).is_ok() {
-                DiagnosticCode::SpawnFailed
-            } else {
-                DiagnosticCode::CleanupFailed
-            });
-        }
-    };
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            return Err(if terminate_owned_child(&ownership, &mut child).is_ok() {
-                DiagnosticCode::SpawnFailed
-            } else {
-                DiagnosticCode::CleanupFailed
-            });
-        }
-    };
-    let process = Arc::new(SidecarProcess {
-        ownership,
-        child: Mutex::new(child),
-        stdin: Mutex::new(Some(stdin)),
-        stop_lock: Mutex::new(()),
-    });
-    if let Ok(mut current) = state.process.lock() {
-        *current = Some(Arc::clone(&process));
-    } else {
-        let _ = stop_sidecar(&process);
-        return Err(DiagnosticCode::InternalFailure);
-    }
-    if !is_current(state, generation) {
-        return Err(DiagnosticCode::InternalFailure);
-    }
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Ok(message) = parse_sidecar_message(line.trim()) {
-                let _ = sender.send(message);
-            }
-        }
-    });
-    Ok((process, receiver))
+    *current = Some(Arc::clone(&process));
+    Ok(process)
 }
 
-/// 终止 sidecar，并在优雅停止超时后终止整个进程树。
-fn stop_sidecar(process: &Arc<SidecarProcess>) -> Result<(), String> {
-    let _stop_guard = process
-        .stop_lock
-        .lock()
-        .map_err(|_| "sidecar stop lock poisoned".to_string())?;
-    stop_process(
-        process.as_ref(),
-        SIDECAR_STOP_AFTER,
-        SIDECAR_FORCE_CONFIRM_AFTER,
-    )
-    .map(|_| ())
+/// 返回跨平台稳定的退出 signal；Windows ExitStatus 没有 POSIX signal。
+#[cfg(unix)]
+fn exit_signal(status: &ExitStatus) -> Option<i32> {
+    status.signal()
 }
 
+/// 返回跨平台稳定的退出 signal；非 Unix 平台固定为空。
+#[cfg(not(unix))]
+fn exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
+}
+
+/// 保存真实 ExitStatus、generation、原因和可选 cleanup outcome。
+fn record_process_observation(
+    state: &RuntimeState,
+    process: &CliProcess,
+    exit: &ProcessExit,
+    cleanup_outcome: Option<&str>,
+) {
+    let reason = match exit.reason {
+        ExitReason::Requested => "requested",
+        ExitReason::Unexpected => "unexpected",
+        ExitReason::StaleGeneration => "stale_generation",
+    };
+    if let Ok(mut observation) = state.last_process_observation.lock() {
+        *observation = Some(ProcessObservation {
+            generation: process.generation(),
+            exit_code: exit.status.code(),
+            exit_signal: exit_signal(&exit.status),
+            exit_reason: reason.into(),
+            cleanup_outcome: cleanup_outcome.map(str::to_owned),
+        });
+    }
+}
+
+/// 在无法确认回收时保留 cleanup failure，而不伪造 ExitStatus。
+fn record_cleanup_failure(state: &RuntimeState, process: &CliProcess) {
+    if let Ok(mut observation) = state.last_process_observation.lock() {
+        if let Some(existing) = observation
+            .as_mut()
+            .filter(|existing| existing.generation == process.generation())
+        {
+            existing.cleanup_outcome = Some("failed".into());
+        } else {
+            *observation = Some(ProcessObservation {
+                generation: process.generation(),
+                exit_code: None,
+                exit_signal: None,
+                exit_reason: "unknown".into(),
+                cleanup_outcome: Some("failed".into()),
+            });
+        }
+    }
+}
+
+/// 对一个 CLI generation 执行八秒宽限停止并持久保留监督结果。
+fn stop_cli(state: &RuntimeState, process: &Arc<CliProcess>) -> Result<StopReport, String> {
+    let report = match process.stop(SIDECAR_STOP_AFTER, SIDECAR_FORCE_CONFIRM_AFTER) {
+        Ok(report) => report,
+        Err(error) => {
+            record_cleanup_failure(state, process);
+            return Err(error);
+        }
+    };
+    if let Some(exit) = report.exit.as_ref() {
+        let outcome = match report.outcome {
+            lifecycle::StopOutcome::Graceful => "graceful",
+            lifecycle::StopOutcome::Forced => "forced",
+        };
+        record_process_observation(state, process, exit, Some(outcome));
+    }
+    Ok(report)
+}
 /// 将窗口导航到打包启动页，供失败和崩溃恢复复用。
 fn navigate_to_startup(app: &AppHandle, state: &RuntimeState) {
     let Some(raw_url) = state
@@ -1071,8 +685,8 @@ fn fail_attempt(app: &AppHandle, state: &RuntimeState, generation: u64, code: Di
     navigate_to_startup(app, state);
 }
 
-/// 仅在状态仍指向同一个 sidecar 时清除共享句柄，避免误删替代轮次。
-fn clear_process(state: &RuntimeState, process: &Arc<SidecarProcess>) {
+/// 仅在状态仍指向同一个 CLI 时清除共享句柄，避免误删替代轮次。
+fn clear_process(state: &RuntimeState, process: &Arc<CliProcess>) {
     if let Ok(mut current) = state.process.lock() {
         if current
             .as_ref()
@@ -1088,10 +702,10 @@ fn abort_attempt(
     app: &AppHandle,
     state: &RuntimeState,
     generation: u64,
-    process: &Arc<SidecarProcess>,
+    process: &Arc<CliProcess>,
     code: DiagnosticCode,
 ) {
-    let cleanup = stop_sidecar(process);
+    let cleanup = stop_cli(state, process);
     if cleanup.is_ok() {
         clear_process(state, process);
     }
@@ -1107,7 +721,7 @@ fn abort_attempt(
     );
 }
 
-/// 执行一个启动轮次，并在 sidecar 意外退出时回到启动失败页。
+/// 执行 direct CLI 启动轮次，并只从进程、固定 HTTP 与 WebView 观察生命周期。
 fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
     transition(
         &app,
@@ -1121,143 +735,87 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
         .ok()
         .and_then(|started| *started)
         .unwrap_or_else(Instant::now);
-    let (process, receiver) = match spawn_sidecar(&app, &state, generation) {
-        Ok(result) => result,
+    let process = match spawn_direct_cli(&app, &state, generation) {
+        Ok(process) => process,
         Err(error) => {
             fail_attempt(&app, &state, generation, error);
             return;
         }
     };
+    set_host_origin(&state, generation, HOST_ORIGIN.into());
     transition(
         &app,
         &state,
         LifecycleState::WaitingForClient,
         "Waiting for client to start.",
     );
-    let mut machine = LifecycleMachine::new();
+    match wait_for_web_listener(
+        &app,
+        &state,
+        generation,
+        &process,
+        HOST_ORIGIN,
+        attempt_started,
+    ) {
+        Ok(()) => {
+            #[cfg(all(debug_assertions, feature = "wdio"))]
+            record_wdio_event(serde_json::json!({
+                "event": "client-page-served",
+                "origin": HOST_ORIGIN
+            }));
+            navigate_to_host(&app, HOST_ORIGIN);
+        }
+        Err(ReadinessWaitError::Cancelled) => return,
+        Err(ReadinessWaitError::ProcessExited) => {
+            match process.try_exit(generation) {
+                Ok(Some(exit)) => {
+                    record_process_observation(&state, &process, &exit, None);
+                    if exit.reason == ExitReason::StaleGeneration {
+                        return;
+                    }
+                    abort_attempt(
+                        &app,
+                        &state,
+                        generation,
+                        &process,
+                        DiagnosticCode::UnexpectedExit,
+                    );
+                }
+                _ => abort_attempt(
+                    &app,
+                    &state,
+                    generation,
+                    &process,
+                    DiagnosticCode::UnexpectedExit,
+                ),
+            }
+            return;
+        }
+        Err(ReadinessWaitError::ProbeFailed) => {
+            abort_attempt(
+                &app,
+                &state,
+                generation,
+                &process,
+                DiagnosticCode::InternalFailure,
+            );
+            return;
+        }
+    }
+
     loop {
         if !is_current(&state, generation) {
             return;
         }
-        if let Ok(message) = receiver.recv_timeout(Duration::from_millis(100)) {
-            match message {
-                SidecarMessage::Ready { origin } => {
-                    if !is_allowed_host_origin(&origin) {
-                        abort_attempt(
-                            &app,
-                            &state,
-                            generation,
-                            &process,
-                            DiagnosticCode::InvalidOrigin,
-                        );
-                        return;
-                    }
-                    match machine.observe(SidecarEvent::Ready(origin.clone())) {
-                        LifecycleAction::Ready(origin) => {
-                            set_host_origin(&state, generation, origin.clone());
-                            if let Err(error) = wait_for_web_listener(
-                                &app,
-                                &state,
-                                generation,
-                                &process,
-                                &origin,
-                                attempt_started,
-                            ) {
-                                match error {
-                                    ReadinessWaitError::Cancelled => {}
-                                    ReadinessWaitError::ProcessExited => abort_attempt(
-                                        &app,
-                                        &state,
-                                        generation,
-                                        &process,
-                                        DiagnosticCode::UnexpectedExit,
-                                    ),
-                                    ReadinessWaitError::ProbeFailed => abort_attempt(
-                                        &app,
-                                        &state,
-                                        generation,
-                                        &process,
-                                        DiagnosticCode::InternalFailure,
-                                    ),
-                                }
-                                return;
-                            }
-                            #[cfg(all(debug_assertions, feature = "wdio"))]
-                            record_wdio_event(
-                                serde_json::json!({ "event": "client-page-served", "origin": origin }),
-                            );
-                            navigate_to_host(&app, &origin);
-                        }
-                        LifecycleAction::Fail => {
-                            abort_attempt(
-                                &app,
-                                &state,
-                                generation,
-                                &process,
-                                DiagnosticCode::UnexpectedExit,
-                            );
-                            return;
-                        }
-                        LifecycleAction::Ignore => {}
-                    }
-                }
-                SidecarMessage::StartupFailed { _error: _ } => {
-                    if let LifecycleAction::Fail = machine.observe(SidecarEvent::StartupFailed) {
-                        abort_attempt(
-                            &app,
-                            &state,
-                            generation,
-                            &process,
-                            DiagnosticCode::StartupFailed,
-                        );
-                    }
+        match process.try_exit(generation) {
+            Ok(Some(exit)) => {
+                record_process_observation(&state, &process, &exit, None);
+                if matches!(
+                    exit.reason,
+                    ExitReason::StaleGeneration | ExitReason::Requested
+                ) {
                     return;
                 }
-                SidecarMessage::StopFailed { _error: _ } => {
-                    if let LifecycleAction::Fail = machine.observe(SidecarEvent::StartupFailed) {
-                        abort_attempt(
-                            &app,
-                            &state,
-                            generation,
-                            &process,
-                            DiagnosticCode::StopFailed,
-                        );
-                    }
-                    return;
-                }
-                SidecarMessage::Stopped => {
-                    if let LifecycleAction::Fail = machine.observe(SidecarEvent::Stopped) {
-                        abort_attempt(
-                            &app,
-                            &state,
-                            generation,
-                            &process,
-                            DiagnosticCode::UnexpectedExit,
-                        );
-                    }
-                    return;
-                }
-            }
-        }
-        if attempt_started.elapsed() >= PROLONGED_STARTUP_AFTER
-            && state
-                .snapshot
-                .lock()
-                .ok()
-                .is_some_and(|snapshot| snapshot.state == LifecycleState::WaitingForClient)
-        {
-            transition(
-                &app,
-                &state,
-                LifecycleState::ProlongedStartup,
-                "Startup is taking longer than expected. You can retry when ready.",
-            );
-        }
-        match process.child_has_exited() {
-            Ok(true)
-                if is_current(&state, generation)
-                    && matches!(machine.observe(SidecarEvent::Exited), LifecycleAction::Fail) =>
-            {
                 abort_attempt(
                     &app,
                     &state,
@@ -1267,8 +825,7 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
                 );
                 return;
             }
-            Ok(true) => return,
-            Ok(false) => {}
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
             Err(_) => {
                 abort_attempt(
                     &app,
@@ -1282,8 +839,7 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
         }
     }
 }
-
-/// 启动一个新的、唯一的 sidecar 启动轮次。
+/// 启动一个新的、唯一的 CLI 启动轮次。
 fn start_attempt(app: &AppHandle, state: &Arc<RuntimeState>) {
     let generation = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
     if let Ok(mut started) = state.attempt_started.lock() {
@@ -1325,20 +881,16 @@ fn request_retry(app: &AppHandle, state: &Arc<RuntimeState>) {
             .lock()
             .ok()
             .and_then(|mut current| current.take());
-        let cleanup = cleanup_then_restart(
-            process
-                .as_deref()
-                .map(|process| process as &dyn ProcessControl),
-            SIDECAR_STOP_AFTER,
-            SIDECAR_FORCE_CONFIRM_AFTER,
-            || {
-                state.retrying.store(false, Ordering::Release);
-                if !state.shutting_down.load(Ordering::Acquire) {
-                    start_attempt(&app, &state);
-                }
-            },
-        );
-        if cleanup.is_err() {
+        let cleanup = process
+            .as_ref()
+            .map(|process| stop_cli(&state, process))
+            .transpose();
+        if cleanup.is_ok() {
+            state.retrying.store(false, Ordering::Release);
+            if !state.shutting_down.load(Ordering::Acquire) {
+                start_attempt(&app, &state);
+            }
+        } else {
             if let Some(process) = process {
                 if let Ok(mut current) = state.process.lock() {
                     *current = Some(process);
@@ -1356,7 +908,7 @@ fn request_retry(app: &AppHandle, state: &Arc<RuntimeState>) {
     });
 }
 
-/// 请求应用退出，并保证 sidecar 进程树被回收。
+/// 请求应用退出，并保证 CLI 进程树被回收。
 fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>) {
     if state.shutting_down.swap(true, Ordering::AcqRel) {
         return;
@@ -1377,7 +929,7 @@ fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>) {
             .and_then(|mut current| current.take());
         let cleanup_failed = process
             .as_ref()
-            .is_some_and(|process| stop_sidecar(process).is_err());
+            .is_some_and(|process| stop_cli(&state, process).is_err());
         drop(_gate);
         app.exit(if cleanup_failed { 1 } else { 0 });
     });
@@ -1419,10 +971,12 @@ struct StartupDiagnostics {
     lifecycle_state: String,
     /// 当前轮次已经运行的毫秒数。
     lifecycle_elapsed_ms: u128,
-    /// 官方 Node/sidecar 路径来源的脱敏状态。
-    sidecar_path_status: String,
-    /// 当前是否仍有被桌面端拥有的 sidecar。
-    sidecar_process_status: String,
+    /// 官方 Node/CLI 路径来源的脱敏状态。
+    cli_path_status: String,
+    /// 当前是否仍有被桌面端拥有的 CLI。
+    cli_process_status: String,
+    /// 最近一次 CLI 退出与 cleanup 的稳定监督结果。
+    process_observation: Option<ProcessObservation>,
     /// 最近一次允许复制的稳定错误分类。
     error_code: Option<DiagnosticCode>,
 }
@@ -1435,7 +989,7 @@ fn build_startup_diagnostics(state: &RuntimeState, snapshot: &LifecycleSnapshot)
         .ok()
         .and_then(|started| started.map(|value| value.elapsed().as_millis()))
         .unwrap_or(0);
-    let sidecar_process_status = state
+    let cli_process_status = state
         .process
         .lock()
         .ok()
@@ -1450,12 +1004,17 @@ fn build_startup_diagnostics(state: &RuntimeState, snapshot: &LifecycleSnapshot)
         lifecycle_state: serde_json::to_string(&snapshot.state)
             .unwrap_or_else(|_| "unknown".into()),
         lifecycle_elapsed_ms: elapsed,
-        sidecar_path_status: state
+        cli_path_status: state
             .node_path_status
             .lock()
             .map(|value| value.clone())
             .unwrap_or_else(|_| "unknown".into()),
-        sidecar_process_status: sidecar_process_status.into(),
+        cli_process_status: cli_process_status.into(),
+        process_observation: state
+            .last_process_observation
+            .lock()
+            .ok()
+            .and_then(|value| value.clone()),
         error_code,
     };
     serde_json::to_string_pretty(&diagnostics).unwrap_or_else(|_| "diagnostics unavailable".into())
@@ -1523,6 +1082,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         shutting_down: AtomicBool::new(false),
         attempt_started: Mutex::new(None),
         node_path_status: Mutex::new("not-checked".into()),
+        last_process_observation: Mutex::new(None),
         logs_dir,
         last_error: Mutex::new(None),
     });
@@ -1666,47 +1226,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_startup_diagnostics, bundled_node_relative_path, configure_sidecar_node_path,
-        decide_navigation, is_allowed_host_origin, is_current_host_page, is_finished_page_load,
-        is_html_client_response, is_packaged_startup_url, parse_loopback_address,
-        parse_sidecar_message, prepend_node_directory_to_path, DiagnosticCode, LifecycleSnapshot,
-        LifecycleState, NavigationDecision, PageLoadEvent, RuntimeState, SidecarMessage,
+        build_startup_diagnostics, bundled_node_relative_path, decide_navigation,
+        is_current_host_page, is_finished_page_load, is_html_client_response,
+        is_packaged_startup_url, parse_loopback_address, DiagnosticCode, LifecycleSnapshot,
+        LifecycleState, NavigationDecision, PageLoadEvent, ProcessObservation, RuntimeState,
     };
-    use std::ffi::OsString;
     use std::path::PathBuf;
-    use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Mutex;
-    /// 验证生命周期 ready 消息可解析。
-    #[test]
-    fn parses_ready_message() {
-        let message =
-            parse_sidecar_message(r#"{"type":"ready","origin":"http://127.0.0.1:1234/"}"#).unwrap();
-        assert!(
-            matches!(message, SidecarMessage::Ready { origin } if origin == "http://127.0.0.1:1234/")
-        );
-    }
-    /// 验证 sidecar 错误载荷只用于分类，不会进入可复制诊断状态。
-    #[test]
-    fn parses_but_discards_sidecar_error_details() {
-        let message = parse_sidecar_message(
-            r#"{"type":"startup-failed","error":{"name":"Error","message":"token=secret"}}"#,
-        )
-        .unwrap();
-        assert!(matches!(message, SidecarMessage::StartupFailed { .. }));
-    }
     /// 验证生命周期保留可恢复状态。
     #[test]
     fn lifecycle_has_recoverable_states() {
         assert_ne!(LifecycleState::Failed, LifecycleState::Ready);
         assert_ne!(LifecycleState::Stopping, LifecycleState::Starting);
-    }
-    /// 验证只接受带端口的 127.0.0.1 HTTP origin。
-    #[test]
-    fn validates_host_origin() {
-        assert!(is_allowed_host_origin("http://127.0.0.1:1234/"));
-        assert!(!is_allowed_host_origin("http://localhost:1234/"));
-        assert!(!is_allowed_host_origin("https://127.0.0.1:1234/"));
     }
     /// 验证 sidecar 返回的规范 origin 尾斜杠不会破坏 TCP readiness 探测。
     #[test]
@@ -1731,53 +1263,6 @@ mod tests {
         ));
     }
 
-    /// 验证官方 Node 所在目录始终位于继承 PATH 的首位。
-    #[test]
-    fn prepends_official_node_directory_to_path() {
-        let node = PathBuf::from("desktop/resources/node/current/node");
-        let inherited =
-            std::env::join_paths([PathBuf::from("system-node"), PathBuf::from("tools")]).unwrap();
-        let configured = prepend_node_directory_to_path(&node, Some(inherited)).unwrap();
-        let configured = std::env::split_paths(&configured).collect::<Vec<_>>();
-        assert_eq!(
-            configured.first(),
-            Some(&node.parent().unwrap().to_path_buf())
-        );
-        assert!(configured.contains(&PathBuf::from("system-node")));
-    }
-
-    /// 验证没有继承 PATH 时仍只提供官方 Node 所在目录。
-    #[test]
-    fn creates_node_path_without_inherited_path() {
-        let node = PathBuf::from("desktop/resources/node/current/node");
-        let configured = prepend_node_directory_to_path(&node, None::<OsString>).unwrap();
-        assert_eq!(
-            std::env::split_paths(&configured).collect::<Vec<_>>(),
-            vec![node.parent().unwrap().to_path_buf()]
-        );
-    }
-
-    /// 验证 Command 仅保留一个前置官方 Node 目录的 PATH 覆盖，作为 Windows 大小写兼容回归保护。
-    #[test]
-    fn command_path_override_prefers_official_node_directory() {
-        let node = PathBuf::from("desktop/resources/node/current/node");
-        let mut command = Command::new("test-program");
-        configure_sidecar_node_path(&mut command, &node).unwrap();
-        let values = command
-            .get_envs()
-            .filter_map(|(name, value)| {
-                name.to_string_lossy()
-                    .eq_ignore_ascii_case("path")
-                    .then_some(value)
-                    .flatten()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(values.len(), 1);
-        assert_eq!(
-            std::env::split_paths(values[0]).next(),
-            Some(node.parent().unwrap().to_path_buf())
-        );
-    }
     /// 验证启动页、当前 Host 和外链导航边界。
     #[test]
     fn applies_navigation_policy() {
@@ -1845,6 +1330,13 @@ mod tests {
             shutting_down: AtomicBool::new(false),
             attempt_started: Mutex::new(None),
             node_path_status: Mutex::new("bundled".into()),
+            last_process_observation: Mutex::new(Some(ProcessObservation {
+                generation: 1,
+                exit_code: None,
+                exit_signal: Some(9),
+                exit_reason: "unexpected".into(),
+                cleanup_outcome: Some("forced".into()),
+            })),
             logs_dir: PathBuf::from(r#"C:\Users\alice\secret"#),
             last_error: Mutex::new(Some(DiagnosticCode::SpawnFailed)),
         };
@@ -1855,6 +1347,8 @@ mod tests {
         };
         let diagnostics = build_startup_diagnostics(&state, &snapshot);
         assert!(diagnostics.contains("spawn_failed"));
+        assert!(diagnostics.contains("stale_generation") || diagnostics.contains("unexpected"));
+        assert!(diagnostics.contains("forced"));
         assert!(!diagnostics.contains("example.test"));
         assert!(!diagnostics.contains("token"));
         assert!(!diagnostics.contains("alice"));
@@ -1879,6 +1373,7 @@ mod tests {
             shutting_down: AtomicBool::new(false),
             attempt_started: Mutex::new(None),
             node_path_status: Mutex::new("bundled".into()),
+            last_process_observation: Mutex::new(None),
             logs_dir: PathBuf::from("logs"),
             last_error: Mutex::new(None),
         };

@@ -128,8 +128,6 @@ pub enum SidecarEvent {
     Ready(String),
     /// Host 在启动阶段报告了失败。
     StartupFailed,
-    /// Host 主动报告已停止。
-    Stopped,
     /// 监督线程观察到 Host 进程退出。
     Exited,
 }
@@ -178,18 +176,12 @@ impl LifecycleMachine {
                 self.state = MachineState::Ready;
                 LifecycleAction::Ready(origin)
             }
-            (
-                MachineState::Starting,
-                SidecarEvent::StartupFailed | SidecarEvent::Stopped | SidecarEvent::Exited,
-            ) => {
+            (MachineState::Starting, SidecarEvent::StartupFailed | SidecarEvent::Exited) => {
                 self.state = MachineState::Failed;
                 LifecycleAction::Fail
             }
             (MachineState::Ready, SidecarEvent::Ready(_)) => LifecycleAction::Ignore,
-            (
-                MachineState::Ready,
-                SidecarEvent::StartupFailed | SidecarEvent::Stopped | SidecarEvent::Exited,
-            ) => {
+            (MachineState::Ready, SidecarEvent::StartupFailed | SidecarEvent::Exited) => {
                 self.state = MachineState::Failed;
                 LifecycleAction::Fail
             }
