@@ -130,6 +130,9 @@ pub(crate) enum SupervisorError {
     CleanupFailed,
 }
 
+/// 对仍存活的 CLI leader 执行平台优雅停止动作。
+type GracefulAction = fn(u32) -> Result<(), String>;
+
 /// 描述一个由 Desktop 拥有的 CLI 进程树。
 pub(crate) struct CliProcess {
     generation: u64,
@@ -139,6 +142,7 @@ pub(crate) struct CliProcess {
     observed_status: Mutex<Option<ExitStatus>>,
     classified_reason: Mutex<Option<ExitReason>>,
     stop_lock: Mutex<()>,
+    graceful_action: GracefulAction,
 }
 
 /// 按发布 `package.json#bin.dsh` 契约解析闭包内的 CLI 入口。
@@ -464,11 +468,12 @@ fn terminate_unowned_child(child: &mut Child) -> Result<(), String> {
     child.wait().map(|_| ()).map_err(|error| error.to_string())
 }
 
-/// 创建进程组/Job Object 并启动一条已经准备好的命令。
-fn spawn_owned_command(
+/// 使用指定平台优雅动作创建并接管一条已经准备好的命令。
+fn spawn_owned_command_with_graceful_action(
     mut command: Command,
     generation: u64,
     preflight: impl FnOnce() -> io::Result<()>,
+    graceful_action: GracefulAction,
 ) -> Result<Arc<CliProcess>, SupervisorError> {
     #[cfg(windows)]
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
@@ -511,7 +516,49 @@ fn spawn_owned_command(
         observed_status: Mutex::new(None),
         classified_reason: Mutex::new(None),
         stop_lock: Mutex::new(()),
+        graceful_action,
     }))
+}
+
+/// 创建进程组/Job Object 并使用当前平台动作启动命令。
+fn spawn_owned_command(
+    command: Command,
+    generation: u64,
+    preflight: impl FnOnce() -> io::Result<()>,
+) -> Result<Arc<CliProcess>, SupervisorError> {
+    spawn_owned_command_with_graceful_action(
+        command,
+        generation,
+        preflight,
+        platform_graceful_action,
+    )
+}
+
+/// Unix 仅向 CLI leader 发送 SIGTERM。
+#[cfg(unix)]
+fn platform_graceful_action(pid: u32) -> Result<(), String> {
+    let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(format!("failed to signal CLI leader {pid}: {error}"))
+    }
+}
+
+/// Windows 在 #50 实现 Ctrl+C 前交由 Job fallback。
+#[cfg(windows)]
+fn platform_graceful_action(_pid: u32) -> Result<(), String> {
+    Err("Windows graceful Ctrl+C is implemented by issue #50".into())
+}
+
+/// 其它平台尚不提供 CLI 优雅停止动作。
+#[cfg(not(any(unix, windows)))]
+fn platform_graceful_action(_pid: u32) -> Result<(), String> {
+    Err("graceful CLI shutdown is unavailable on this platform".into())
 }
 
 /// 在固定端口预检后启动一个由 Desktop 拥有的官方 CLI 进程树。
@@ -608,7 +655,7 @@ impl CliProcess {
 }
 
 impl ProcessControl for CliProcess {
-    /// Unix 仅向 CLI leader 发送 SIGTERM；Windows 本票交由 Job fallback。
+    /// 确认 leader 存活并登记 owned request 后调用平台优雅停止动作。
     fn request_graceful_stop(&self, current_generation: u64) -> Result<(), String> {
         let mut child = self
             .child
@@ -630,36 +677,20 @@ impl ProcessControl for CliProcess {
         }
         self.requested_generation
             .store(self.generation, Ordering::Release);
-        #[cfg(unix)]
-        {
-            let pid = child.id() as i32;
-            let result = unsafe { libc::kill(pid, libc::SIGTERM) };
-            if result == 0 {
-                return Ok(());
-            }
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                if let Some(status) = child
-                    .try_wait()
-                    .map_err(|wait_error| wait_error.to_string())?
-                {
-                    self.cache_observed_status(status)?;
-                    drop(child);
-                    self.try_exit(current_generation)?;
-                }
-                Ok(())
-            } else {
-                Err(format!("failed to signal CLI leader {pid}: {error}"))
-            }
+        let pid = child.id();
+        let action = (self.graceful_action)(pid);
+        if action.is_ok() {
+            return Ok(());
         }
-        #[cfg(windows)]
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|wait_error| wait_error.to_string())?
         {
-            Err("Windows graceful Ctrl+C is implemented by issue #50".into())
+            self.cache_observed_status(status)?;
+            drop(child);
+            self.try_exit(current_generation)?;
         }
-        #[cfg(not(any(unix, windows)))]
-        {
-            Err("graceful CLI shutdown is unavailable on this platform".into())
-        }
+        action
     }
 
     /// 只有直接 CLI 和拥有的完整进程树都消失才确认退出。
@@ -692,18 +723,23 @@ impl ProcessControl for CliProcess {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::spawn_owned_command_with_graceful_action;
     use super::{
         classify_exit, preflight_address, prepend_node_path, resolve_dsh_cli_entry,
         spawn_owned_command, CliCommandPlan, ExitReason, SupervisorError, HOST_ADDRESS,
     };
-    use crate::lifecycle::{stop_process, ProcessControl, StopOutcome};
+    #[cfg(unix)]
+    use crate::lifecycle::StopOutcome;
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io;
     use std::net::{Ipv4Addr, TcpListener};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    #[cfg(unix)]
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -711,42 +747,16 @@ mod tests {
     #[cfg(unix)]
     static HELPER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-    /// 模拟平台优雅信号尚不可用、只能进入强制清理的 owned process。
-    struct FailingGracefulProcess {
-        process_generation: u64,
-        requested_generation: AtomicU64,
-        exited: AtomicBool,
-    }
-
-    impl ProcessControl for FailingGracefulProcess {
-        /// 登记 owned stop 后模拟平台优雅请求失败。
-        fn request_graceful_stop(&self, _current_generation: u64) -> Result<(), String> {
-            self.requested_generation
-                .store(self.process_generation, Ordering::Release);
-            Err("graceful request unavailable".into())
-        }
-
-        /// 返回强制清理是否已经令测试进程退出。
-        fn has_exited(&self) -> Result<bool, String> {
-            Ok(self.exited.load(Ordering::Acquire))
-        }
-
-        /// 模拟 Job 或进程组强制回收成功。
-        fn force_kill_tree(&self) -> Result<(), String> {
-            self.exited.store(true, Ordering::Release);
-            Ok(())
-        }
-
-        /// 测试进程无需持有真实系统句柄。
-        fn reap(&self) -> Result<(), String> {
-            Ok(())
-        }
-    }
-
     /// POSIX helper 的信号处理器只设置原子标志，实际清理留在普通控制流。
     #[cfg(unix)]
     extern "C" fn request_helper_shutdown(_signal: i32) {
         HELPER_SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+    }
+
+    /// 注入一个确定失败的平台优雅动作，验证真实监督器 fallback。
+    #[cfg(unix)]
+    fn fail_graceful_action(_pid: u32) -> Result<(), String> {
+        Err("injected graceful action failure".into())
     }
 
     /// 创建不会与并行测试冲突的临时目录。
@@ -870,28 +880,6 @@ mod tests {
         assert_eq!(classify_exit(7, 8, None), ExitReason::StaleGeneration);
         assert_eq!(classify_exit(7, 7, None), ExitReason::Unexpected);
         assert_eq!(classify_exit(7, 8, Some(8)), ExitReason::StaleGeneration);
-    }
-
-    /// 验证优雅请求失败并转入强制清理时仍保留 owned Requested 语义。
-    #[test]
-    fn graceful_request_failure_then_forced_cleanup_remains_requested() {
-        let process = FailingGracefulProcess {
-            process_generation: 7,
-            requested_generation: AtomicU64::new(0),
-            exited: AtomicBool::new(false),
-        };
-        assert_eq!(
-            stop_process(&process, 8, Duration::ZERO, Duration::ZERO),
-            Ok(StopOutcome::Forced)
-        );
-        assert_eq!(
-            classify_exit(
-                process.process_generation,
-                8,
-                Some(process.requested_generation.load(Ordering::Acquire)),
-            ),
-            ExitReason::Requested
-        );
     }
 
     /// 验证 PATH 缺失时仍能提供仅包含官方 Node 的有效值。
@@ -1027,6 +1015,25 @@ mod tests {
         let exit = report.exit.unwrap();
         assert_eq!(exit.status.code(), Some(23));
         assert_eq!(exit.reason, ExitReason::StaleGeneration);
+    }
+
+    /// 验证真实 CliProcess 在平台动作失败并强制回收后仍分类为 requested。
+    #[cfg(unix)]
+    #[test]
+    fn injected_graceful_failure_forces_real_owned_process_as_requested() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exec sleep 60"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let process =
+            spawn_owned_command_with_graceful_action(command, 19, || Ok(()), fail_graceful_action)
+                .unwrap();
+        let report = process
+            .stop(20, Duration::ZERO, Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(report.outcome, StopOutcome::Forced);
+        assert_eq!(report.exit.unwrap().reason, ExitReason::Requested);
     }
 
     /// 子进程 helper 在 SIGTERM 后主动关闭 listener 和后代，模拟官方 CLI disposal。
