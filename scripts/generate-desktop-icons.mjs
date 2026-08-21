@@ -14,8 +14,6 @@ const iconOutputPath = path.join(repositoryRoot, 'src-tauri', 'icons')
 const tauriCliPath = path.join(repositoryRoot, 'node_modules', '@tauri-apps', 'cli', 'tauri.js')
 const sourceViewBox = 'viewBox="0 0 1254 1254"'
 const desktopViewBox = 'viewBox="126 107 1001 1001"'
-const roundedFrame = '<rect x="106" y="107" width="1042" height="1001" rx="240" fill="url(#frame)"/>'
-const squareFrame = '<rect x="126" y="107" width="1001" height="1001" fill="url(#frame)"/>'
 const macosPlatform = 'macos'
 const windowsLinuxPlatform = 'windows-linux'
 const windowsLinuxAssetNames = [
@@ -39,22 +37,18 @@ function replaceRequired(source, expected, replacement) {
 /** 从唯一品牌源派生平台构图，不维护第二套鲸鱼或窗口素材。 */
 function createPlatformSvg(brandSource, platform) {
   const croppedSource = replaceRequired(brandSource, sourceViewBox, desktopViewBox)
-  if (platform === macosPlatform) {
-    return replaceRequired(croppedSource, roundedFrame, squareFrame)
-  }
-  if (platform === windowsLinuxPlatform) {
+  if (platform === macosPlatform || platform === windowsLinuxPlatform) {
     return croppedSource
   }
   throw new Error(`不支持的桌面图标平台：${platform}`)
 }
 
-/** 使用相同缩放与压缩参数渲染平台源图，仅 macOS 铺平为不透明画布。 */
+/** 使用相同缩放与压缩参数渲染保留透明圆角的平台源图。 */
 async function renderPlatformSource(brandSource, platform, outputPath) {
-  let pipeline = sharp(Buffer.from(createPlatformSvg(brandSource, platform))).resize(1024, 1024)
-  if (platform === macosPlatform) {
-    pipeline = pipeline.flatten({ background: '#0b3154' })
-  }
-  await pipeline.png({ compressionLevel: 9 }).toFile(outputPath)
+  await sharp(Buffer.from(createPlatformSvg(brandSource, platform)))
+    .resize(1024, 1024)
+    .png({ compressionLevel: 9 })
+    .toFile(outputPath)
 }
 
 /** 将两种平台构图渲染为供固定版 Tauri CLI 消费的统一 1024 像素源图。 */

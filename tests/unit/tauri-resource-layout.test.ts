@@ -5,6 +5,15 @@ import { describe, expect, it } from 'vitest'
 const root = path.resolve(import.meta.dirname, '../..')
 
 describe('Tauri resource layout', () => {
+  /** 验证 Startup logo 位于 frontendDist 内，开发服务器和打包协议都能解析同一路径。 */
+  it('keeps the Startup logo inside the frontend resource root', async () => {
+    const html = await readFile(path.join(root, 'src/startup/index.html'), 'utf8')
+    const buildScript = await readFile(path.join(root, 'scripts/build.mjs'), 'utf8')
+    expect(html).toContain('href="./assets/dsh-desktop-logo.svg"')
+    expect(html).toContain('src="./assets/dsh-desktop-logo.svg"')
+    expect(buildScript).toContain("dist/startup/assets/${desktopLogoFileName}")
+  })
+
   /** 验证目录映射保留 runtime closure 和平台目录层级，避免 glob 将文件扁平化。 */
   it('maps resource directories without glob flattening', async () => {
     const config = JSON.parse(await readFile(path.join(root, 'src-tauri/tauri.conf.json'), 'utf8'))
