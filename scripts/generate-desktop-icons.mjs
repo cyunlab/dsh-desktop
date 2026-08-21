@@ -16,6 +16,8 @@ const sourceViewBox = 'viewBox="0 0 1254 1254"'
 const desktopViewBox = 'viewBox="126 107 1001 1001"'
 const roundedFrame = '<rect x="106" y="107" width="1042" height="1001" rx="240" fill="url(#frame)"/>'
 const squareFrame = '<rect x="126" y="107" width="1001" height="1001" fill="url(#frame)"/>'
+const macosPlatform = 'macos'
+const windowsLinuxPlatform = 'windows-linux'
 const windowsLinuxAssetNames = [
   '32x32.png',
   '64x64.png',
@@ -37,10 +39,22 @@ function replaceRequired(source, expected, replacement) {
 /** 从唯一品牌源派生平台构图，不维护第二套鲸鱼或窗口素材。 */
 function createPlatformSvg(brandSource, platform) {
   const croppedSource = replaceRequired(brandSource, sourceViewBox, desktopViewBox)
-  if (platform === 'macos') {
+  if (platform === macosPlatform) {
     return replaceRequired(croppedSource, roundedFrame, squareFrame)
   }
-  return croppedSource
+  if (platform === windowsLinuxPlatform) {
+    return croppedSource
+  }
+  throw new Error(`不支持的桌面图标平台：${platform}`)
+}
+
+/** 使用相同缩放与压缩参数渲染平台源图，仅 macOS 铺平为不透明画布。 */
+async function renderPlatformSource(brandSource, platform, outputPath) {
+  let pipeline = sharp(Buffer.from(createPlatformSvg(brandSource, platform))).resize(1024, 1024)
+  if (platform === macosPlatform) {
+    pipeline = pipeline.flatten({ background: '#0b3154' })
+  }
+  await pipeline.png({ compressionLevel: 9 }).toFile(outputPath)
 }
 
 /** 将两种平台构图渲染为供固定版 Tauri CLI 消费的统一 1024 像素源图。 */
@@ -49,15 +63,8 @@ async function renderPlatformSources(brandSource, temporaryRoot) {
   const macosSourcePath = path.join(temporaryRoot, 'macos.png')
 
   await Promise.all([
-    sharp(Buffer.from(createPlatformSvg(brandSource, 'windows-linux')))
-      .resize(1024, 1024)
-      .png({ compressionLevel: 9 })
-      .toFile(windowsLinuxSourcePath),
-    sharp(Buffer.from(createPlatformSvg(brandSource, 'macos')))
-      .resize(1024, 1024)
-      .flatten({ background: '#0b3154' })
-      .png({ compressionLevel: 9 })
-      .toFile(macosSourcePath)
+    renderPlatformSource(brandSource, windowsLinuxPlatform, windowsLinuxSourcePath),
+    renderPlatformSource(brandSource, macosPlatform, macosSourcePath)
   ])
 
   return { macosSourcePath, windowsLinuxSourcePath }
@@ -70,6 +77,11 @@ async function runTauriIconGeneration(sourcePath, outputPath) {
     cwd: repositoryRoot,
     maxBuffer: 10 * 1024 * 1024
   })
+}
+
+/** 按 ICNS 四字节类型码稳定排列容器块。 */
+function compareIcnsChunks(left, right) {
+  return left.subarray(0, 4).compare(right.subarray(0, 4))
 }
 
 /** 规范化 Tauri CLI 随机排列的 ICNS 块，使重复生成得到相同字节。 */
@@ -88,19 +100,19 @@ async function copyCanonicalIcns(sourcePath, destinationPath) {
     chunks.push(source.subarray(offset, offset + chunkLength))
     offset += chunkLength
   }
-  chunks.sort((left, right) => left.subarray(0, 4).compare(right.subarray(0, 4)))
+  chunks.sort(compareIcnsChunks)
   await writeFile(destinationPath, Buffer.concat([source.subarray(0, 8), ...chunks]))
 }
 
 /** 仅复制最终桌面产物；移动端和商店模板只存在于临时目录。 */
 async function copyDesktopAssets(windowsLinuxOutputPath, macosOutputPath) {
   await mkdir(iconOutputPath, { recursive: true })
-  await Promise.all([
-    ...windowsLinuxAssetNames.map(assetName =>
-      copyFile(path.join(windowsLinuxOutputPath, assetName), path.join(iconOutputPath, assetName))
-    ),
-    copyCanonicalIcns(path.join(macosOutputPath, 'icon.icns'), path.join(iconOutputPath, 'icon.icns'))
-  ])
+  const copyOperations = []
+  for (const assetName of windowsLinuxAssetNames) {
+    copyOperations.push(copyFile(path.join(windowsLinuxOutputPath, assetName), path.join(iconOutputPath, assetName)))
+  }
+  copyOperations.push(copyCanonicalIcns(path.join(macosOutputPath, 'icon.icns'), path.join(iconOutputPath, 'icon.icns')))
+  await Promise.all(copyOperations)
 }
 
 /** 从品牌 SVG 生成并提交使用的七个 Desktop 图标产物。 */
