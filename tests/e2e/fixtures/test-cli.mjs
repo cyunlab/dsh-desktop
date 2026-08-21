@@ -11,7 +11,7 @@ let child
 let stopping = false
 let crashTimer
 let listenerTimer
-let ignoresStop = false
+let ignoresSignal = false
 let hasStubbornDescendant = false
 let attemptNumber = 0
 const host = argumentValue('--host') ?? '127.0.0.1'
@@ -85,12 +85,12 @@ async function startUnreadyServer() {
   await record('listener-started', { origin, attempt: attemptNumber })
 }
 
-/** 启动 loopback HTTP 服务并发布 ready 生命周期消息。 */
+/** 启动 loopback HTTP 服务并记录 HTML listener 已可用。 */
 async function startServer() {
   if (server) return
   const port = await listenServer()
   origin = `http://${host}:${port}/`
-  await record('ready', { origin, attempt: attemptNumber })
+  await record('html-listener-ready', { origin, attempt: attemptNumber })
 }
 
 /** 延迟开启固定 listener，用于稳定覆盖 prolonged-startup 状态。 */
@@ -114,13 +114,13 @@ async function stop(exitCode = 0) {
     await record('server-closed', { origin, attempt: attemptNumber })
     server = undefined
   }
-  if (ignoresStop) { await record('stop-ignored', { pid: process.pid }); return }
+  if (ignoresSignal) { await record('signal-ignored', { pid: process.pid }); return }
   if (child && child.exitCode === null) {
     child.kill()
     if (hasStubbornDescendant) await record('cleanup-waiting-for-descendant', { pid: child.pid })
     await new Promise(resolve => child.once('exit', resolve))
   }
-  await record('stopped', { origin })
+  await record('cli-stopped', { origin })
   process.exit(exitCode)
 }
 
@@ -150,11 +150,11 @@ async function runScenario() {
   if ((scenario === 'retry' && attempt === 1) || scenario === 'stubborn-cleanup') {
     child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});process.on('SIGINT',()=>{});setInterval(()=>{},1000)"], { stdio: 'ignore', windowsHide: true })
     hasStubbornDescendant = true
-    ignoresStop = scenario === 'stubborn-cleanup'
+    ignoresSignal = scenario === 'stubborn-cleanup'
     await record('descendant-spawned', { pid: child.pid, parentPid: process.pid, attempt })
   }
   if (scenario === 'failure') {
-    await record('startup-failed', { attempt })
+    await record('fixture-exited', { attempt })
     process.exit(17)
     return
   }

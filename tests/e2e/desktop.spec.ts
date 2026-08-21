@@ -5,6 +5,7 @@ import { applicationPath } from './support/paths.mjs'
 import { isPackagedStartupUrl, waitForPackagedStartupPage } from './support/startup-page.mjs'
 
 const scenario = process.env.DSH_TEST_SCENARIO ?? 'success'
+let scenarioTestsPassed = true
 
 /** 等待元素展示目标文本，兼容启动页到 loopback 页面之间的导航。 */
 async function waitForText(selector: string, expected: string, timeout = 15_000): Promise<void> {
@@ -86,9 +87,43 @@ async function waitForEvent(name: string): Promise<readonly Record<string, unkno
   return readEvents()
 }
 
+/** 不依赖 WebDriver 轮询文件系统，验收最后 generation、进程树和 listener 全部关闭。 */
+async function waitForNativeCleanup(): Promise<number> {
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    const records = await readRecords()
+    const events = await readEvents()
+    const backendPid = Number(records.find(event => event.event === 'backend-started')?.pid)
+    const lastSpawn = records.filter(event => event.event === 'cli-spawned').at(-1)
+    const generation = Number(lastSpawn?.generation)
+    const requestIndex = records.findIndex(event => event.event === 'native-shutdown-requested'
+      && event.source === 'close-requested' && event.generation === generation)
+    const completionIndex = records.findIndex(event => event.event === 'native-shutdown-completed'
+      && event.generation === generation && event.cleanupSucceeded === true)
+    const cliCleaned = records.some(event => event.event === 'cli-cleaned' && event.generation === generation)
+    const pids = [...new Set([
+      ...records.filter(event => event.event === 'cli-spawned').map(event => Number(event.pid)),
+      ...events.filter(event => event.event === 'descendant-spawned').map(event => Number(event.pid)),
+      backendPid
+    ].filter(Number.isInteger))]
+    const origins = records.filter(event => event.event === 'client-page-served').map(event => String(event.origin))
+    const listenersClosed = (await Promise.all(origins.map(async origin => {
+      try { await fetch(origin, { signal: AbortSignal.timeout(300) }); return false } catch { return true }
+    }))).every(Boolean)
+    if (Number.isInteger(generation)
+      && requestIndex >= 0
+      && completionIndex > requestIndex
+      && cliCleaned
+      && pids.every(pid => !processExists(pid))
+      && listenersClosed) return generation
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  throw new Error(`Final-window shutdown did not complete owned generation cleanup: ${JSON.stringify(await readRecords())}`)
+}
+
 /** 使用平台进程接口判断 Retry 前的旧 PID 是否仍存活。 */
 function processExists(pid: number): boolean {
-  if (process.platform === 'win32') return spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true }).stdout.includes(`"${pid}"`)
+  if (process.platform === 'win32') return spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true, timeout: 2_000, killSignal: 'SIGKILL' }).stdout.includes(`"${pid}"`)
   try { process.kill(pid, 0); return true } catch { return false }
 }
 
@@ -103,6 +138,10 @@ async function launchSecondInstance(): Promise<void> {
 }
 
 describe('DeepSeek Harness Desktop Tauri behavior', () => {
+  /** 记录任何行为断言失败，防止 runner 把真正失败误判成预期 backend 断连。 */
+  afterEach(function () {
+    if (this.currentTest?.state !== 'passed') scenarioTestsPassed = false
+  })
   if (scenario === 'delayed-success') {
     /** 验证 WebDriver 越过 about:blank 后先看到真实启动页，再看到 loopback Web Client。 */
     it('shows the startup page before loading the loopback Web Client', async () => {
@@ -131,7 +170,7 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
       expect(diagnostics).not.toContain('http://')
       await $('#retry').click()
       await waitForHarness()
-      const events = await waitForEvent('ready')
+      const events = await waitForEvent('html-listener-ready')
       const oldPids = events.filter(event => event.attempt === 1 && (event.event === 'fixture-started' || event.event === 'descendant-spawned')).map(event => Number(event.pid))
       expect(oldPids.length).toBe(2)
       expect(oldPids.every(pid => !processExists(pid))).toBe(true)
@@ -142,7 +181,7 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
       expect(replacementSpawned).toBeGreaterThan(cleaned)
       const listenerClosed = events.findIndex(event => event.event === 'server-closed' && event.attempt === 1)
       const replacementStarted = events.findIndex(event => event.event === 'fixture-started' && event.attempt === 2)
-      const replacementReady = events.findIndex(event => event.event === 'ready' && event.attempt === 2)
+      const replacementReady = events.findIndex(event => event.event === 'html-listener-ready' && event.attempt === 2)
       expect(listenerClosed).toBeGreaterThanOrEqual(0)
       expect(replacementStarted).toBeGreaterThan(listenerClosed)
       expect(replacementReady).toBeGreaterThan(replacementStarted)
@@ -207,8 +246,17 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
     it('loads before runner verifies hard process-tree cleanup', async () => { await waitForHarness() })
   }
 
-  /** 在每个桌面行为场景结束时销毁 WebView，验收 Tauri 侧的 CLI 回收。 */
+  /** 调用真实 Tauri Window.close 触发 CloseRequested，并在 WebDriver session 断开后只轮询文件系统。 */
   after(async () => {
-    await browser.closeWindow()
+    const completionFile = process.env.DSH_TEST_COMPLETION_FILE
+    await browser.execute(async () => {
+      const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke(command: string, args?: Record<string, unknown>): Promise<unknown> } }).__TAURI_INTERNALS__
+      if (!internals) throw new Error('Tauri internals are unavailable')
+      await internals.invoke('plugin:window|close', { label: 'main' })
+    })
+    const generation = await waitForNativeCleanup()
+    if (scenarioTestsPassed && completionFile) {
+      await writeFile(completionFile, JSON.stringify({ status: 'passed', generation }), 'utf8')
+    }
   })
 })

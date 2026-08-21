@@ -58,7 +58,7 @@ export function getNodeTarget(runtimePlatform = hostPlatform(), runtimeArch = ho
       archiveSha256: '14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647'
     }
   }[`${runtimePlatform}-${runtimeArch}`]
-  if (!targets) throw new Error(`Unsupported Node sidecar target: ${runtimePlatform}-${runtimeArch}`)
+  if (!targets) throw new Error(`Unsupported official Node target: ${runtimePlatform}-${runtimeArch}`)
   return Object.freeze({ ...targets, runtimePlatform, runtimeArch })
 }
 
@@ -188,13 +188,13 @@ export async function withDirectoryLock(lockPath, action, options = {}) {
       try {
         lockInformation = await stat(lockPath)
       } catch {
-        if (Date.now() - started >= timeoutMilliseconds) throw new Error(`Timed out waiting for Node sidecar lock: ${lockPath}`)
+        if (Date.now() - started >= timeoutMilliseconds) throw new Error(`Timed out waiting for official Node lock: ${lockPath}`)
         await delay(retryMilliseconds)
         continue
       }
       if (Date.now() - lockInformation.mtimeMs >= staleMilliseconds) {
         if (await lockOwnerProcessIsAlive(lockPath)) {
-          if (Date.now() - started >= timeoutMilliseconds) throw new Error(`Timed out waiting for Node sidecar lock: ${lockPath}`)
+          if (Date.now() - started >= timeoutMilliseconds) throw new Error(`Timed out waiting for official Node lock: ${lockPath}`)
           await delay(retryMilliseconds)
           continue
         }
@@ -207,7 +207,7 @@ export async function withDirectoryLock(lockPath, action, options = {}) {
           if (!isExistenceConflict(staleError) && !(staleError instanceof Error && 'code' in staleError && staleError.code === 'ENOENT')) throw staleError
         }
       }
-      if (Date.now() - started >= timeoutMilliseconds) throw new Error(`Timed out waiting for Node sidecar lock: ${lockPath}`)
+      if (Date.now() - started >= timeoutMilliseconds) throw new Error(`Timed out waiting for official Node lock: ${lockPath}`)
       await delay(retryMilliseconds)
     }
   }
@@ -345,8 +345,8 @@ async function installArchive(archivePath, destination, target) {
   }
 }
 
-/** 确保固定版本官方 Node sidecar 已存在；已存在时绝不重复下载。 */
-export async function ensureNodeSidecar(options = {}) {
+/** 确保固定版本官方 Node executable 已存在；已存在时绝不重复下载。 */
+export async function ensureOfficialNode(options = {}) {
   const runtimePlatform = options.runtimePlatform ?? hostPlatform()
   const runtimeArch = options.runtimeArch ?? hostArch()
   const target = getNodeTarget(runtimePlatform, runtimeArch)
@@ -356,7 +356,7 @@ export async function ensureNodeSidecar(options = {}) {
   const executable = path.join(destination, target.relativeExecutable)
   if (await isFile(executable)) {
     await ensureExecutablePermission(executable, runtimePlatform)
-    console.log(`Node sidecar already present: ${executable}`)
+    console.log(`Official Node executable already present: ${executable}`)
     return executable
   }
   const cacheRoot = options.cacheRoot ?? getNodeCacheRoot(process.env, homedir(), runtimePlatform)
@@ -364,12 +364,12 @@ export async function ensureNodeSidecar(options = {}) {
   return withDirectoryLock(lockPath, async () => {
     if (await isFile(executable)) {
       await ensureExecutablePermission(executable, runtimePlatform)
-      console.log(`Node sidecar already present: ${executable}`)
+      console.log(`Official Node executable already present: ${executable}`)
       return executable
     }
     const archivePath = await ensureCachedArchive(target, cacheRoot, options.fetchImpl ?? fetch)
     await installArchive(archivePath, destination, target)
-    console.log(`Installed Node ${NODE_VERSION} sidecar: ${executable}`)
+    console.log(`Installed official Node ${NODE_VERSION}: ${executable}`)
     return executable
   }, options.lockOptions)
 }
@@ -381,5 +381,5 @@ function isDirectEntry() {
 }
 
 if (isDirectEntry()) {
-  await ensureNodeSidecar()
+  await ensureOfficialNode()
 }

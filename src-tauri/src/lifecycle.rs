@@ -1,4 +1,4 @@
-//! Sidecar 生命周期的可测试核心抽象。
+//! Published CLI 生命周期的可测试核心抽象。
 
 use std::thread;
 use std::time::{Duration, Instant};

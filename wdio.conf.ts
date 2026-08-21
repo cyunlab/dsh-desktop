@@ -16,13 +16,13 @@ export const config: Options.Testrunner = {
       driverProvider: 'embedded',
       embeddedPort: 4445,
       statusPollTimeout: 15_000,
-      // 调试构建捕获 Rust stderr，便于诊断窗口导航和 sidecar 生命周期。
+      // 调试构建捕获 Rust stderr，便于诊断窗口导航和 CLI 生命周期。
       captureBackendLogs: true,
       // Windows provider 会校验 WebView2 匹配的驱动，由服务自动下载并缓存。
       autoDownloadEdgeDriver: true,
       env: {
         DSH_NODE_PATH: process.env.DSH_NODE_PATH ?? officialNodePath(),
-        ...(process.env.DSH_TEST_SIDECAR ? { DSH_TEST_SIDECAR: process.env.DSH_TEST_SIDECAR } : {}),
+        ...(process.env.DSH_TEST_CLI_ENTRY ? { DSH_TEST_CLI_ENTRY: process.env.DSH_TEST_CLI_ENTRY } : {}),
         DSH_TEST_SCENARIO: scenario,
         ...(process.env.DSH_TEST_EVENTS ? { DSH_TEST_EVENTS: process.env.DSH_TEST_EVENTS } : {}),
         ...(process.env.DSH_TEST_STATE_FILE ? { DSH_TEST_STATE_FILE: process.env.DSH_TEST_STATE_FILE } : {}),

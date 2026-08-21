@@ -99,19 +99,19 @@ jobs:
         shell: bash
         run: set -o pipefail; pnpm test:integration 2>&1 | tee artifacts/integration.log
 
-      - name: Download the fixed official Node sidecar and build the runtime
+      - name: Download the fixed official Node and build the runtime closure
         id: runtime_build
         continue-on-error: true
         timeout-minutes: 15
         shell: bash
-        run: set -o pipefail; { pnpm ensure:node-sidecar && pnpm build; } 2>&1 | tee artifacts/runtime-build.log
+        run: set -o pipefail; { pnpm ensure:official-node && pnpm build; } 2>&1 | tee artifacts/runtime-build.log
 
-      - name: Run real official Node + Harness smoke test
+      - name: Run real official Node plus published dsh web smoke test
         id: smoke
         continue-on-error: true
         timeout-minutes: 20
         shell: bash
-        run: set -o pipefail; pnpm smoke:node-sidecar 2>&1 | tee artifacts/smoke.log
+        run: set -o pipefail; pnpm smoke:dsh-cli 2>&1 | tee artifacts/smoke.log
 
       - name: Run embedded Tauri desktop E2E
         id: e2e
