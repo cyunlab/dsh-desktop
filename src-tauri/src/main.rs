@@ -33,7 +33,9 @@ use std::os::unix::process::ExitStatusExt;
 const SNAPSHOT_EVENT: &str = "startup:snapshot";
 const PROLONGED_STARTUP_AFTER: Duration = Duration::from_secs(30);
 const HTTP_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
-const HTTP_RESPONSE_CAP: usize = 64 * 1024;
+const HTTP_BODY_CAP: usize = 64 * 1024;
+const HTTP_METADATA_CAP: usize = 16 * 1024;
+const HTTP_WIRE_CAP: usize = HTTP_BODY_CAP + HTTP_METADATA_CAP;
 const CLI_STOP_AFTER: Duration = Duration::from_secs(8);
 const CLI_FORCE_CONFIRM_AFTER: Duration = Duration::from_secs(5);
 const BUNDLED_NODE_VERSION: &str = "24.19.0";
@@ -557,47 +559,263 @@ enum HttpResponseState {
     Reject,
 }
 
+/// 判断一个字节是否属于 RFC 9110 token 字符。
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// 判断字节串是否为非空 RFC 9110 token。
+fn is_http_token(value: &[u8]) -> bool {
+    !value.is_empty() && value.iter().copied().all(is_http_token_byte)
+}
+
+/// 按 grammar 扫描 chunk extensions，支持 quoted-string 内的分号和安全转义。
+fn valid_chunk_extensions(extensions: &[u8]) -> bool {
+    let mut offset = 0_usize;
+    while offset < extensions.len() {
+        if extensions[offset] != b';' {
+            return false;
+        }
+        offset += 1;
+        let name_start = offset;
+        while offset < extensions.len() && is_http_token_byte(extensions[offset]) {
+            offset += 1;
+        }
+        if offset == name_start {
+            return false;
+        }
+        if offset == extensions.len() || extensions[offset] == b';' {
+            continue;
+        }
+        if extensions[offset] != b'=' {
+            return false;
+        }
+        offset += 1;
+        if offset == extensions.len() {
+            return false;
+        }
+        if extensions[offset] != b'"' {
+            let value_start = offset;
+            while offset < extensions.len() && is_http_token_byte(extensions[offset]) {
+                offset += 1;
+            }
+            if offset == value_start || (offset < extensions.len() && extensions[offset] != b';') {
+                return false;
+            }
+            continue;
+        }
+        offset += 1;
+        let mut closed = false;
+        while offset < extensions.len() {
+            let byte = extensions[offset];
+            offset += 1;
+            if byte == b'"' {
+                closed = true;
+                break;
+            }
+            if byte == b'\\' {
+                if offset == extensions.len()
+                    || !extensions[offset].is_ascii()
+                    || extensions[offset].is_ascii_control()
+                {
+                    return false;
+                }
+                offset += 1;
+            } else if byte.is_ascii_control() {
+                return false;
+            }
+        }
+        if !closed || (offset < extensions.len() && extensions[offset] != b';') {
+            return false;
+        }
+    }
+    true
+}
+
+/// 解析合法的十六进制 chunk size，并保守校验可选 extension。
+fn parse_chunk_size(line: &[u8]) -> Option<usize> {
+    if line.is_empty() || line.len() > HTTP_METADATA_CAP {
+        return None;
+    }
+    let extension_offset = line
+        .iter()
+        .position(|byte| *byte == b';')
+        .unwrap_or(line.len());
+    let raw_size = &line[..extension_offset];
+    if raw_size.is_empty() || raw_size.len() > 16 || !raw_size.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    if !valid_chunk_extensions(&line[extension_offset..]) {
+        return None;
+    }
+    usize::from_str_radix(std::str::from_utf8(raw_size).ok()?, 16).ok()
+}
+
+/// 校验 trailer 行，拒绝折行、控制字符和会改变 framing 的字段。
+fn valid_chunk_trailer(line: &[u8]) -> bool {
+    let Some(separator) = line.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    let name = &line[..separator];
+    let value = &line[separator + 1..];
+    is_http_token(name)
+        && !name.eq_ignore_ascii_case(b"content-length")
+        && !name.eq_ignore_ascii_case(b"transfer-encoding")
+        && value
+            .iter()
+            .all(|byte| *byte == b'\t' || !byte.is_ascii_control())
+}
+
+/// 在不分配解码缓冲区的前提下严格解析完整 chunked body。
+fn inspect_chunked_body(body: &[u8], eof: bool) -> HttpResponseState {
+    let incomplete = || {
+        if eof || body.len() == HTTP_WIRE_CAP {
+            HttpResponseState::Reject
+        } else {
+            HttpResponseState::NeedMore
+        }
+    };
+    let mut offset = 0_usize;
+    let mut decoded = 0_usize;
+    let mut nonempty = false;
+    loop {
+        let Some(line_end) = body[offset..]
+            .windows(2)
+            .position(|bytes| bytes == b"\r\n")
+            .map(|relative| offset + relative)
+        else {
+            return incomplete();
+        };
+        if line_end - offset > HTTP_METADATA_CAP {
+            return HttpResponseState::Reject;
+        }
+        let Some(chunk_size) = parse_chunk_size(&body[offset..line_end]) else {
+            return HttpResponseState::Reject;
+        };
+        offset = line_end + 2;
+        if chunk_size == 0 {
+            let trailer_start = offset;
+            loop {
+                let Some(trailer_end) = body[offset..]
+                    .windows(2)
+                    .position(|bytes| bytes == b"\r\n")
+                    .map(|relative| offset + relative)
+                else {
+                    return incomplete();
+                };
+                if trailer_end - trailer_start > HTTP_METADATA_CAP {
+                    return HttpResponseState::Reject;
+                }
+                if trailer_end == offset {
+                    offset += 2;
+                    return if offset == body.len() && nonempty {
+                        HttpResponseState::Ready
+                    } else {
+                        HttpResponseState::Reject
+                    };
+                }
+                if !valid_chunk_trailer(&body[offset..trailer_end]) {
+                    return HttpResponseState::Reject;
+                }
+                offset = trailer_end + 2;
+            }
+        }
+        let Some(next_decoded) = decoded.checked_add(chunk_size) else {
+            return HttpResponseState::Reject;
+        };
+        if next_decoded > HTTP_BODY_CAP {
+            return HttpResponseState::Reject;
+        }
+        let Some(data_end) = offset.checked_add(chunk_size) else {
+            return HttpResponseState::Reject;
+        };
+        let Some(framed_end) = data_end.checked_add(2) else {
+            return HttpResponseState::Reject;
+        };
+        if framed_end > body.len() {
+            return incomplete();
+        }
+        if &body[data_end..framed_end] != b"\r\n" {
+            return HttpResponseState::Reject;
+        }
+        nonempty |= body[offset..data_end]
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace());
+        decoded = next_decoded;
+        offset = framed_end;
+    }
+}
+
 /// 判断已读响应是否具有完整、有界且非空的 HTML body。
 fn inspect_http_client_response(response: &[u8], eof: bool) -> HttpResponseState {
-    if response.len() > HTTP_RESPONSE_CAP {
+    if response.len() > HTTP_WIRE_CAP {
         return HttpResponseState::Reject;
     }
     let Some(header_offset) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-        return if eof || response.len() == HTTP_RESPONSE_CAP {
+        return if eof || response.len() > HTTP_METADATA_CAP {
             HttpResponseState::Reject
         } else {
             HttpResponseState::NeedMore
         };
     };
+    if header_offset > HTTP_METADATA_CAP {
+        return HttpResponseState::Reject;
+    }
     let body_offset = header_offset + 4;
     let Ok(headers) = std::str::from_utf8(&response[..header_offset]) else {
         return HttpResponseState::Reject;
     };
-    let mut lines = headers.lines();
+    let mut lines = headers.split("\r\n");
     let Some(status) = lines.next() else {
         return HttpResponseState::Reject;
     };
-    let successful_status = status
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse::<u16>().ok())
-        .is_some_and(|code| (200..300).contains(&code));
+    let mut status_fields = status.split_ascii_whitespace();
+    let successful_status = status_fields.next() == Some("HTTP/1.1")
+        && status_fields
+            .next()
+            .filter(|code| code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|code| code.parse::<u16>().ok())
+            .is_some_and(|code| (200..300).contains(&code));
     if !successful_status {
         return HttpResponseState::Reject;
     }
     let mut content_types = Vec::new();
     let mut content_lengths = Vec::new();
-    let mut has_transfer_encoding = false;
+    let mut transfer_encodings = Vec::new();
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             return HttpResponseState::Reject;
         };
+        if !is_http_token(name.as_bytes())
+            || value
+                .bytes()
+                .any(|byte| byte != b'\t' && byte.is_ascii_control())
+        {
+            return HttpResponseState::Reject;
+        }
         if name.eq_ignore_ascii_case("content-type") {
             content_types.push(value.trim());
         } else if name.eq_ignore_ascii_case("content-length") {
             content_lengths.push(value.trim());
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            has_transfer_encoding = true;
+            transfer_encodings.push(value.trim());
         }
     }
     let html_type = content_types.len() == 1
@@ -605,18 +823,33 @@ fn inspect_http_client_response(response: &[u8], eof: bool) -> HttpResponseState
             .split(';')
             .next()
             .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"));
-    if !html_type || has_transfer_encoding || content_lengths.len() > 1 {
+    if !html_type || content_lengths.len() > 1 || transfer_encodings.len() > 1 {
         return HttpResponseState::Reject;
+    }
+    if let Some(transfer_encoding) = transfer_encodings.first() {
+        let mut codings = transfer_encoding.split(',').map(str::trim);
+        if !content_lengths.is_empty()
+            || !codings
+                .next()
+                .is_some_and(|coding| coding.eq_ignore_ascii_case("chunked"))
+            || codings.next().is_some()
+        {
+            return HttpResponseState::Reject;
+        }
+        return inspect_chunked_body(&response[body_offset..], eof);
     }
     let body_nonempty = |body: &[u8]| body.iter().any(|byte| !byte.is_ascii_whitespace());
     if let Some(raw_length) = content_lengths.first() {
+        if raw_length.is_empty() || !raw_length.bytes().all(|byte| byte.is_ascii_digit()) {
+            return HttpResponseState::Reject;
+        }
         let Ok(length) = raw_length.parse::<usize>() else {
             return HttpResponseState::Reject;
         };
         let Some(expected_total) = body_offset.checked_add(length) else {
             return HttpResponseState::Reject;
         };
-        if length == 0 || expected_total > HTTP_RESPONSE_CAP || response.len() > expected_total {
+        if length == 0 || length > HTTP_BODY_CAP || response.len() > expected_total {
             return HttpResponseState::Reject;
         }
         if response.len() < expected_total {
@@ -631,6 +864,9 @@ fn inspect_http_client_response(response: &[u8], eof: bool) -> HttpResponseState
         } else {
             HttpResponseState::Reject
         };
+    }
+    if response.len() - body_offset > HTTP_BODY_CAP {
+        return HttpResponseState::Reject;
     }
     if !eof {
         return HttpResponseState::NeedMore;
@@ -675,11 +911,11 @@ fn probe_client_page_with_timeout(address: SocketAddr, timeout: Duration) -> boo
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return false;
         };
-        if remaining.is_zero() || response.len() == HTTP_RESPONSE_CAP {
+        if remaining.is_zero() || response.len() == HTTP_WIRE_CAP {
             return false;
         }
         let _ = stream.set_read_timeout(Some(remaining));
-        let available = (HTTP_RESPONSE_CAP - response.len()).min(buffer.len());
+        let available = (HTTP_WIRE_CAP - response.len()).min(buffer.len());
         match stream.read(&mut buffer[..available]) {
             Ok(0) => {
                 return inspect_http_client_response(&response, true) == HttpResponseState::Ready;
@@ -924,6 +1160,12 @@ fn stop_cli(state: &RuntimeState, process: &Arc<CliProcess>) -> Result<StopRepor
         };
         record_process_observation(state, process, exit, Some(outcome));
     }
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    record_wdio_event(serde_json::json!({
+        "event": "cli-cleaned",
+        "generation": process.generation(),
+        "pid": process.pid().ok()
+    }));
     Ok(report)
 }
 /// 将窗口导航到打包启动页，主线程执行前再次校验 generation。
@@ -1685,6 +1927,7 @@ mod tests {
         navigation_event_matches, parse_loopback_address, probe_client_page_with_timeout,
         retry_allowed, DiagnosticCode, ExitReason, HttpResponseState, LifecycleSnapshot,
         LifecycleState, NavigationDecision, PageLoadEvent, ProcessObservation, RuntimeState,
+        HTTP_BODY_CAP,
     };
     use std::io::Write;
     use std::net::TcpListener;
@@ -1748,9 +1991,29 @@ mod tests {
         );
         assert_eq!(
             inspect_http_client_response(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n<html>\r\n0\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\nd;node=\"yes;ok\"\r\n<html></html>\r\n0\r\nX-Node: yes\r\n\r\n",
                 true,
             ),
+            HttpResponseState::Ready
+        );
+        for invalid in [
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\nz\r\n<html>\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n<html>\r\n0\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n<html>\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: gzip, chunked\r\n\r\n6\r\n<html>\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked, gzip\r\n\r\n6\r\n<html>\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n<html>\r\n0\r\n\r\n".as_slice(),
+        ] {
+            assert_eq!(
+                inspect_http_client_response(invalid, true),
+                HttpResponseState::Reject
+            );
+        }
+        let mut oversized = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n10001\r\n".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', HTTP_BODY_CAP + 1));
+        oversized.extend_from_slice(b"\r\n0\r\n\r\n");
+        assert_eq!(
+            inspect_http_client_response(&oversized, true),
             HttpResponseState::Reject
         );
     }
@@ -1762,7 +2025,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            for byte in b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>" {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            for byte in b"6\r\n<html>\r\n0\r\n\r\n" {
                 if stream.write_all(&[*byte]).is_err() {
                     break;
                 }
