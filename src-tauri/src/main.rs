@@ -1605,6 +1605,8 @@ enum ShutdownSource {
     CloseRequested,
     /// 最终窗口已被销毁后的兜底事件。
     Destroyed,
+    /// 开发终端发出的 SIGINT 或 SIGTERM。
+    TerminalSignal,
 }
 
 #[cfg(all(debug_assertions, feature = "wdio"))]
@@ -1614,6 +1616,7 @@ impl ShutdownSource {
         match self {
             Self::CloseRequested => "close-requested",
             Self::Destroyed => "destroyed",
+            Self::TerminalSignal => "terminal-signal",
         }
     }
 }
@@ -1674,6 +1677,29 @@ fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>, source: Shutdown
         }));
         app.exit(if cleanup_failed { 1 } else { 0 });
     });
+}
+
+/// 开发构建捕获终端退出信号，先回收 CLI 进程树再退出 Desktop。
+#[cfg(all(debug_assertions, unix))]
+fn register_development_shutdown_signals(
+    app: AppHandle,
+    state: Arc<RuntimeState>,
+) -> Result<(), std::io::Error> {
+    use signal_hook::consts::signal::{SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    thread::spawn(move || {
+        let mut shutdown_requested = false;
+        for _signal in signals.forever() {
+            if shutdown_requested {
+                std::process::exit(130);
+            }
+            shutdown_requested = true;
+            request_shutdown(&app, &state, ShutdownSource::TerminalSignal);
+        }
+    });
+    Ok(())
 }
 
 /// 返回当前启动页状态。
@@ -1832,6 +1858,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     });
     app.manage(Arc::clone(&state));
     let app_handle = app.handle().clone();
+    #[cfg(all(debug_assertions, unix))]
+    register_development_shutdown_signals(app_handle.clone(), Arc::clone(&state))?;
     let startup_window =
         WebviewWindowBuilder::new(app.handle(), "main", WebviewUrl::App("index.html".into()))
             .title("DeepSeek Harness Desktop")
