@@ -1,8 +1,11 @@
-import { chmod, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { requiredRuntimeAssets, runtimeTarget, verifyRuntimeClosure } from '../../scripts/runtime-closure.mjs'
+import { packagedDshCliCommand, probePackagedDshCli, requiredRuntimeAssets, resolveDshCliEntry, runtimeTarget, verifyRuntimeClosure } from '../../scripts/runtime-closure.mjs'
+
+const desktopManifest = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'))
+const pinnedDshVersion = desktopManifest.dependencies['@deepseek-ai/dsh'] as string
 
 /** 创建最小的 Harness 入口包清单，隔离闭包验证器自身的图遍历逻辑。 */
 async function createEntryPackages(root: string): Promise<void> {
@@ -17,6 +20,31 @@ async function createEntryPackages(root: string): Promise<void> {
     await mkdir(directory, { recursive: true })
     await writeFile(path.join(directory, 'package.json'), JSON.stringify({ name, version: 'test', dependencies: {} }))
   }
+  const cliDirectory = path.join(root, '@deepseek-ai/dsh')
+  await mkdir(path.join(cliDirectory, 'lib'), { recursive: true })
+  await writeFile(path.join(cliDirectory, 'package.json'), JSON.stringify({
+    name: '@deepseek-ai/dsh',
+    version: pinnedDshVersion,
+    bin: { dsh: 'lib/published-cli.js' },
+    dependencies: {}
+  }))
+  await writeFile(path.join(cliDirectory, 'lib', 'published-cli.js'), 'console.log("fixture")')
+}
+
+/** 为发布配置资产生成可解析且形状真实的最小夹具内容。 */
+function fixtureAssetContents(assetPath: string): string {
+  if (assetPath.endsWith('preset.yml')) {
+    const preset = path.basename(path.dirname(assetPath))
+    return `name: ${preset} fixture\ndescription: Packaged preset fixture\norder: 1\n`
+  }
+  if (assetPath.endsWith('agent.cordis.yml')) {
+    return "- id: persona\n  name: '@deepseek-ai/dsh-persona'\n  config:\n    text: Packaged preset fixture\n"
+  }
+  if (assetPath.endsWith('SKILL.md')) {
+    const skill = path.basename(path.dirname(assetPath))
+    return `---\nname: ${skill}\ndescription: Packaged skill fixture\n---\n\n# ${skill}\n`
+  }
+  return 'asset'
 }
 
 /** 返回夹具中模拟 pnpm 安装的动态 sharp 原生资产路径。 */
@@ -46,7 +74,7 @@ async function createCompleteFixture(target = runtimeTarget('win32', 'x64'), dyn
       await writeFile(path.join(targetPath, 'asset.js'), 'asset')
     } else {
       await mkdir(path.dirname(targetPath), { recursive: true })
-      await writeFile(targetPath, 'asset')
+      await writeFile(targetPath, fixtureAssetContents(asset.path))
       if (asset.executable) await chmod(targetPath, 0o755)
     }
   }
@@ -60,6 +88,160 @@ describe('runtime closure contract', () => {
     expect(assets).toContainEqual(expect.objectContaining({
       path: path.join('@deepseek-ai', 'dsh-base', 'cordis.patch.yml')
     }))
+    expect(assets).toContainEqual(expect.objectContaining({
+      path: path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'standard', 'preset.yml')
+    }))
+    expect(assets).toContainEqual(expect.objectContaining({
+      path: path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'standard', 'agent.cordis.yml')
+    }))
+    expect(assets.filter(asset => asset.category === 'published CLI configuration').map(asset => asset.path)).toEqual([
+      path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'code', 'agent.cordis.yml'),
+      path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'code', 'preset.yml'),
+      path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'cordis', 'agent.cordis.yml'),
+      path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'cordis', 'preset.yml'),
+      path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'cordis', 'skills', 'cordis-plugin-development', 'SKILL.md'),
+      path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'cordis', 'skills', 'editing-cordis-compositions', 'SKILL.md'),
+      path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'minimal', 'agent.cordis.yml'),
+      path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'minimal', 'preset.yml'),
+      path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'standard', 'agent.cordis.yml'),
+      path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'standard', 'preset.yml')
+    ])
+  })
+
+  it('resolves the published CLI entry only through package.json#bin.dsh', async () => {
+    const fixture = await createCompleteFixture()
+    try {
+      const expectedEntry = await realpath(path.join(fixture.root, '@deepseek-ai', 'dsh', 'lib', 'published-cli.js'))
+      await expect(resolveDshCliEntry(fixture.root)).resolves.toBe(expectedEntry)
+      const command = await packagedDshCliCommand({
+        nodeExecutable: path.join(fixture.root, 'node-runtime', 'node'),
+        nodeModulesRoot: fixture.root,
+        args: ['web', '--host', '127.0.0.1', '--port', '3080'],
+        environment: { pAtH: '/system/bin', NODE_PATH: '/repository/node_modules', Node_Path: '/mixed-case/node_modules' }
+      })
+      expect(command.args).toEqual([
+        expectedEntry,
+        'web', '--host', '127.0.0.1', '--port', '3080'
+      ])
+      expect(command.environment.PATH?.split(path.delimiter)[0]).toBe(path.join(fixture.root, 'node-runtime'))
+      expect(command.environment.PATH?.split(path.delimiter)[1]).toBe('/system/bin')
+      expect(command.environment.NODE_PATH).toBeUndefined()
+      expect(command.environment.Node_Path).toBeUndefined()
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')('rejects a bin.dsh symlink that escapes the published package', async () => {
+    const fixture = await createCompleteFixture()
+    const entry = path.join(fixture.root, '@deepseek-ai', 'dsh', 'lib', 'published-cli.js')
+    const outside = path.join(fixture.root, '..', `outside-dsh-cli-${process.pid}.js`)
+    try {
+      await writeFile(outside, 'console.log("outside")')
+      await rm(entry)
+      await symlink(outside, entry)
+      await expect(resolveDshCliEntry(fixture.root)).rejects.toThrow('must not be a symbolic link')
+      await expect(packagedDshCliCommand({
+        nodeExecutable: path.join(fixture.root, 'packaged-node', 'node'),
+        nodeModulesRoot: fixture.root
+      })).rejects.toThrow('must not be a symbolic link')
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+      await rm(outside, { force: true })
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')('rejects a CLI entry whose ancestor symlink resolves outside the package', async () => {
+    const fixture = await createCompleteFixture()
+    const libraryDirectory = path.join(fixture.root, '@deepseek-ai', 'dsh', 'lib')
+    const outside = path.join(fixture.root, '..', `outside-dsh-cli-directory-${process.pid}`)
+    try {
+      await mkdir(outside)
+      await writeFile(path.join(outside, 'published-cli.js'), 'console.log("outside")')
+      await rm(libraryDirectory, { recursive: true, force: true })
+      await symlink(outside, libraryDirectory, 'dir')
+      await expect(resolveDshCliEntry(fixture.root)).rejects.toThrow('resolves outside its package')
+      await expect(packagedDshCliCommand({
+        nodeExecutable: path.join(fixture.root, 'packaged-node', 'node'),
+        nodeModulesRoot: fixture.root
+      })).rejects.toThrow('resolves outside its package')
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a published package without the dsh bin contract or its declared entry', async () => {
+    const fixture = await createCompleteFixture()
+    const manifestPath = path.join(fixture.root, '@deepseek-ai', 'dsh', 'package.json')
+    try {
+      await writeFile(manifestPath, JSON.stringify({ name: '@deepseek-ai/dsh', version: pinnedDshVersion, dependencies: {} }))
+      await expect(verifyRuntimeClosure(fixture.root, fixture.target)).rejects.toThrow('package.json#bin.dsh')
+
+      await writeFile(manifestPath, JSON.stringify({
+        name: '@deepseek-ai/dsh',
+        version: pinnedDshVersion,
+        bin: { dsh: 'lib/missing-cli.js' },
+        dependencies: {}
+      }))
+      await expect(verifyRuntimeClosure(fixture.root, fixture.target)).rejects.toThrow('lib/missing-cli.js')
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a runtime CLI package that does not match the exact Desktop pin', async () => {
+    const fixture = await createCompleteFixture()
+    const manifestPath = path.join(fixture.root, '@deepseek-ai', 'dsh', 'package.json')
+    try {
+      await writeFile(manifestPath, JSON.stringify({
+        name: '@deepseek-ai/dsh',
+        version: '999.0.0',
+        bin: { dsh: 'lib/published-cli.js' },
+        dependencies: {}
+      }))
+      await expect(verifyRuntimeClosure(fixture.root, fixture.target)).rejects.toThrow(
+        `runtime version mismatch: expected ${pinnedDshVersion}, found 999.0.0`
+      )
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a closure without the published CLI configuration assets', async () => {
+    const fixture = await createCompleteFixture()
+    try {
+      const missing = path.join(fixture.root, '@deepseek-ai', 'dsh', 'config', 'agent-presets', 'standard', 'preset.yml')
+      await rm(missing)
+      await expect(verifyRuntimeClosure(fixture.root, fixture.target)).rejects.toThrow(
+        path.join('config', 'agent-presets', 'standard', 'preset.yml')
+      )
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')('spawns the supplied Node executable with the manifest CLI entry and argv', async () => {
+    const fixture = await createCompleteFixture()
+    const nodeExecutable = path.join(fixture.root, 'packaged-node', 'node')
+    const capture = path.join(fixture.root, 'probe-argv.txt')
+    try {
+      await mkdir(path.dirname(nodeExecutable), { recursive: true })
+      await writeFile(nodeExecutable, `#!/bin/sh\nprintf '%s\\n' "$@" > "${capture}"\n`)
+      await chmod(nodeExecutable, 0o755)
+      await expect(probePackagedDshCli({
+        nodeExecutable,
+        nodeModulesRoot: fixture.root,
+        args: ['--version']
+      })).resolves.toEqual(expect.objectContaining({ code: 0 }))
+      const expectedEntry = await realpath(path.join(fixture.root, '@deepseek-ai', 'dsh', 'lib', 'published-cli.js'))
+      expect((await readFile(capture, 'utf8')).trim().split('\n')).toEqual([
+        expectedEntry,
+        '--version'
+      ])
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
   })
 
   it('keeps platform-specific workers and native runtime paths in the contract', () => {
