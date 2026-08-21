@@ -1,11 +1,11 @@
 import { chmod, mkdir, mkdtemp, open, readdir, realpath, rm, stat } from 'node:fs/promises'
-import { createInterface } from 'node:readline'
-import { execFile, spawn } from 'node:child_process'
-import { arch as hostArch, platform as hostPlatform, tmpdir } from 'node:os'
+import { execFile } from 'node:child_process'
+import { arch as hostArch, tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
-import { terminateProcessTree, waitForListenerClosed } from './smoke-node-sidecar.mjs'
+import { resolveDshCliEntry, runtimeTarget, verifyRuntimeClosure } from './runtime-closure.mjs'
+import { probeDirectDshWeb } from './smoke-dsh-cli.mjs'
 
 const execFileAsync = promisify(execFile)
 const projectRoot = path.resolve(import.meta.dirname, '..')
@@ -141,18 +141,43 @@ async function verifyExecutableArchitecture(file, contract, label) {
   if (architecture !== contract.architecture) throw new Error(`${label} architecture mismatch: expected ${contract.architecture}, found ${architecture}`)
 }
 
-/** 在安装包展开目录中验证真正随包交付的 Node、sidecar 和应用程序。 */
+/** 从展开产物中定位官方 Node 与 published CLI closure。 */
+async function locateBundledRuntime(contentRoot, contract) {
+  const canonicalRoot = await realpath(contentRoot)
+  const contents = await walkFiles(canonicalRoot)
+  /** 统一安装包内路径分隔符与大小写，供跨平台后缀匹配。 */
+  function normalized(file) { return file.replaceAll('\\', '/').toLowerCase() }
+  const nodeSuffix = `/node/${contract.resourceName}/${contract.executableName}`.toLowerCase()
+  const manifestSuffix = '/dist/node_modules/@deepseek-ai/dsh/package.json'
+  const nodeExecutable = contents.find(file => normalized(file).endsWith(nodeSuffix))
+  const cliManifest = contents.find(file => normalized(file).endsWith(manifestSuffix))
+  if (!nodeExecutable) throw new Error(`Bundled official Node resource is missing from ${contract.label}`)
+  if (!cliManifest) throw new Error(`Bundled published dsh CLI manifest is missing from ${contract.label}`)
+  const nodeModulesRoot = path.dirname(path.dirname(path.dirname(cliManifest)))
+  const cliEntry = await resolveDshCliEntry(nodeModulesRoot)
+  return Object.freeze({
+    nodeExecutable: await realpath(nodeExecutable),
+    nodeModulesRoot: await realpath(nodeModulesRoot),
+    cliEntry
+  })
+}
+
+/** 将产物矩阵平台映射为 runtime closure 的 Node 平台。 */
+function closureTarget(contract) {
+  const platformName = { win: 'win32', mac: 'darwin', linux: 'linux' }[contract.platformName]
+  const architecture = contract.architecture === 'aarch64' ? 'arm64' : 'x64'
+  return runtimeTarget(platformName, architecture)
+}
+
+/** 在安装包展开目录中验证真正随包交付的 Node、published CLI 和应用程序。 */
 export async function verifyExtractedBundleContents(contentRoot, platformName, runtimeArch = hostArch()) {
   const contract = artifactContract(platformName, runtimeArch)
   const contents = await walkFiles(contentRoot)
-  const normalized = file => file.replaceAll('\\', '/').toLowerCase()
-  const nodeSuffix = `/node/${contract.resourceName}/${contract.executableName}`.toLowerCase()
-  const sidecarSuffix = '/dist/sidecar/index.js'
-  const nodeExecutable = contents.find(file => normalized(file).endsWith(nodeSuffix))
-  const sidecarScript = contents.find(file => normalized(file).endsWith(sidecarSuffix))
-  if (!nodeExecutable) throw new Error(`Bundled Node resource is missing from ${contract.label}`)
-  if (!sidecarScript || (await stat(sidecarScript)).size === 0) throw new Error(`Bundled sidecar resource is missing or empty from ${contract.label}`)
-  await verifyExecutableArchitecture(nodeExecutable, contract, 'Official Node')
+  /** 统一安装包内路径分隔符与大小写，供跨平台应用入口匹配。 */
+  function normalized(file) { return file.replaceAll('\\', '/').toLowerCase() }
+  const runtime = await locateBundledRuntime(contentRoot, contract)
+  await verifyExecutableArchitecture(runtime.nodeExecutable, contract, 'Official Node')
+  await verifyRuntimeClosure(runtime.nodeModulesRoot, closureTarget(contract))
   let application
   if (platformName === 'win') {
     application = contents.find(file => normalized(file).endsWith('.exe')
@@ -169,202 +194,16 @@ export async function verifyExtractedBundleContents(contentRoot, platformName, r
   await verifyExecutableArchitecture(application, contract, 'Tauri application')
 }
 
-/** 在真实安装包内容中定位随包交付的官方 Node 和 sidecar。 */
-async function locateBundledRuntime(contentRoot, contract) {
-  const contents = await walkFiles(contentRoot)
-  const normalized = file => file.replaceAll('\\', '/').toLowerCase()
-  const nodeSuffix = `/node/${contract.resourceName}/${contract.executableName}`.toLowerCase()
-  const sidecarSuffix = '/dist/sidecar/index.js'
-  const nodeExecutable = contents.find(file => normalized(file).endsWith(nodeSuffix))
-  const sidecarScript = contents.find(file => normalized(file).endsWith(sidecarSuffix))
-  if (!nodeExecutable || !sidecarScript) throw new Error(`Bundled runtime files cannot be located in ${contract.label}`)
-  // macOS 的 /tmp 可能是指向 /private/tmp 的符号链接；Node ESM 会将入口 realpath 化，
-  // 因此这里必须把 argv 中的入口也 canonicalize，避免 sidecar 的 direct-entry 检查静默跳过。
-  return { nodeExecutable: await realpath(nodeExecutable), sidecarScript: await realpath(sidecarScript) }
-}
-
-/** 创建可排队的 sidecar 生命周期读取器，避免 ready/stopped 同一 stdout chunk 时丢失后者。 */
-function createSidecarMessageReader(child, lines) {
-  const messages = []
-  const waiters = []
-  let terminalError
-  let terminalExitCode
-
-  /** 将已收到的消息交给最早匹配的生命周期等待者。 */
-  const dispatch = message => {
-    const waiterIndex = waiters.findIndex(waiter => waiter.expected === message.type || message.type === 'startup-failed')
-    if (waiterIndex < 0) {
-      messages.push(message)
-      return
-    }
-    const [waiter] = waiters.splice(waiterIndex, 1)
-    clearTimeout(waiter.timer)
-    if (message.type === 'startup-failed') waiter.reject(new Error(`Bundled Harness startup failed: ${message.error?.message ?? 'unknown error'}`))
-    else waiter.resolve(message)
-  }
-  /** 解析 stdout 中的一行结构化消息；非 JSON 日志不影响生命周期等待。 */
-  const onLine = line => {
-    try { dispatch(JSON.parse(line)) } catch {}
-  }
-  /** 将 child spawn 错误广播给当前及后续生命周期等待。 */
-  const onError = error => {
-    terminalError = error
-    while (waiters.length > 0) {
-      const waiter = waiters.shift()
-      clearTimeout(waiter.timer)
-      waiter.reject(error)
-    }
-  }
-  /** child 无生命周期消息退出时必须失败，即使退出码是 0。 */
-  const onExit = code => {
-    terminalExitCode = code
-    while (waiters.length > 0) {
-      const waiter = waiters.shift()
-      clearTimeout(waiter.timer)
-      waiter.reject(new Error(`Bundled sidecar exited before ${waiter.expected} with code ${code ?? 'unknown'}`))
-    }
-  }
-  lines.on('line', onLine)
-  child.once('error', onError)
-  child.once('exit', onExit)
-
-  return {
-    /** 等待指定生命周期消息，同时消费已经缓冲的 stdout 行。 */
-    waitFor(expected, timeoutMilliseconds = 90_000) {
-      const messageIndex = messages.findIndex(message => message.type === expected || message.type === 'startup-failed')
-      if (messageIndex >= 0) {
-        const [message] = messages.splice(messageIndex, 1)
-        if (message.type === 'startup-failed') return Promise.reject(new Error(`Bundled Harness startup failed: ${message.error?.message ?? 'unknown error'}`))
-        return Promise.resolve(message)
-      }
-      if (terminalError) return Promise.reject(terminalError)
-      if (terminalExitCode !== undefined) return Promise.reject(new Error(`Bundled sidecar exited before ${expected} with code ${terminalExitCode ?? 'unknown'}`))
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          const waiterIndex = waiters.findIndex(waiter => waiter.timer === timer)
-          if (waiterIndex >= 0) waiters.splice(waiterIndex, 1)
-          reject(new Error(`Bundled sidecar did not report ${expected} within ${timeoutMilliseconds}ms`))
-        }, timeoutMilliseconds)
-        waiters.push({ expected, resolve, reject, timer })
-      })
-    },
-    /** 释放 stdout 和 child 监听器，保证 verifier 本身不会留下引用。 */
-    dispose() {
-      lines.removeListener('line', onLine)
-      child.removeListener('error', onError)
-      child.removeListener('exit', onExit)
-      while (waiters.length > 0) {
-        const waiter = waiters.shift()
-        clearTimeout(waiter.timer)
-        waiter.reject(new Error('Bundled sidecar lifecycle reader was disposed'))
-      }
-    }
-  }
-}
-
-/** 等待控制消息真正写入 sidecar stdin，避免 stop 仍在缓冲时开始判断 child 退出。 */
-function writeSidecarControlMessage(child, message) {
-  return new Promise((resolve, reject) => {
-    const input = child.stdin
-    if (!input || input.destroyed || input.writableEnded) {
-      reject(new Error('Bundled sidecar stdin is unavailable'))
-      return
-    }
-    /** 处理 stdin 管道在写回调前关闭的情况。 */
-    const onError = error => {
-      input.removeListener('error', onError)
-      reject(error)
-    }
-    input.once('error', onError)
-    input.write(`${JSON.stringify(message)}\n`, error => {
-      input.removeListener('error', onError)
-      if (error) reject(error)
-      else resolve()
-    })
-  })
-}
-
-/** 严格验证 sidecar 返回的 loopback origin，禁止凭据、远程主机、非根路径和查询片段。 */
-function parseProbeOrigin(origin) {
-  if (typeof origin !== 'string') throw new Error('Bundled sidecar ready message did not include an origin')
-  let url
-  try { url = new URL(origin) } catch { throw new Error(`Bundled sidecar returned an invalid origin: ${origin}`) }
-  const port = Number(url.port)
-  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || !Number.isInteger(port) || port < 1 || port > 65_535
-    || url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
-    throw new Error(`Bundled sidecar returned a disallowed origin: ${origin}`)
-  }
-  return url.toString()
-}
-
-/** 用安装包内的官方 Node 启动真实 Harness，验证打包闭包不是静态假绿。 */
+/** 用安装包内的官方 Node 与 published CLI 启动固定 dsh web。 */
 export async function probeBundledRuntime(contentRoot, platformName, runtimeArch = hostArch()) {
   const contract = artifactContract(platformName, runtimeArch)
-  const { nodeExecutable, sidecarScript } = await locateBundledRuntime(contentRoot, contract)
-  const workDirectory = await realpath(await mkdtemp(path.join(tmpdir(), 'dsh-artifact-runtime-probe-')))
-  const environment = { ...process.env, DSH_HOME: path.join(workDirectory, 'harness-home') }
-  delete environment.DSH_NODE_PATH
-  for (const name of Object.keys(environment)) {
-    if (name.startsWith('DSH_TEST_')) delete environment[name]
-  }
-  const child = spawn(nodeExecutable, [sidecarScript], {
-    cwd: workDirectory,
-    env: environment,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: platformName !== 'win',
-    windowsHide: true
+  const runtime = await locateBundledRuntime(contentRoot, contract)
+  const result = await probeDirectDshWeb({
+    nodeExecutable: runtime.nodeExecutable,
+    nodeModulesRoot: runtime.nodeModulesRoot
   })
-  const processGroupPid = child.pid
-  const detached = platformName !== 'win'
-  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity })
-  const protocol = createSidecarMessageReader(child, lines)
-  let stderr = ''
-  let origin
-  let cleanupConfirmed = false
-  child.stderr.on('data', chunk => { stderr = `${stderr}${chunk}`.slice(-8_000) })
-  try {
-    const ready = await protocol.waitFor('ready')
-    origin = parseProbeOrigin(ready.origin)
-    const response = await fetch(origin)
-    if (!response.ok) throw new Error(`Bundled Harness probe returned HTTP ${response.status}`)
-    if (!response.headers.get('content-type')?.includes('text/html')) throw new Error('Bundled Harness probe did not return HTML')
-    const body = await response.text()
-    if (!body.trim() || !/(?:<!doctype\s+html|<html(?:\s|>))/i.test(body)) throw new Error('Bundled Harness probe did not return non-empty HTML')
-    await writeSidecarControlMessage(child, { type: 'stop' })
-    await protocol.waitFor('stopped', 20_000)
-    // stopped 已经确认进入退出路径，此时关闭 verifier 持有的写端，避免 stdin 管道延迟影响 reap。
-    if (!child.stdin.destroyed) child.stdin.end()
-    await waitForChildExit(child, 20_000)
-    await waitForProcessGroupClosed(processGroupPid, 20_000, detached)
-    await waitForListenerClosed(origin)
-    cleanupConfirmed = true
-    console.log(`Verified packaged official Node + Harness runtime: ${contract.label}`)
-  } catch (error) {
-    const detail = stderr.trim()
-    let cleanupError
-    try {
-      await cleanupBundledChild(child, processGroupPid, detached)
-    } catch (failure) {
-      cleanupError = failure
-    }
-    let listenerError
-    if (origin) {
-      try { await waitForListenerClosed(origin) } catch (failure) {
-        listenerError = failure
-      }
-    }
-    cleanupConfirmed = !cleanupError && !listenerError
-    const primary = `${error instanceof Error ? error.message : String(error)}${detail ? `\n${detail}` : ''}`
-    const cleanupDetail = [cleanupError, listenerError]
-      .filter(Boolean)
-      .map(failure => failure instanceof Error ? failure.message : String(failure))
-    throw new Error(`${primary}${cleanupDetail.length > 0 ? `\nCleanup failed: ${cleanupDetail.join('; ')}` : ''}`)
-  } finally {
-    protocol.dispose()
-    lines.close()
-    // 进程树未确认退出时保留 cwd，避免删除仍被 child 使用的目录并掩盖清理失败。
-    if (cleanupConfirmed) await rm(workDirectory, { recursive: true, force: true })
-  }
+  if (result.command.args[0] !== runtime.cliEntry) throw new Error('Artifact probe did not execute package.json#bin.dsh')
+  console.log(`Verified packaged official Node + published dsh web runtime: ${contract.label}`)
 }
 
 /** 在真实 DMG 挂载点内执行检查，并保证主流程或检查失败时都尝试卸载。 */
@@ -394,131 +233,6 @@ export async function inspectMountedDmg(artifact, inspectionRoot, inspect, comma
   }
   if (operationError) throw operationError
   if (detachError) throw detachError
-}
-
-/** 等待 child process 确认退出，防止产物验收留下 Harness。 */
-function waitForChildExit(child, timeoutMilliseconds) {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Bundled sidecar did not exit within ${timeoutMilliseconds}ms`)), timeoutMilliseconds)
-    child.once('exit', () => { clearTimeout(timer); resolve() })
-  })
-}
-
-/** 在 POSIX 上等待 detached process group 中的 leader 和 descendant 全部消失。 */
-async function waitForProcessGroupClosed(processGroupPid, timeoutMilliseconds = 20_000, detached = true) {
-  if (hostPlatform() === 'win32' || !detached || processGroupPid === undefined) return
-  const started = Date.now()
-  while (Date.now() - started < timeoutMilliseconds) {
-    try {
-      process.kill(-processGroupPid, 0)
-    } catch (error) {
-      if (error instanceof Error && 'code' in error && error.code === 'ESRCH') return
-      throw error
-    }
-    await new Promise(resolve => setTimeout(resolve, 50))
-  }
-  throw new Error(`Bundled sidecar process group ${processGroupPid} still has live descendants`)
-}
-
-/** 通过 Windows CIM 快照读取 PID/ParentPID，不打印命令输出或环境变量。 */
-async function readWindowsProcessSnapshot(commandRunner = execFileAsync) {
-  try {
-    const result = await commandRunner('powershell.exe', [
-      '-NoProfile',
-      '-NonInteractive',
-      '-Command',
-      '$ErrorActionPreference="Stop"; Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress'
-    ], { windowsHide: true, maxBuffer: 1_000_000 })
-    const parsed = JSON.parse(result.stdout || '[]')
-    return Array.isArray(parsed) ? parsed : [parsed]
-  } catch {
-    throw new Error('Windows process snapshot is unavailable')
-  }
-}
-
-/** 返回已知 leader PID 的全部存活 descendants，按最深层优先排列。 */
-export async function collectWindowsDescendantPids(rootPid, commandRunner = execFileAsync) {
-  if (!Number.isInteger(rootPid) || rootPid <= 0) return []
-  const snapshot = await readWindowsProcessSnapshot(commandRunner)
-  const childrenByParent = new Map()
-  for (const process of snapshot) {
-    const pid = Number(process.ProcessId)
-    const parentPid = Number(process.ParentProcessId)
-    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(parentPid) || parentPid <= 0) continue
-    const children = childrenByParent.get(parentPid) ?? []
-    children.push(pid)
-    childrenByParent.set(parentPid, children)
-  }
-  const descendants = []
-  const visited = new Set([rootPid])
-  /** 深度优先遍历确保子孙先于父进程进入强杀队列。 */
-  const visit = parentPid => {
-    for (const childPid of childrenByParent.get(parentPid) ?? []) {
-      if (visited.has(childPid)) continue
-      visited.add(childPid)
-      visit(childPid)
-      descendants.push(childPid)
-    }
-  }
-  visit(rootPid)
-  return descendants
-}
-
-/** 在 Windows leader 已退出的竞态下枚举、深度优先强杀并确认全部 descendants 消失。 */
-async function cleanupWindowsProcessTree(rootPid, commandRunner = execFileAsync) {
-  if (!Number.isInteger(rootPid) || rootPid <= 0) return
-  let lastRemaining = []
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const descendants = await collectWindowsDescendantPids(rootPid, commandRunner)
-    const targets = [...descendants, rootPid]
-    for (const pid of targets) {
-      try {
-        await commandRunner('taskkill.exe', ['/PID', String(pid), '/F'], { windowsHide: true, maxBuffer: 64_000 })
-      } catch {
-        // leader 自然退出时 taskkill 失败是预期竞态；最终快照决定是否清理成功。
-      }
-    }
-    const remaining = await collectWindowsDescendantPids(rootPid, commandRunner)
-    lastRemaining = remaining
-    // leader 退出与 descendant 出现在 CIM 快照之间存在竞态，至少做一次延迟确认。
-    if (remaining.length === 0 && attempt > 0) return
-    await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)))
-  }
-  throw new Error(`Windows sidecar descendants still running: ${lastRemaining.join(', ')}`)
-}
-
-/** 强制终止并确认 sidecar process group，即使 leader 已先退出也不能跳过 descendant 清理。 */
-async function cleanupBundledChild(child, processGroupPid, detached) {
-  let processError
-  const leaderExited = child.exitCode !== null || child.signalCode !== null
-  // POSIX detached group 必须始终尝试 kill(-pid)，因为 leader 退出不代表 descendant 已退出。
-  if (hostPlatform() === 'win32') {
-    try {
-      await cleanupWindowsProcessTree(processGroupPid)
-    } catch (error) {
-      processError = error
-    }
-  } else if (detached || !leaderExited) {
-    try {
-      await terminateProcessTree(child)
-    } catch (error) {
-      processError = error
-    }
-  }
-  let exitError
-  try {
-    await waitForChildExit(child, 20_000)
-    await waitForProcessGroupClosed(processGroupPid, 20_000, detached)
-  } catch (error) {
-    exitError = error
-  }
-  if (processError || exitError) {
-    const details = [processError, exitError]
-      .filter(Boolean)
-      .map(error => error instanceof Error ? error.message : String(error))
-    throw new Error(details.join('; '))
-  }
 }
 
 /** 查找 GitHub Windows runner 或本机 PATH 中可用的 7-Zip。 */

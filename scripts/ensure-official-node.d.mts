@@ -1,4 +1,4 @@
-/** 固定 Node sidecar 版本。 */
+/** 固定官方 Node 版本。 */
 export const NODE_VERSION: string
 
 /** 官方 Node 目标描述。 */
@@ -14,8 +14,8 @@ export interface NodeTarget {
   readonly runtimeArch: string
 }
 
-/** sidecar 安装选项。 */
-export interface EnsureNodeSidecarOptions {
+/** 官方 Node 安装选项。 */
+export interface EnsureOfficialNodeOptions {
   readonly projectRoot?: string
   readonly cacheRoot?: string
   readonly runtimePlatform?: string
@@ -38,8 +38,8 @@ export function getNodeTarget(runtimePlatform?: string, runtimeArch?: string): N
 /** 返回当前平台的 Node 归档缓存目录。 */
 export function getNodeCacheRoot(environment?: NodeJS.ProcessEnv, home?: string, runtimePlatform?: string): string
 
-/** 确保固定版本官方 Node sidecar 已安装。 */
-export function ensureNodeSidecar(options?: EnsureNodeSidecarOptions): Promise<string>
+/** 确保固定版本官方 Node executable 已安装。 */
+export function ensureOfficialNode(options?: EnsureOfficialNodeOptions): Promise<string>
 
 /** 下载归档到临时文件。 */
 export function download(url: string, destination: string, fetchImpl?: typeof fetch): Promise<void>

@@ -1,13 +1,28 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { chmod, cp, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { arch as hostArch, platform as hostPlatform } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const projectRoot = path.resolve(import.meta.dirname, '..')
-const RUNTIME_CLOSURE_VERSION = 2
+const desktopPackageManifest = JSON.parse(await readFile(path.join(projectRoot, 'package.json'), 'utf8'))
+const PINNED_DSH_VERSION = desktopPackageManifest.dependencies?.['@deepseek-ai/dsh']
+const RUNTIME_CLOSURE_VERSION = 4
+const DSH_CLI_CONFIGURATION_FILES = [
+  'config/agent-presets/code/agent.cordis.yml',
+  'config/agent-presets/code/preset.yml',
+  'config/agent-presets/cordis/agent.cordis.yml',
+  'config/agent-presets/cordis/preset.yml',
+  'config/agent-presets/cordis/skills/cordis-plugin-development/SKILL.md',
+  'config/agent-presets/cordis/skills/editing-cordis-compositions/SKILL.md',
+  'config/agent-presets/minimal/agent.cordis.yml',
+  'config/agent-presets/minimal/preset.yml',
+  'config/agent-presets/standard/agent.cordis.yml',
+  'config/agent-presets/standard/preset.yml'
+]
 const RUNTIME_ENTRY_PACKAGES = [
+  '@deepseek-ai/dsh',
   '@deepseek-ai/dsh-app-boot',
   '@deepseek-ai/dsh-base',
   '@deepseek-ai/dsh-cmdline',
@@ -30,6 +45,7 @@ export function runtimeTarget(runtimePlatform = hostPlatform(), runtimeArch = ho
 /** 返回需要随应用发布的原生运行时文件清单。 */
 export function requiredRuntimeAssets(target) {
   const assets = [
+    ...DSH_CLI_CONFIGURATION_FILES.map(relative => file('@deepseek-ai/dsh', relative, 'published CLI configuration')),
     file('@deepseek-ai/dsh-base', 'cordis.patch.yml', 'Harness bundle configuration'),
     file('@deepseek-ai/dsh-web-app', 'cordis.patch.yml', 'Harness bundle configuration'),
     file('@deepseek-ai/dsh-web-frontend', 'dist/index.html', 'Harness frontend'),
@@ -280,6 +296,88 @@ async function findPackageManifest(name, fromDirectory, root) {
   return await isFile(rootCandidate) ? rootCandidate : undefined
 }
 
+/** 按发布包的 package.json#bin.dsh 契约解析 CLI 入口，拒绝缺失和越界的深层入口。 */
+export async function resolveDshCliEntry(root) {
+  const canonicalRoot = await realpath(root)
+  const manifestPath = await findPackageManifest('@deepseek-ai/dsh', canonicalRoot, canonicalRoot)
+  if (!manifestPath) throw new Error('@deepseek-ai/dsh/package.json is missing from the runtime closure')
+  const packageDirectory = path.dirname(manifestPath)
+  const canonicalPackageDirectory = await realpath(packageDirectory)
+  if (!isWithin(canonicalRoot, canonicalPackageDirectory)) {
+    throw new Error('@deepseek-ai/dsh package resolves outside the runtime closure')
+  }
+  if ((await lstat(manifestPath)).isSymbolicLink()) {
+    throw new Error('@deepseek-ai/dsh/package.json must not be a symbolic link')
+  }
+  const canonicalManifestPath = await realpath(manifestPath)
+  if (!isWithin(canonicalPackageDirectory, canonicalManifestPath)) {
+    throw new Error('@deepseek-ai/dsh/package.json resolves outside its package')
+  }
+  const manifest = JSON.parse(await readFile(canonicalManifestPath, 'utf8'))
+  if (manifest.name !== '@deepseek-ai/dsh' || typeof PINNED_DSH_VERSION !== 'string' || manifest.version !== PINNED_DSH_VERSION) {
+    throw new Error(`@deepseek-ai/dsh runtime version mismatch: expected ${PINNED_DSH_VERSION ?? 'an exact package pin'}, found ${manifest.version ?? 'unknown'}`)
+  }
+  const declaredEntry = manifest.bin?.dsh
+  if (typeof declaredEntry !== 'string' || declaredEntry.trim() === '') {
+    throw new Error('@deepseek-ai/dsh package.json#bin.dsh is missing or invalid')
+  }
+  const entry = path.resolve(canonicalPackageDirectory, declaredEntry)
+  if (!isWithin(canonicalPackageDirectory, entry)) {
+    throw new Error(`@deepseek-ai/dsh package.json#bin.dsh escapes its package: ${declaredEntry}`)
+  }
+  if (!await isFile(entry)) throw new Error(`@deepseek-ai/dsh CLI entry is missing: ${declaredEntry}`)
+  if ((await lstat(entry)).isSymbolicLink()) {
+    throw new Error(`@deepseek-ai/dsh CLI entry must not be a symbolic link: ${declaredEntry}`)
+  }
+  const canonicalEntry = await realpath(entry)
+  if (!isWithin(canonicalPackageDirectory, canonicalEntry)) {
+    throw new Error(`@deepseek-ai/dsh CLI entry resolves outside its package: ${declaredEntry}`)
+  }
+  return canonicalEntry
+}
+
+/** 构造只能从指定便携依赖树解析入口的官方 Node + dsh CLI 命令。 */
+export async function packagedDshCliCommand(options) {
+  const nodeExecutable = path.resolve(options.nodeExecutable)
+  const nodeModulesRoot = path.resolve(options.nodeModulesRoot)
+  const cliEntry = await resolveDshCliEntry(nodeModulesRoot)
+  const environment = { ...(options.environment ?? process.env) }
+  const inheritedPathName = Object.keys(environment).find(name => name.toLowerCase() === 'path')
+  const existingPath = inheritedPathName ? environment[inheritedPathName] ?? '' : ''
+  for (const name of Object.keys(environment)) {
+    if (['path', 'node_path'].includes(name.toLowerCase())) delete environment[name]
+  }
+  environment.PATH = [path.dirname(nodeExecutable), existingPath].filter(Boolean).join(path.delimiter)
+  return Object.freeze({
+    executable: nodeExecutable,
+    args: Object.freeze([cliEntry, ...(options.args ?? ['--version'])]),
+    environment: Object.freeze(environment)
+  })
+}
+
+/** 用显式提供的打包 Node 执行一次发布 CLI 探测，绝不回退到系统 Node。 */
+export async function probePackagedDshCli(options) {
+  const command = await packagedDshCliCommand(options)
+  if (!await isFile(command.executable)) throw new Error(`Packaged official Node executable is missing: ${command.executable}`)
+  return new Promise((resolve, reject) => {
+    const child = spawn(command.executable, command.args, {
+      cwd: options.cwd,
+      env: command.environment,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', chunk => { stdout = `${stdout}${chunk}`.slice(-32_000) })
+    child.stderr.on('data', chunk => { stderr = `${stderr}${chunk}`.slice(-32_000) })
+    child.once('error', reject)
+    child.once('exit', (code, signal) => {
+      if (code === 0) resolve(Object.freeze({ code, signal, stdout, stderr, command }))
+      else reject(new Error(`Packaged dsh CLI probe exited with ${code ?? signal ?? 'unknown'}${stderr.trim() ? `:\n${stderr.trim()}` : ''}`))
+    })
+  })
+}
+
 /** 将 Cordis patch 中的动态插件名称转换为包名。 */
 function packageNameFromSpecifier(specifier) {
   const segments = specifier.split('/')
@@ -362,6 +460,9 @@ export async function verifyRuntimeClosure(root, target) {
   else {
     const graph = await verifyDependencyGraph(root)
     failures.push(...graph.failures)
+    try { await resolveDshCliEntry(root) } catch (error) {
+      failures.push(error instanceof Error ? error.message : String(error))
+    }
     failures.push(...(await verifyNoSymlinks(root)).map(filePath => `${filePath} (symlink is not portable)`))
     const resolved = await resolveRuntimeAssets(root, target)
     failures.push(...resolved.failures)

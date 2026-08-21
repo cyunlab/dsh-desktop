@@ -3,23 +3,23 @@
 #[cfg(all(not(debug_assertions), feature = "wdio"))]
 compile_error!("the wdio feature is test-only and cannot be enabled in release builds");
 
+mod cli_supervisor;
 mod lifecycle;
 
-use lifecycle::{
-    cleanup_then_restart, stop_process, wait_for_readiness, LifecycleAction, LifecycleMachine,
-    ProcessControl, ReadinessWaitError, SidecarEvent,
+use cli_supervisor::{
+    build_command_plan, spawn_cli, CliProcess, ExitReason, ProcessExit, StopReport,
+    SupervisorError, HOST_ORIGIN,
 };
-use serde::{Deserialize, Serialize};
-use std::ffi::OsString;
-use std::fs;
+use lifecycle::{wait_for_readiness, ReadinessWaitError};
+use serde::Serialize;
 #[cfg(all(debug_assertions, feature = "wdio"))]
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::webview::PageLoadEvent;
@@ -28,68 +28,41 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-#[cfg(windows)]
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-};
-#[cfg(windows)]
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
-    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-    TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, OpenThread, ResumeThread, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
-};
+use std::os::unix::process::ExitStatusExt;
 
 const SNAPSHOT_EVENT: &str = "startup:snapshot";
 const PROLONGED_STARTUP_AFTER: Duration = Duration::from_secs(30);
-const SIDECAR_STOP_AFTER: Duration = Duration::from_secs(8);
-const SIDECAR_FORCE_CONFIRM_AFTER: Duration = Duration::from_secs(5);
+const HTTP_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+const HTTP_BODY_CAP: usize = 64 * 1024;
+const HTTP_METADATA_CAP: usize = 16 * 1024;
+const HTTP_WIRE_CAP: usize = HTTP_BODY_CAP + HTTP_METADATA_CAP;
+const CLI_STOP_AFTER: Duration = Duration::from_secs(8);
+const CLI_FORCE_CONFIRM_AFTER: Duration = Duration::from_secs(5);
 const BUNDLED_NODE_VERSION: &str = "24.19.0";
-
-/// Sidecar 生命周期消息的 JSON 表示。
-#[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "kebab-case", tag = "type")]
-enum SidecarMessage {
-    Ready {
-        origin: String,
-    },
-    StartupFailed {
-        #[serde(rename = "error")]
-        _error: SidecarError,
-    },
-    Stopped,
-    StopFailed {
-        #[serde(rename = "error")]
-        _error: SidecarError,
-    },
-}
-
-/// Sidecar 返回的可序列化错误。
-#[derive(Debug, Deserialize, Clone)]
-struct SidecarError {}
 
 /// 生命周期状态，序列化后作为启动页的稳定协议。
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 enum LifecycleState {
     Starting,
-    StartingSidecar,
     WaitingForClient,
     ProlongedStartup,
     Ready,
     Failed,
     Stopping,
+}
+
+#[cfg(test)]
+impl LifecycleState {
+    /// 列出 Startup 协议允许的全部 direct CLI 状态。
+    const ALL: [Self; 6] = [
+        Self::Starting,
+        Self::WaitingForClient,
+        Self::ProlongedStartup,
+        Self::Ready,
+        Self::Failed,
+        Self::Stopping,
+    ];
 }
 
 /// 启动页可见的生命周期快照。
@@ -100,6 +73,16 @@ struct LifecycleSnapshot {
     origin: Option<String>,
 }
 
+/// 供后续 lifecycle 和 Windows 信号分类复用的稳定进程观察结果。
+#[derive(Debug, Serialize, Clone)]
+struct ProcessObservation {
+    generation: u64,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+    exit_reason: String,
+    cleanup_outcome: Option<String>,
+}
+
 /// 允许复制到诊断信息中的安全错误分类。
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -108,19 +91,15 @@ enum DiagnosticCode {
     ResourceUnavailable,
     /// 官方 Node 不存在且没有显式覆盖。
     NodeUnavailable,
-    /// sidecar bootstrap 不存在。
+    /// 发布 CLI 入口或 runtime closure 不存在。
     BootstrapUnavailable,
     /// 无法准备应用数据目录。
     AppDataUnavailable,
-    /// 无法创建或接管 sidecar 进程树。
+    /// 固定的 127.0.0.1:3080 已被其它进程占用。
+    PortConflict,
+    /// 无法创建或接管 CLI 进程树。
     SpawnFailed,
-    /// sidecar 返回了启动失败消息。
-    StartupFailed,
-    /// sidecar 返回了停止失败消息。
-    StopFailed,
-    /// sidecar 返回了不允许的 origin。
-    InvalidOrigin,
-    /// sidecar 在 ready 或 listener 等待期间退出。
+    /// CLI 在 ready 或 listener 等待期间退出。
     UnexpectedExit,
     /// 进程树清理没有得到确认。
     CleanupFailed,
@@ -128,337 +107,27 @@ enum DiagnosticCode {
     InternalFailure,
 }
 
-/// 描述当前 sidecar 的进程树拥有关系。
-#[cfg(windows)]
-struct ProcessOwnership {
-    /// Windows Job Object 句柄；句柄关闭时会终止仍属于该 Job 的后代。
-    job: isize,
-}
-
-#[cfg(windows)]
-impl ProcessOwnership {
-    /// 为挂起的新进程创建并附加带有 kill-on-close 语义的 Job Object。
-    fn attach(pid: u32) -> Result<Self, String> {
-        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if job.is_null() {
-            return Err("failed to create sidecar Job Object".into());
-        }
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let configured = unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &mut limits as *mut _ as *mut std::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        } != 0;
-        if !configured {
-            unsafe { CloseHandle(job) };
-            return Err("failed to configure sidecar Job Object".into());
-        }
-        let process = unsafe {
-            OpenProcess(
-                PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-                0,
-                pid,
-            )
-        };
-        if process.is_null() {
-            unsafe { CloseHandle(job) };
-            return Err("failed to open suspended sidecar process".into());
-        }
-        let assigned = unsafe { AssignProcessToJobObject(job, process) != 0 };
-        unsafe { CloseHandle(process) };
-        if !assigned {
-            unsafe { CloseHandle(job) };
-            return Err("failed to assign suspended sidecar to Job Object".into());
-        }
-        Ok(Self { job: job as isize })
-    }
-
-    /// 在 Job Object 接管完成后恢复挂起 sidecar 的全部初始线程。
-    fn resume_suspended(&self, pid: u32) -> Result<(), String> {
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err("failed to enumerate suspended sidecar threads".into());
-        }
-        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
-        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-        let mut found = false;
-        let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) != 0 };
-        while has_entry {
-            if entry.th32OwnerProcessID == pid {
-                let thread_handle =
-                    unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-                if thread_handle.is_null() {
-                    unsafe { CloseHandle(snapshot) };
-                    return Err("failed to open suspended sidecar thread".into());
-                }
-                let resume_result = unsafe { ResumeThread(thread_handle) };
-                unsafe { CloseHandle(thread_handle) };
-                if resume_result == u32::MAX {
-                    unsafe { CloseHandle(snapshot) };
-                    return Err("failed to resume suspended sidecar thread".into());
-                }
-                found = true;
-            }
-            has_entry = unsafe { Thread32Next(snapshot, &mut entry) != 0 };
-        }
-        unsafe { CloseHandle(snapshot) };
-        if found {
-            Ok(())
-        } else {
-            Err("suspended sidecar thread was not found".into())
-        }
-    }
-
-    /// 终止 Job Object 中的整个 sidecar 进程树。
-    fn force_kill_tree(&self) -> Result<(), String> {
-        if unsafe { TerminateJobObject(self.job as HANDLE, 1) } != 0 {
-            Ok(())
-        } else {
-            Err("failed to terminate sidecar Job Object".into())
-        }
-    }
-
-    /// 查询 Job Object 中的 sidecar 和后代是否都已退出。
-    fn tree_has_exited(&self) -> Result<bool, String> {
-        let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
-        let queried = unsafe {
-            QueryInformationJobObject(
-                self.job as HANDLE,
-                JobObjectBasicAccountingInformation,
-                &mut accounting as *mut _ as *mut std::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            )
-        } != 0;
-        if queried {
-            Ok(accounting.ActiveProcesses == 0)
-        } else {
-            Err("failed to query sidecar Job Object".into())
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for ProcessOwnership {
-    /// 关闭 Job Object 句柄，确保仍存活的拥有进程树不会脱离桌面端。
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.job as HANDLE) };
-    }
-}
-
-#[cfg(unix)]
-struct ProcessOwnership {
-    /// sidecar 独立进程组的组长 PID。
-    pgid: i32,
-}
-
-#[cfg(unix)]
-impl ProcessOwnership {
-    /// 记录由 CommandExt 创建的独立进程组。
-    fn attach(pid: u32) -> Result<Self, String> {
-        Ok(Self { pgid: pid as i32 })
-    }
-
-    /// 向独立进程组发送 SIGKILL，覆盖 sidecar 生成的后代。
-    fn force_kill_tree(&self) -> Result<(), String> {
-        let result = unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
-        if result == 0 {
-            Ok(())
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "failed to kill sidecar process group {}: {error}",
-                    self.pgid
-                ))
-            }
-        }
-    }
-
-    /// 检查独立 Unix 进程组是否仍包含存活成员。
-    fn tree_has_exited(&self) -> Result<bool, String> {
-        let result = unsafe { libc::kill(-self.pgid, 0) };
-        if result == 0 {
-            return Ok(false);
-        }
-        let error = std::io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::ESRCH) => Ok(true),
-            Some(libc::EPERM) => Ok(false),
-            _ => Err(format!(
-                "failed to query sidecar process group {}: {error}",
-                self.pgid
-            )),
-        }
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-struct ProcessOwnership;
-
-#[cfg(not(any(unix, windows)))]
-impl ProcessOwnership {
-    /// 在未实现进程组 API 的平台上创建直接子进程拥有关系。
-    fn attach(_pid: u32) -> Result<Self, String> {
-        Ok(Self)
-    }
-
-    /// 未实现平台由 SidecarProcess 的 Child::kill 提供兜底。
-    fn force_kill_tree(&self) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// 未实现平台只能由直接子进程的退出状态决定树是否结束。
-    fn tree_has_exited(&self) -> Result<bool, String> {
-        Ok(true)
-    }
-}
-
-/// 由 Tauri 持有并可在重试期间共享的 Node sidecar 句柄。
-struct SidecarProcess {
-    /// 官方 Node 子进程句柄。
-    child: Mutex<Child>,
-    /// 发给 sidecar 的控制管道。
-    stdin: Mutex<Option<ChildStdin>>,
-    /// 当前进程树的拥有关系。
-    ownership: ProcessOwnership,
-    /// 串行化停止请求，防止关闭和 Retry 同时强杀同一棵树。
-    stop_lock: Mutex<()>,
-}
-
-impl ProcessControl for SidecarProcess {
-    /// 通过 sidecar 控制协议请求优雅停止。
-    fn request_graceful_stop(&self) -> Result<(), String> {
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| "sidecar stdin lock poisoned".to_string())?;
-        let Some(input) = stdin.as_mut() else {
-            return Err("sidecar stdin is unavailable".into());
-        };
-        writeln!(input, "{{\"type\":\"stop\"}}").map_err(|error| error.to_string())?;
-        input.flush().map_err(|error| error.to_string())
-    }
-
-    /// 查询官方 Node 子进程是否退出。
-    fn has_exited(&self) -> Result<bool, String> {
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| "sidecar child lock poisoned".to_string())?;
-        let child_exited = child
-            .try_wait()
-            .map(|status| status.is_some())
-            .map_err(|error| error.to_string())?;
-        Ok(child_exited && self.ownership.tree_has_exited()?)
-    }
-
-    /// 终止拥有的整个进程树，并在必要时直接终止组长。
-    fn force_kill_tree(&self) -> Result<(), String> {
-        self.ownership.force_kill_tree()
-    }
-
-    /// 等待并回收官方 Node 子进程句柄。
-    fn reap(&self) -> Result<(), String> {
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| "sidecar child lock poisoned".to_string())?;
-        child.wait().map_err(|error| error.to_string())?;
-        Ok(())
-    }
-}
-
-impl SidecarProcess {
-    /// 仅检查直接 Node 子进程，用于 readiness 期间快速识别 Host 崩溃。
-    fn child_has_exited(&self) -> Result<bool, String> {
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| "sidecar child lock poisoned".to_string())?;
-        child
-            .try_wait()
-            .map(|status| status.is_some())
-            .map_err(|error| error.to_string())
-    }
-}
-
-/// 在有界期限内确认并回收一个直接子进程。
-fn wait_and_reap_child(child: &mut Child, timeout: Duration) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child
-            .try_wait()
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("sidecar child did not exit before cleanup deadline".into());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-/// 在 Windows Job 接管失败时终止仍处于挂起状态且尚无后代的子进程。
-#[cfg(windows)]
-fn terminate_unowned_suspended_child(child: &mut Child) -> Result<(), String> {
-    let pid = child.id().to_string();
-    let taskkill_succeeded = Command::new("taskkill")
-        .args(["/PID", &pid, "/T", "/F"])
-        .status()
-        .is_ok_and(|status| status.success());
-    if !taskkill_succeeded {
-        child.kill().map_err(|error| error.to_string())?;
-    }
-    wait_and_reap_child(child, SIDECAR_FORCE_CONFIRM_AFTER)
-}
-
-/// 在非 Windows 平台终止尚未完成拥有关系初始化的直接子进程。
-#[cfg(not(windows))]
-fn terminate_unowned_suspended_child(child: &mut Child) -> Result<(), String> {
-    child.kill().map_err(|error| error.to_string())?;
-    wait_and_reap_child(child, SIDECAR_FORCE_CONFIRM_AFTER)
-}
-
-/// 强制终止已接管的进程树并在有界期限内确认树和组长全部退出。
-fn terminate_owned_child(ownership: &ProcessOwnership, child: &mut Child) -> Result<(), String> {
-    ownership.force_kill_tree()?;
-    let deadline = Instant::now() + SIDECAR_FORCE_CONFIRM_AFTER;
-    let mut child_exited = false;
-    loop {
-        if !child_exited {
-            child_exited = child
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                .is_some();
-        }
-        if child_exited && ownership.tree_has_exited()? {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("sidecar process tree did not exit before cleanup deadline".into());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
 /// Tauri shell 的共享运行时状态。
 struct RuntimeState {
     snapshot: Mutex<LifecycleSnapshot>,
-    process: Mutex<Option<Arc<SidecarProcess>>>,
+    process: Mutex<Option<Arc<CliProcess>>>,
+    /// 串行 generation 切换与 generation-bound 事件发布。
+    generation_event_gate: Mutex<()>,
+    /// 串行主线程导航与 generation 切换，不在 WebView 回调期间持有。
+    navigation_operation_gate: Mutex<()>,
     /// 串行化 spawn、Retry 和 shutdown，避免旧进程尚未回收时创建替代 Host。
     lifecycle_gate: Mutex<()>,
     host_origin: Mutex<Option<String>>,
     /// 当前 Host origin 所属的启动轮次，防止旧页面加载误报新轮次 Ready。
     host_generation: Mutex<Option<u64>>,
+    /// 已调度到主线程的 Host 导航所属轮次。
+    webview_navigation_generation: Mutex<Option<u64>>,
+    /// 已调度 Host 导航的唯一 fragment URL。
+    webview_navigation_url: Mutex<Option<String>>,
+    /// 当前受控 Host 页面加载所属轮次。
+    webview_load_generation: Mutex<Option<u64>>,
+    /// Started 事件已确认的受控 fragment URL。
+    webview_load_url: Mutex<Option<String>>,
     startup_url: Mutex<Option<String>>,
     generation: AtomicU64,
     retrying: AtomicBool,
@@ -467,26 +136,9 @@ struct RuntimeState {
     attempt_started: Mutex<Option<Instant>>,
     /// 官方 Node 可执行文件来源和路径状态的脱敏描述。
     node_path_status: Mutex<String>,
-    logs_dir: PathBuf,
+    /// 最近一次 CLI 的真实退出分类与清理结果。
+    last_process_observation: Mutex<Option<ProcessObservation>>,
     last_error: Mutex<Option<DiagnosticCode>>,
-}
-
-/// 解析官方 Node sidecar 的生命周期输出。
-fn parse_sidecar_message(line: &str) -> Result<SidecarMessage, String> {
-    serde_json::from_str(line).map_err(|error| format!("invalid sidecar message: {error}"))
-}
-
-/// 判断一个 URL 是否是当前 Desktop 允许的精确 loopback origin。
-fn is_allowed_host_origin(origin: &str) -> bool {
-    let Ok(url) = origin.parse::<tauri::Url>() else {
-        return false;
-    };
-    url.scheme() == "http"
-        && url.host_str() == Some("127.0.0.1")
-        && url.port().is_some()
-        && url.path() == "/"
-        && url.query().is_none()
-        && url.fragment().is_none()
 }
 
 /// 判断 URL 是否是 Tauri 在不同 WebView 平台使用的精确打包启动入口。
@@ -495,7 +147,7 @@ fn is_packaged_startup_url(target: &tauri::Url) -> bool {
         && target.host_str() == Some("tauri.localhost"))
         || (target.scheme() == "tauri" && target.host_str() == Some("localhost"));
     packaged_origin
-        && matches!(target.path(), "/" | "/index.html")
+        && matches!(target.path(), "" | "/" | "/index.html")
         && target.query().is_none()
         && target.fragment().is_none()
 }
@@ -591,34 +243,9 @@ fn resolve_node_path(resource_dir: &Path) -> Result<PathBuf, String> {
         return Ok(bundled);
     }
     Err(format!(
-        "official Node sidecar is missing: {}",
+        "official Node executable is missing: {}",
         bundled.display()
     ))
-}
-
-/// 解析官方 sidecar 命令；可控测试替身只存在于 debug+wdio 构建。
-fn resolve_sidecar_command(resource_dir: &Path) -> Result<(PathBuf, PathBuf), DiagnosticCode> {
-    #[cfg(all(debug_assertions, feature = "wdio"))]
-    if let Some(raw_path) = std::env::var_os("DSH_TEST_SIDECAR").filter(|value| !value.is_empty()) {
-        let test_path = PathBuf::from(raw_path);
-        if !test_path.is_file() {
-            return Err(DiagnosticCode::BootstrapUnavailable);
-        }
-        return Ok((
-            resolve_node_path(resource_dir).map_err(|_| DiagnosticCode::NodeUnavailable)?,
-            test_path,
-        ));
-    }
-    let program = resolve_node_path(resource_dir).map_err(|_| DiagnosticCode::NodeUnavailable)?;
-    let script = if cfg!(debug_assertions) {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist/sidecar/index.js")
-    } else {
-        resource_dir.join("dist/sidecar/index.js")
-    };
-    if !script.is_file() {
-        return Err(DiagnosticCode::BootstrapUnavailable);
-    }
-    Ok((program, script))
 }
 
 /// 仅在 debug+wdio 构建中追加结构化测试事件。
@@ -675,6 +302,51 @@ fn transition(
     );
 }
 
+/// 仅当 generation 仍处于等待阶段时发布计时器状态，拒绝迟到 timer。
+fn transition_waiting_generation(
+    app: &AppHandle,
+    state: &RuntimeState,
+    generation: u64,
+    lifecycle: LifecycleState,
+    message: impl Into<String>,
+) -> bool {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return false;
+    };
+    if !is_current(state, generation) {
+        return false;
+    }
+    let waiting = state.snapshot.lock().ok().is_some_and(|snapshot| {
+        matches!(
+            snapshot.state,
+            LifecycleState::WaitingForClient | LifecycleState::ProlongedStartup
+        )
+    });
+    if !waiting || !is_current(state, generation) {
+        return false;
+    }
+    transition(app, state, lifecycle, message);
+    true
+}
+
+/// 仅为当前 generation 发布生命周期快照，拒绝迟到进程事件。
+fn transition_generation(
+    app: &AppHandle,
+    state: &RuntimeState,
+    generation: u64,
+    lifecycle: LifecycleState,
+    message: impl Into<String>,
+) -> bool {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return false;
+    };
+    if !is_current(state, generation) {
+        return false;
+    }
+    transition(app, state, lifecycle, message);
+    true
+}
+
 /// 判断某个启动轮次是否仍然有效。
 fn is_current(state: &RuntimeState, generation: u64) -> bool {
     !state.shutting_down.load(Ordering::Acquire)
@@ -691,39 +363,159 @@ fn parse_loopback_address(origin: &str) -> Result<SocketAddr, ReadinessWaitError
         .map_err(|_| ReadinessWaitError::ProbeFailed)
 }
 
-/// 将当前轮次的 Host origin 与 generation 一起保存，供页面加载回调进行竞态校验。
-fn set_host_origin(state: &RuntimeState, generation: u64, origin: String) {
-    if !is_current(state, generation) {
-        return;
+/// 清除 Host readiness 与 WebView 观察令牌，使迟到事件无法穿过 Retry 边界。
+fn reset_host_observation(state: &RuntimeState) {
+    if let Ok(mut current) = state.host_origin.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = state.host_generation.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = state.webview_navigation_generation.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = state.webview_navigation_url.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = state.webview_load_generation.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = state.webview_load_url.lock() {
+        *current = None;
+    }
+}
+
+/// 在 HTTP readiness 二次确认后才公布当前 Host origin。
+fn set_ready_host_origin(state: &RuntimeState, generation: u64, origin: String) -> bool {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return false;
+    };
+    if !current_cli_is_alive(state, generation) {
+        return false;
     }
     if let Ok(mut current) = state.host_origin.lock() {
         *current = Some(origin);
+    } else {
+        return false;
     }
     if let Ok(mut current) = state.host_generation.lock() {
         *current = Some(generation);
+        true
+    } else {
+        reset_host_observation(state);
+        false
+    }
+}
+
+/// 确认该 generation 仍是当前轮次，且拥有的 CLI leader 尚未退出。
+fn current_cli_is_alive(state: &RuntimeState, generation: u64) -> bool {
+    if !is_current(state, generation) {
+        return false;
+    }
+    let process = state
+        .process
+        .lock()
+        .ok()
+        .and_then(|current| current.as_ref().map(Arc::clone));
+    process.is_some_and(|process| {
+        process.generation() == generation
+            && process
+                .try_exit(generation)
+                .is_ok_and(|exit| exit.is_none())
+    })
+}
+
+/// 判断 Started 事件是否精确命中当前 generation 的 fragment URL。
+fn navigation_event_matches(
+    current_generation: u64,
+    pending_generation: Option<u64>,
+    pending_url: Option<&str>,
+    loaded_url: &str,
+) -> bool {
+    pending_generation == Some(current_generation) && pending_url == Some(loaded_url)
+}
+
+/// 用纯值判断 WebView Finished 是否属于当前受控 fragment 加载。
+fn is_current_host_page_event(
+    current_generation: u64,
+    host_generation: Option<u64>,
+    load_generation: Option<u64>,
+    lifecycle: LifecycleState,
+    cli_alive: bool,
+    load_url: Option<&str>,
+    loaded_url: &tauri::Url,
+) -> bool {
+    host_generation == Some(current_generation)
+        && load_generation == Some(current_generation)
+        && cli_alive
+        && matches!(
+            lifecycle,
+            LifecycleState::WaitingForClient | LifecycleState::ProlongedStartup
+        )
+        && load_url == Some(loaded_url.as_str())
+}
+
+/// 把 Host Started 绑定到受控 fragment URL；应用在 Ready 前改 hash 不能替代该精确 token。
+fn begin_client_page_load(state: &RuntimeState, loaded_url: &tauri::Url) {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return;
+    };
+    let generation = state.generation.load(Ordering::Acquire);
+    let expected = state
+        .webview_navigation_generation
+        .lock()
+        .ok()
+        .and_then(|value| *value);
+    let expected_url = state
+        .webview_navigation_url
+        .lock()
+        .ok()
+        .and_then(|value| value.clone());
+    if !navigation_event_matches(
+        generation,
+        expected,
+        expected_url.as_deref(),
+        loaded_url.as_str(),
+    ) || !current_cli_is_alive(state, generation)
+    {
+        return;
+    }
+    if let Ok(mut loading) = state.webview_load_generation.lock() {
+        *loading = Some(generation);
+    }
+    if let Ok(mut loading_url) = state.webview_load_url.lock() {
+        *loading_url = Some(loaded_url.to_string());
     }
 }
 
 /// 判断实际完成加载的页面是否属于当前启动轮次等待中的 Host 客户端。
 fn is_current_host_page(state: &RuntimeState, loaded_url: &tauri::Url) -> bool {
     let generation = state.generation.load(Ordering::Acquire);
-    let origin = state
-        .host_origin
+    let host_generation = state.host_generation.lock().ok().and_then(|value| *value);
+    let load_generation = state
+        .webview_load_generation
+        .lock()
+        .ok()
+        .and_then(|value| *value);
+    let load_url = state
+        .webview_load_url
         .lock()
         .ok()
         .and_then(|value| value.clone());
-    let origin_generation = state.host_generation.lock().ok().and_then(|value| *value);
-    let waiting_for_client = state.snapshot.lock().ok().is_some_and(|snapshot| {
-        matches!(
-            snapshot.state,
-            LifecycleState::WaitingForClient | LifecycleState::ProlongedStartup
-        )
-    });
-    origin_generation == Some(generation)
-        && waiting_for_client
-        && origin.is_some_and(|origin| {
-            loaded_url.as_str().trim_end_matches('/') == origin.trim_end_matches('/')
-        })
+    let lifecycle = state
+        .snapshot
+        .lock()
+        .map(|snapshot| snapshot.state)
+        .unwrap_or(LifecycleState::Failed);
+    is_current_host_page_event(
+        generation,
+        host_generation,
+        load_generation,
+        lifecycle,
+        current_cli_is_alive(state, generation),
+        load_url.as_deref(),
+        loaded_url,
+    )
 }
 
 /// 仅在 WebView 完成页面加载后推进 client readiness，避免 Started 事件过早宣告 Ready。
@@ -733,6 +525,9 @@ fn is_finished_page_load(event: PageLoadEvent) -> bool {
 
 /// 在主 WebView 确认当前 Host 页面加载完成后，才对启动页发布客户端 Ready。
 fn mark_client_page_loaded(app: &AppHandle, state: &RuntimeState, loaded_url: &tauri::Url) {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return;
+    };
     if !is_current_host_page(state, loaded_url) {
         return;
     }
@@ -741,54 +536,390 @@ fn mark_client_page_loaded(app: &AppHandle, state: &RuntimeState, loaded_url: &t
         "event": "client-page-loaded",
         "url": loaded_url.as_str()
     }));
+    if let Ok(mut navigation) = state.webview_navigation_generation.lock() {
+        *navigation = None;
+    }
+    if let Ok(mut loading) = state.webview_load_generation.lock() {
+        *loading = None;
+    }
+    if let Ok(mut navigation_url) = state.webview_navigation_url.lock() {
+        *navigation_url = None;
+    }
+    if let Ok(mut loading_url) = state.webview_load_url.lock() {
+        *loading_url = None;
+    }
     transition(app, state, LifecycleState::Ready, "Ready.");
 }
 
-/// 判断 loopback HTTP 响应是否确认可提供 HTML 客户端页面。
-fn is_html_client_response(response: &[u8]) -> bool {
-    let Ok(response) = std::str::from_utf8(response) else {
-        return false;
-    };
-    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
-        return false;
-    };
-    let mut lines = headers.lines();
-    let Some(status) = lines.next() else {
-        return false;
-    };
-    let successful_status = status
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse::<u16>().ok())
-        .is_some_and(|code| (200..300).contains(&code));
-    successful_status
-        && lines.any(|line| {
-            line.split_once(':').is_some_and(|(name, value)| {
-                name.eq_ignore_ascii_case("content-type")
-                    && value.trim().to_ascii_lowercase().starts_with("text/html")
-            })
-        })
-        && !body.trim().is_empty()
+/// HTTP 响应在有界读取中的严格 framing 判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpResponseState {
+    NeedMore,
+    Ready,
+    Reject,
 }
 
-/// 通过一次受限的 HTTP GET 确认根页面可服务，而非仅确认 TCP 端口被监听。
-fn probe_client_page(address: SocketAddr) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(500)) else {
+/// 判断一个字节是否属于 RFC 9110 token 字符。
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// 判断字节串是否为非空 RFC 9110 token。
+fn is_http_token(value: &[u8]) -> bool {
+    !value.is_empty() && value.iter().copied().all(is_http_token_byte)
+}
+
+/// 按 grammar 扫描 chunk extensions，支持 quoted-string 内的分号和安全转义。
+fn valid_chunk_extensions(extensions: &[u8]) -> bool {
+    let mut offset = 0_usize;
+    while offset < extensions.len() {
+        if extensions[offset] != b';' {
+            return false;
+        }
+        offset += 1;
+        let name_start = offset;
+        while offset < extensions.len() && is_http_token_byte(extensions[offset]) {
+            offset += 1;
+        }
+        if offset == name_start {
+            return false;
+        }
+        if offset == extensions.len() || extensions[offset] == b';' {
+            continue;
+        }
+        if extensions[offset] != b'=' {
+            return false;
+        }
+        offset += 1;
+        if offset == extensions.len() {
+            return false;
+        }
+        if extensions[offset] != b'"' {
+            let value_start = offset;
+            while offset < extensions.len() && is_http_token_byte(extensions[offset]) {
+                offset += 1;
+            }
+            if offset == value_start || (offset < extensions.len() && extensions[offset] != b';') {
+                return false;
+            }
+            continue;
+        }
+        offset += 1;
+        let mut closed = false;
+        while offset < extensions.len() {
+            let byte = extensions[offset];
+            offset += 1;
+            if byte == b'"' {
+                closed = true;
+                break;
+            }
+            if byte == b'\\' {
+                if offset == extensions.len()
+                    || !extensions[offset].is_ascii()
+                    || extensions[offset].is_ascii_control()
+                {
+                    return false;
+                }
+                offset += 1;
+            } else if byte.is_ascii_control() {
+                return false;
+            }
+        }
+        if !closed || (offset < extensions.len() && extensions[offset] != b';') {
+            return false;
+        }
+    }
+    true
+}
+
+/// 解析合法的十六进制 chunk size，并保守校验可选 extension。
+fn parse_chunk_size(line: &[u8]) -> Option<usize> {
+    if line.is_empty() || line.len() > HTTP_METADATA_CAP {
+        return None;
+    }
+    let extension_offset = line
+        .iter()
+        .position(|byte| *byte == b';')
+        .unwrap_or(line.len());
+    let raw_size = &line[..extension_offset];
+    if raw_size.is_empty() || raw_size.len() > 16 || !raw_size.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    if !valid_chunk_extensions(&line[extension_offset..]) {
+        return None;
+    }
+    usize::from_str_radix(std::str::from_utf8(raw_size).ok()?, 16).ok()
+}
+
+/// 校验 trailer 行，拒绝折行、控制字符和会改变 framing 的字段。
+fn valid_chunk_trailer(line: &[u8]) -> bool {
+    let Some(separator) = line.iter().position(|byte| *byte == b':') else {
         return false;
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let name = &line[..separator];
+    let value = &line[separator + 1..];
+    is_http_token(name)
+        && !name.eq_ignore_ascii_case(b"content-length")
+        && !name.eq_ignore_ascii_case(b"transfer-encoding")
+        && value
+            .iter()
+            .all(|byte| *byte == b'\t' || !byte.is_ascii_control())
+}
+
+/// 在不分配解码缓冲区的前提下严格解析完整 chunked body。
+fn inspect_chunked_body(body: &[u8], eof: bool) -> HttpResponseState {
+    let incomplete = || {
+        if eof || body.len() == HTTP_WIRE_CAP {
+            HttpResponseState::Reject
+        } else {
+            HttpResponseState::NeedMore
+        }
+    };
+    let mut offset = 0_usize;
+    let mut decoded = 0_usize;
+    let mut nonempty = false;
+    loop {
+        let Some(line_end) = body[offset..]
+            .windows(2)
+            .position(|bytes| bytes == b"\r\n")
+            .map(|relative| offset + relative)
+        else {
+            return incomplete();
+        };
+        if line_end - offset > HTTP_METADATA_CAP {
+            return HttpResponseState::Reject;
+        }
+        let Some(chunk_size) = parse_chunk_size(&body[offset..line_end]) else {
+            return HttpResponseState::Reject;
+        };
+        offset = line_end + 2;
+        if chunk_size == 0 {
+            let trailer_start = offset;
+            loop {
+                let Some(trailer_end) = body[offset..]
+                    .windows(2)
+                    .position(|bytes| bytes == b"\r\n")
+                    .map(|relative| offset + relative)
+                else {
+                    return incomplete();
+                };
+                if trailer_end - trailer_start > HTTP_METADATA_CAP {
+                    return HttpResponseState::Reject;
+                }
+                if trailer_end == offset {
+                    offset += 2;
+                    return if offset == body.len() && nonempty {
+                        HttpResponseState::Ready
+                    } else {
+                        HttpResponseState::Reject
+                    };
+                }
+                if !valid_chunk_trailer(&body[offset..trailer_end]) {
+                    return HttpResponseState::Reject;
+                }
+                offset = trailer_end + 2;
+            }
+        }
+        let Some(next_decoded) = decoded.checked_add(chunk_size) else {
+            return HttpResponseState::Reject;
+        };
+        if next_decoded > HTTP_BODY_CAP {
+            return HttpResponseState::Reject;
+        }
+        let Some(data_end) = offset.checked_add(chunk_size) else {
+            return HttpResponseState::Reject;
+        };
+        let Some(framed_end) = data_end.checked_add(2) else {
+            return HttpResponseState::Reject;
+        };
+        if framed_end > body.len() {
+            return incomplete();
+        }
+        if &body[data_end..framed_end] != b"\r\n" {
+            return HttpResponseState::Reject;
+        }
+        nonempty |= body[offset..data_end]
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace());
+        decoded = next_decoded;
+        offset = framed_end;
+    }
+}
+
+/// 判断已读响应是否具有完整、有界且非空的 HTML body。
+fn inspect_http_client_response(response: &[u8], eof: bool) -> HttpResponseState {
+    if response.len() > HTTP_WIRE_CAP {
+        return HttpResponseState::Reject;
+    }
+    let Some(header_offset) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return if eof || response.len() > HTTP_METADATA_CAP {
+            HttpResponseState::Reject
+        } else {
+            HttpResponseState::NeedMore
+        };
+    };
+    if header_offset > HTTP_METADATA_CAP {
+        return HttpResponseState::Reject;
+    }
+    let body_offset = header_offset + 4;
+    let Ok(headers) = std::str::from_utf8(&response[..header_offset]) else {
+        return HttpResponseState::Reject;
+    };
+    let mut lines = headers.split("\r\n");
+    let Some(status) = lines.next() else {
+        return HttpResponseState::Reject;
+    };
+    let mut status_fields = status.split_ascii_whitespace();
+    let successful_status = status_fields.next() == Some("HTTP/1.1")
+        && status_fields
+            .next()
+            .filter(|code| code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|code| code.parse::<u16>().ok())
+            .is_some_and(|code| (200..300).contains(&code));
+    if !successful_status {
+        return HttpResponseState::Reject;
+    }
+    let mut content_types = Vec::new();
+    let mut content_lengths = Vec::new();
+    let mut transfer_encodings = Vec::new();
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return HttpResponseState::Reject;
+        };
+        if !is_http_token(name.as_bytes())
+            || value
+                .bytes()
+                .any(|byte| byte != b'\t' && byte.is_ascii_control())
+        {
+            return HttpResponseState::Reject;
+        }
+        if name.eq_ignore_ascii_case("content-type") {
+            content_types.push(value.trim());
+        } else if name.eq_ignore_ascii_case("content-length") {
+            content_lengths.push(value.trim());
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encodings.push(value.trim());
+        }
+    }
+    let html_type = content_types.len() == 1
+        && content_types[0]
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"));
+    if !html_type || content_lengths.len() > 1 || transfer_encodings.len() > 1 {
+        return HttpResponseState::Reject;
+    }
+    if let Some(transfer_encoding) = transfer_encodings.first() {
+        let mut codings = transfer_encoding.split(',').map(str::trim);
+        if !content_lengths.is_empty()
+            || !codings
+                .next()
+                .is_some_and(|coding| coding.eq_ignore_ascii_case("chunked"))
+            || codings.next().is_some()
+        {
+            return HttpResponseState::Reject;
+        }
+        return inspect_chunked_body(&response[body_offset..], eof);
+    }
+    let body_nonempty = |body: &[u8]| body.iter().any(|byte| !byte.is_ascii_whitespace());
+    if let Some(raw_length) = content_lengths.first() {
+        if raw_length.is_empty() || !raw_length.bytes().all(|byte| byte.is_ascii_digit()) {
+            return HttpResponseState::Reject;
+        }
+        let Ok(length) = raw_length.parse::<usize>() else {
+            return HttpResponseState::Reject;
+        };
+        let Some(expected_total) = body_offset.checked_add(length) else {
+            return HttpResponseState::Reject;
+        };
+        if length == 0 || length > HTTP_BODY_CAP || response.len() > expected_total {
+            return HttpResponseState::Reject;
+        }
+        if response.len() < expected_total {
+            return if eof {
+                HttpResponseState::Reject
+            } else {
+                HttpResponseState::NeedMore
+            };
+        }
+        return if body_nonempty(&response[body_offset..expected_total]) {
+            HttpResponseState::Ready
+        } else {
+            HttpResponseState::Reject
+        };
+    }
+    if response.len() - body_offset > HTTP_BODY_CAP {
+        return HttpResponseState::Reject;
+    }
+    if !eof {
+        return HttpResponseState::NeedMore;
+    }
+    if body_nonempty(&response[body_offset..]) {
+        HttpResponseState::Ready
+    } else {
+        HttpResponseState::Reject
+    }
+}
+
+/// 兼容已有纯值测试，把输入视为已经 EOF 的完整响应。
+#[cfg(test)]
+fn is_html_client_response(response: &[u8]) -> bool {
+    inspect_http_client_response(response, true) == HttpResponseState::Ready
+}
+
+/// 在一个绝对 deadline 内读取并严格验证根页面响应。
+fn probe_client_page_with_timeout(address: SocketAddr, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
+        return false;
+    };
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {address}\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
     );
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return false;
+    };
+    let _ = stream.set_write_timeout(Some(remaining));
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }
     let mut response = Vec::with_capacity(4096);
     let mut buffer = [0_u8; 4096];
-    while response.len() < 64 * 1024 {
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
+    loop {
+        match inspect_http_client_response(&response, false) {
+            HttpResponseState::Ready => return true,
+            HttpResponseState::Reject => return false,
+            HttpResponseState::NeedMore => {}
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        if remaining.is_zero() || response.len() == HTTP_WIRE_CAP {
+            return false;
+        }
+        let _ = stream.set_read_timeout(Some(remaining));
+        let available = (HTTP_WIRE_CAP - response.len()).min(buffer.len());
+        match stream.read(&mut buffer[..available]) {
+            Ok(0) => {
+                return inspect_http_client_response(&response, true) == HttpResponseState::Ready;
+            }
             Ok(read) => response.extend_from_slice(&buffer[..read]),
             Err(error)
                 if matches!(
@@ -796,12 +927,27 @@ fn probe_client_page(address: SocketAddr) -> bool {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                break
+                return false;
             }
             Err(_) => return false,
         }
     }
-    is_html_client_response(&response)
+}
+
+/// 使用生产小上限执行一次根页面探测。
+fn probe_client_page(address: SocketAddr) -> bool {
+    probe_client_page_with_timeout(address, HTTP_PROBE_TIMEOUT)
+}
+
+/// 生产始终使用 30 秒，仅 debug+wdio 允许缩短 Prolonged 门槛以消除 E2E 固定等待。
+fn prolonged_startup_after() -> Duration {
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    if let Ok(milliseconds) = std::env::var("DSH_TEST_PROLONGED_AFTER_MS") {
+        if let Ok(milliseconds) = milliseconds.parse::<u64>() {
+            return Duration::from_millis(milliseconds.max(1));
+        }
+    }
+    PROLONGED_STARTUP_AFTER
 }
 
 /// 等待 Harness 根页面可通过 HTTP 提供 HTML；超过 30 秒只进入可恢复状态，不自动失败。
@@ -809,22 +955,27 @@ fn wait_for_web_listener(
     app: &AppHandle,
     state: &RuntimeState,
     generation: u64,
-    process: &Arc<SidecarProcess>,
+    process: &Arc<CliProcess>,
     origin: &str,
     attempt_started: Instant,
 ) -> Result<(), ReadinessWaitError> {
     let address = parse_loopback_address(origin)?;
     wait_for_readiness(
         || is_current(state, generation),
-        || process.child_has_exited(),
+        || {
+            process
+                .try_exit(state.generation.load(Ordering::Acquire))
+                .map(|exit| exit.is_some())
+        },
         || Ok(probe_client_page(address)),
         attempt_started,
-        PROLONGED_STARTUP_AFTER,
+        prolonged_startup_after(),
         Duration::from_millis(100),
         || {
-            transition(
+            transition_waiting_generation(
                 app,
                 state,
+                generation,
                 LifecycleState::ProlongedStartup,
                 "Startup is taking longer than expected. You can retry when ready.",
             );
@@ -832,57 +983,20 @@ fn wait_for_web_listener(
     )
 }
 
-/// 将官方 Node 所在目录置于 PATH 首位，保证插件 spawn("node") 复用同一官方运行时。
-fn prepend_node_directory_to_path(
-    node_path: &Path,
-    inherited_path: Option<OsString>,
-) -> Result<OsString, DiagnosticCode> {
-    let node_directory = node_path.parent().ok_or(DiagnosticCode::NodeUnavailable)?;
-    let paths = std::iter::once(node_directory.to_path_buf()).chain(
-        inherited_path
-            .as_deref()
-            .map(std::env::split_paths)
-            .into_iter()
-            .flatten(),
-    );
-    std::env::join_paths(paths).map_err(|_| DiagnosticCode::SpawnFailed)
-}
-
-/// 向 sidecar Command 写入去重后的 PATH；Windows 同时清除 PATH 与 Path 等大小写变体。
-fn configure_sidecar_node_path(
-    command: &mut Command,
-    node_path: &Path,
-) -> Result<(), DiagnosticCode> {
-    let inherited_path = std::env::vars_os().find_map(|(name, value)| {
-        name.to_string_lossy()
-            .eq_ignore_ascii_case("path")
-            .then_some(value)
-    });
-    let path = prepend_node_directory_to_path(node_path, inherited_path)?;
-    command.env_remove("PATH");
-    command.env_remove("Path");
-    for (name, _) in
-        std::env::vars_os().filter(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("path"))
-    {
-        command.env_remove(name);
+/// 返回当前构建中物化的 production runtime closure 根目录。
+fn runtime_closure_root(resource_dir: &Path) -> PathBuf {
+    if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist/node_modules")
+    } else {
+        resource_dir.join("dist/node_modules")
     }
-    command.env("PATH", path);
-    Ok(())
 }
 
-/// 启动一个官方 Node sidecar，并返回共享进程句柄与生命周期消息通道。
-fn spawn_sidecar(
+/// 解析固定 Node、发布 CLI 入口、隔离 Home 与独立工作目录。
+fn resolve_cli_plan(
     app: &AppHandle,
     state: &RuntimeState,
-    generation: u64,
-) -> Result<(Arc<SidecarProcess>, mpsc::Receiver<SidecarMessage>), DiagnosticCode> {
-    let _gate = state
-        .lifecycle_gate
-        .lock()
-        .map_err(|_| DiagnosticCode::InternalFailure)?;
-    if !is_current(state, generation) {
-        return Err(DiagnosticCode::InternalFailure);
-    }
+) -> Result<cli_supervisor::CliCommandPlan, DiagnosticCode> {
     let resource_dir = app
         .path()
         .resource_dir()
@@ -890,113 +1004,172 @@ fn spawn_sidecar(
     if let Ok(mut status) = state.node_path_status.lock() {
         *status = node_path_status(&resource_dir).into();
     }
-    let (node_path, script) = resolve_sidecar_command(&resource_dir)?;
-    let harness_home = app
+    let node_path =
+        resolve_node_path(&resource_dir).map_err(|_| DiagnosticCode::NodeUnavailable)?;
+    let app_data = app
         .path()
         .app_data_dir()
         .map_err(|_| DiagnosticCode::AppDataUnavailable)?;
-    fs::create_dir_all(&harness_home).map_err(|_| DiagnosticCode::AppDataUnavailable)?;
-    let mut command = Command::new(&node_path);
-    command
-        .arg(script)
-        .current_dir(&harness_home)
-        .env("DSH_HOME", &harness_home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    configure_sidecar_node_path(&mut command, &node_path)?;
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command.spawn().map_err(|_| DiagnosticCode::SpawnFailed)?;
+    let plan = build_command_plan(
+        node_path,
+        &runtime_closure_root(&resource_dir),
+        app_data.join("harness-home"),
+        app_data.join("working-directory"),
+    )
+    .map_err(|_| DiagnosticCode::BootstrapUnavailable)?;
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    let plan = if let Some(test_entry) =
+        std::env::var_os("DSH_TEST_CLI_ENTRY").filter(|value| !value.is_empty())
+    {
+        let test_entry = PathBuf::from(test_entry);
+        if !test_entry.is_file() {
+            return Err(DiagnosticCode::BootstrapUnavailable);
+        }
+        plan.with_test_entry(test_entry)
+    } else {
+        plan
+    };
+    Ok(plan)
+}
+
+/// 把 supervisor 的稳定错误映射到 Desktop 诊断分类。
+fn map_supervisor_error(error: SupervisorError) -> DiagnosticCode {
+    match error {
+        SupervisorError::RuntimeUnavailable => DiagnosticCode::AppDataUnavailable,
+        SupervisorError::PortConflict => DiagnosticCode::PortConflict,
+        SupervisorError::PreflightFailed => DiagnosticCode::InternalFailure,
+        SupervisorError::SpawnFailed => DiagnosticCode::SpawnFailed,
+        SupervisorError::CleanupFailed => DiagnosticCode::CleanupFailed,
+    }
+}
+
+/// 在生命周期门禁内启动当前 generation 的官方 CLI。
+fn spawn_direct_cli(
+    app: &AppHandle,
+    state: &RuntimeState,
+    generation: u64,
+) -> Result<Arc<CliProcess>, DiagnosticCode> {
+    let _gate = state
+        .lifecycle_gate
+        .lock()
+        .map_err(|_| DiagnosticCode::InternalFailure)?;
+    if !is_current(state, generation) {
+        return Err(DiagnosticCode::InternalFailure);
+    }
+    let plan = resolve_cli_plan(app, state)?;
+    let process = spawn_cli(&plan, generation).map_err(map_supervisor_error)?;
     #[cfg(all(debug_assertions, feature = "wdio"))]
     record_wdio_event(serde_json::json!({
-        "event": "sidecar-spawned",
-        "pid": child.id(),
+        "event": "cli-spawned",
+        "generation": generation,
+        "pid": process.pid().ok(),
         "nodePathPrepended": true
     }));
-    let pid = child.id();
-    let ownership = match ProcessOwnership::attach(pid) {
-        Ok(ownership) => ownership,
-        Err(_) => {
-            return Err(if terminate_unowned_suspended_child(&mut child).is_ok() {
-                DiagnosticCode::SpawnFailed
-            } else {
-                DiagnosticCode::CleanupFailed
-            });
-        }
+    if !is_current(state, generation) {
+        let _ = stop_cli(state, &process);
+        return Err(DiagnosticCode::InternalFailure);
+    }
+    let Ok(mut current) = state.process.lock() else {
+        return Err(if stop_cli(state, &process).is_ok() {
+            DiagnosticCode::InternalFailure
+        } else {
+            DiagnosticCode::CleanupFailed
+        });
     };
-    #[cfg(windows)]
-    if ownership.resume_suspended(pid).is_err() {
-        return Err(if terminate_owned_child(&ownership, &mut child).is_ok() {
-            DiagnosticCode::SpawnFailed
+    if current.is_some() {
+        drop(current);
+        return Err(if stop_cli(state, &process).is_ok() {
+            DiagnosticCode::InternalFailure
         } else {
             DiagnosticCode::CleanupFailed
         });
     }
-    let stdin = match child.stdin.take() {
-        Some(stdin) => stdin,
-        None => {
-            return Err(if terminate_owned_child(&ownership, &mut child).is_ok() {
-                DiagnosticCode::SpawnFailed
-            } else {
-                DiagnosticCode::CleanupFailed
-            });
-        }
-    };
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            return Err(if terminate_owned_child(&ownership, &mut child).is_ok() {
-                DiagnosticCode::SpawnFailed
-            } else {
-                DiagnosticCode::CleanupFailed
-            });
-        }
-    };
-    let process = Arc::new(SidecarProcess {
-        ownership,
-        child: Mutex::new(child),
-        stdin: Mutex::new(Some(stdin)),
-        stop_lock: Mutex::new(()),
-    });
-    if let Ok(mut current) = state.process.lock() {
-        *current = Some(Arc::clone(&process));
-    } else {
-        let _ = stop_sidecar(&process);
-        return Err(DiagnosticCode::InternalFailure);
-    }
-    if !is_current(state, generation) {
-        return Err(DiagnosticCode::InternalFailure);
-    }
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Ok(message) = parse_sidecar_message(line.trim()) {
-                let _ = sender.send(message);
-            }
-        }
-    });
-    Ok((process, receiver))
+    *current = Some(Arc::clone(&process));
+    Ok(process)
 }
 
-/// 终止 sidecar，并在优雅停止超时后终止整个进程树。
-fn stop_sidecar(process: &Arc<SidecarProcess>) -> Result<(), String> {
-    let _stop_guard = process
-        .stop_lock
-        .lock()
-        .map_err(|_| "sidecar stop lock poisoned".to_string())?;
-    stop_process(
-        process.as_ref(),
-        SIDECAR_STOP_AFTER,
-        SIDECAR_FORCE_CONFIRM_AFTER,
-    )
-    .map(|_| ())
+/// 返回跨平台稳定的退出 signal；Windows ExitStatus 没有 POSIX signal。
+#[cfg(unix)]
+fn exit_signal(status: &ExitStatus) -> Option<i32> {
+    status.signal()
 }
 
-/// 将窗口导航到打包启动页，供失败和崩溃恢复复用。
-fn navigate_to_startup(app: &AppHandle, state: &RuntimeState) {
+/// 返回跨平台稳定的退出 signal；非 Unix 平台固定为空。
+#[cfg(not(unix))]
+fn exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
+}
+
+/// 保存真实 ExitStatus、generation、原因和可选 cleanup outcome。
+fn record_process_observation(
+    state: &RuntimeState,
+    process: &CliProcess,
+    exit: &ProcessExit,
+    cleanup_outcome: Option<&str>,
+) {
+    let reason = match exit.reason {
+        ExitReason::Requested => "requested",
+        ExitReason::Unexpected => "unexpected",
+        ExitReason::StaleGeneration => "stale_generation",
+    };
+    if let Ok(mut observation) = state.last_process_observation.lock() {
+        *observation = Some(ProcessObservation {
+            generation: process.generation(),
+            exit_code: exit.status.code(),
+            exit_signal: exit_signal(&exit.status),
+            exit_reason: reason.into(),
+            cleanup_outcome: cleanup_outcome.map(str::to_owned),
+        });
+    }
+}
+
+/// 在无法确认回收时保留 cleanup failure，而不伪造 ExitStatus。
+fn record_cleanup_failure(state: &RuntimeState, process: &CliProcess) {
+    if let Ok(mut observation) = state.last_process_observation.lock() {
+        if let Some(existing) = observation
+            .as_mut()
+            .filter(|existing| existing.generation == process.generation())
+        {
+            existing.cleanup_outcome = Some("failed".into());
+        } else {
+            *observation = Some(ProcessObservation {
+                generation: process.generation(),
+                exit_code: None,
+                exit_signal: None,
+                exit_reason: "unknown".into(),
+                cleanup_outcome: Some("failed".into()),
+            });
+        }
+    }
+}
+
+/// 对一个 CLI generation 执行八秒宽限停止并持久保留监督结果。
+fn stop_cli(state: &RuntimeState, process: &Arc<CliProcess>) -> Result<StopReport, String> {
+    let current_generation = state.generation.load(Ordering::Acquire);
+    let report = match process.stop(current_generation, CLI_STOP_AFTER, CLI_FORCE_CONFIRM_AFTER) {
+        Ok(report) => report,
+        Err(error) => {
+            record_cleanup_failure(state, process);
+            return Err(error);
+        }
+    };
+    if let Some(exit) = report.exit.as_ref() {
+        let outcome = match report.outcome {
+            lifecycle::StopOutcome::Graceful => "graceful",
+            lifecycle::StopOutcome::Forced => "forced",
+        };
+        record_process_observation(state, process, exit, Some(outcome));
+    }
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    record_wdio_event(serde_json::json!({
+        "event": "cli-cleaned",
+        "generation": process.generation(),
+        "pid": process.pid().ok()
+    }));
+    Ok(report)
+}
+/// 将窗口导航到打包启动页，主线程执行前再次校验 generation。
+fn navigate_to_startup(app: &AppHandle, state: &RuntimeState, generation: u64) {
     let Some(raw_url) = state
         .startup_url
         .lock()
@@ -1005,14 +1178,25 @@ fn navigate_to_startup(app: &AppHandle, state: &RuntimeState) {
     else {
         return;
     };
-    let Ok(url) = raw_url.parse() else { return };
+    let Ok(url) = raw_url.parse::<tauri::Url>() else {
+        return;
+    };
     let app = app.clone();
     let app_for_task = app.clone();
     let _ = app.run_on_main_thread(move || {
+        let state = app_for_task.state::<Arc<RuntimeState>>();
+        let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+            return;
+        };
+        let Ok(_gate) = state.generation_event_gate.lock() else {
+            return;
+        };
+        if !is_current(&state, generation) {
+            return;
+        }
+        reset_host_observation(&state);
+        drop(_gate);
         if let Some(window) = app_for_task.get_webview_window("main") {
-            if window.url().is_ok_and(|current| current == url) {
-                return;
-            }
             let result = window.navigate(url.clone());
             #[cfg(not(all(debug_assertions, feature = "wdio")))]
             let _ = result;
@@ -1026,16 +1210,55 @@ fn navigate_to_startup(app: &AppHandle, state: &RuntimeState) {
     });
 }
 
-/// 将窗口导航到当前启动轮次的 Host 页面。
-fn navigate_to_host(app: &AppHandle, origin: &str) {
-    let Ok(url) = origin.parse::<tauri::Url>() else {
+/// 将窗口导航到当前启动轮次的 Host 页面，拒绝迟到主线程任务。
+fn navigate_to_host(app: &AppHandle, generation: u64, origin: &str) {
+    let Ok(mut url) = origin.parse::<tauri::Url>() else {
         return;
     };
+    url.set_fragment(Some(&format!("dsh-desktop-generation={generation}")));
+    let navigation_url = url.to_string();
     let app = app.clone();
     let app_for_task = app.clone();
     let _ = app.run_on_main_thread(move || {
+        let state = app_for_task.state::<Arc<RuntimeState>>();
+        let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+            return;
+        };
+        let Ok(_gate) = state.generation_event_gate.lock() else {
+            return;
+        };
+        let host_generation = state.host_generation.lock().ok().and_then(|value| *value);
+        if host_generation != Some(generation) || !current_cli_is_alive(&state, generation) {
+            return;
+        }
+        if let Ok(mut expected) = state.webview_navigation_generation.lock() {
+            *expected = Some(generation);
+        } else {
+            return;
+        }
+        if let Ok(mut expected_url) = state.webview_navigation_url.lock() {
+            *expected_url = Some(navigation_url.clone());
+        } else {
+            reset_host_observation(&state);
+            return;
+        }
+        if let Ok(mut loading) = state.webview_load_generation.lock() {
+            *loading = None;
+        }
+        if let Ok(mut loading_url) = state.webview_load_url.lock() {
+            *loading_url = None;
+        }
+        drop(_gate);
         if let Some(window) = app_for_task.get_webview_window("main") {
             let result = window.navigate(url.clone());
+            if result.is_err() {
+                if let Ok(mut expected) = state.webview_navigation_generation.lock() {
+                    *expected = None;
+                }
+                if let Ok(mut expected_url) = state.webview_navigation_url.lock() {
+                    *expected_url = None;
+                }
+            }
             #[cfg(not(all(debug_assertions, feature = "wdio")))]
             let _ = result;
             #[cfg(all(debug_assertions, feature = "wdio"))]
@@ -1050,15 +1273,13 @@ fn navigate_to_host(app: &AppHandle, origin: &str) {
 
 /// 记录启动失败并恢复到统一启动页。
 fn fail_attempt(app: &AppHandle, state: &RuntimeState, generation: u64, code: DiagnosticCode) {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return;
+    };
     if !is_current(state, generation) {
         return;
     }
-    if let Ok(mut origin) = state.host_origin.lock() {
-        *origin = None;
-    }
-    if let Ok(mut origin_generation) = state.host_generation.lock() {
-        *origin_generation = None;
-    }
+    reset_host_observation(state);
     if let Ok(mut last_error) = state.last_error.lock() {
         *last_error = Some(code);
     }
@@ -1066,13 +1287,14 @@ fn fail_attempt(app: &AppHandle, state: &RuntimeState, generation: u64, code: Di
         app,
         state,
         LifecycleState::Failed,
-        "Startup failed. Retry, copy diagnostics, or open logs.",
+        "Startup failed. Retry or copy diagnostics.",
     );
-    navigate_to_startup(app, state);
+    drop(_gate);
+    navigate_to_startup(app, state, generation);
 }
 
-/// 仅在状态仍指向同一个 sidecar 时清除共享句柄，避免误删替代轮次。
-fn clear_process(state: &RuntimeState, process: &Arc<SidecarProcess>) {
+/// 仅在状态仍指向同一个 CLI 时清除共享句柄，避免误删替代轮次。
+fn clear_process(state: &RuntimeState, process: &Arc<CliProcess>) {
     if let Ok(mut current) = state.process.lock() {
         if current
             .as_ref()
@@ -1088,10 +1310,10 @@ fn abort_attempt(
     app: &AppHandle,
     state: &RuntimeState,
     generation: u64,
-    process: &Arc<SidecarProcess>,
+    process: &Arc<CliProcess>,
     code: DiagnosticCode,
 ) {
-    let cleanup = stop_sidecar(process);
+    let cleanup = stop_cli(state, process);
     if cleanup.is_ok() {
         clear_process(state, process);
     }
@@ -1107,157 +1329,129 @@ fn abort_attempt(
     );
 }
 
-/// 执行一个启动轮次，并在 sidecar 意外退出时回到启动失败页。
+/// 只有当前 generation 的非预期退出才应转入 Failed。
+fn exit_requires_failure(
+    process_generation: u64,
+    current_generation: u64,
+    reason: ExitReason,
+) -> bool {
+    process_generation == current_generation && reason == ExitReason::Unexpected
+}
+
+/// 执行 direct CLI 启动轮次，并只从进程、固定 HTTP 与 WebView 观察生命周期。
 fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
-    transition(
-        &app,
-        &state,
-        LifecycleState::StartingSidecar,
-        "Starting local Host.",
-    );
     let attempt_started = state
         .attempt_started
         .lock()
         .ok()
         .and_then(|started| *started)
         .unwrap_or_else(Instant::now);
-    let (process, receiver) = match spawn_sidecar(&app, &state, generation) {
-        Ok(result) => result,
+    let process = match spawn_direct_cli(&app, &state, generation) {
+        Ok(process) => process,
         Err(error) => {
             fail_attempt(&app, &state, generation, error);
             return;
         }
     };
-    transition(
+    if !transition_generation(
         &app,
         &state,
+        generation,
         LifecycleState::WaitingForClient,
         "Waiting for client to start.",
-    );
-    let mut machine = LifecycleMachine::new();
+    ) {
+        return;
+    }
+    match wait_for_web_listener(
+        &app,
+        &state,
+        generation,
+        &process,
+        HOST_ORIGIN,
+        attempt_started,
+    ) {
+        Ok(()) => {
+            if !set_ready_host_origin(&state, generation, HOST_ORIGIN.into()) {
+                if is_current(&state, generation) {
+                    abort_attempt(
+                        &app,
+                        &state,
+                        generation,
+                        &process,
+                        DiagnosticCode::UnexpectedExit,
+                    );
+                }
+                return;
+            }
+            #[cfg(all(debug_assertions, feature = "wdio"))]
+            record_wdio_event(serde_json::json!({
+                "event": "client-page-served",
+                "origin": HOST_ORIGIN
+            }));
+            navigate_to_host(&app, generation, HOST_ORIGIN);
+        }
+        Err(ReadinessWaitError::Cancelled) => return,
+        Err(ReadinessWaitError::ProcessExited) => {
+            if !is_current(&state, generation) {
+                return;
+            }
+            match process.try_exit(state.generation.load(Ordering::Acquire)) {
+                Ok(Some(exit)) => {
+                    record_process_observation(&state, &process, &exit, None);
+                    if !exit_requires_failure(
+                        process.generation(),
+                        state.generation.load(Ordering::Acquire),
+                        exit.reason,
+                    ) {
+                        return;
+                    }
+                    abort_attempt(
+                        &app,
+                        &state,
+                        generation,
+                        &process,
+                        DiagnosticCode::UnexpectedExit,
+                    );
+                }
+                _ => abort_attempt(
+                    &app,
+                    &state,
+                    generation,
+                    &process,
+                    DiagnosticCode::UnexpectedExit,
+                ),
+            }
+            return;
+        }
+        Err(ReadinessWaitError::ProbeFailed) => {
+            if !is_current(&state, generation) {
+                return;
+            }
+            abort_attempt(
+                &app,
+                &state,
+                generation,
+                &process,
+                DiagnosticCode::InternalFailure,
+            );
+            return;
+        }
+    }
+
     loop {
         if !is_current(&state, generation) {
             return;
         }
-        if let Ok(message) = receiver.recv_timeout(Duration::from_millis(100)) {
-            match message {
-                SidecarMessage::Ready { origin } => {
-                    if !is_allowed_host_origin(&origin) {
-                        abort_attempt(
-                            &app,
-                            &state,
-                            generation,
-                            &process,
-                            DiagnosticCode::InvalidOrigin,
-                        );
-                        return;
-                    }
-                    match machine.observe(SidecarEvent::Ready(origin.clone())) {
-                        LifecycleAction::Ready(origin) => {
-                            set_host_origin(&state, generation, origin.clone());
-                            if let Err(error) = wait_for_web_listener(
-                                &app,
-                                &state,
-                                generation,
-                                &process,
-                                &origin,
-                                attempt_started,
-                            ) {
-                                match error {
-                                    ReadinessWaitError::Cancelled => {}
-                                    ReadinessWaitError::ProcessExited => abort_attempt(
-                                        &app,
-                                        &state,
-                                        generation,
-                                        &process,
-                                        DiagnosticCode::UnexpectedExit,
-                                    ),
-                                    ReadinessWaitError::ProbeFailed => abort_attempt(
-                                        &app,
-                                        &state,
-                                        generation,
-                                        &process,
-                                        DiagnosticCode::InternalFailure,
-                                    ),
-                                }
-                                return;
-                            }
-                            #[cfg(all(debug_assertions, feature = "wdio"))]
-                            record_wdio_event(
-                                serde_json::json!({ "event": "client-page-served", "origin": origin }),
-                            );
-                            navigate_to_host(&app, &origin);
-                        }
-                        LifecycleAction::Fail => {
-                            abort_attempt(
-                                &app,
-                                &state,
-                                generation,
-                                &process,
-                                DiagnosticCode::UnexpectedExit,
-                            );
-                            return;
-                        }
-                        LifecycleAction::Ignore => {}
-                    }
-                }
-                SidecarMessage::StartupFailed { _error: _ } => {
-                    if let LifecycleAction::Fail = machine.observe(SidecarEvent::StartupFailed) {
-                        abort_attempt(
-                            &app,
-                            &state,
-                            generation,
-                            &process,
-                            DiagnosticCode::StartupFailed,
-                        );
-                    }
+        match process.try_exit(state.generation.load(Ordering::Acquire)) {
+            Ok(Some(exit)) => {
+                record_process_observation(&state, &process, &exit, None);
+                if !exit_requires_failure(
+                    process.generation(),
+                    state.generation.load(Ordering::Acquire),
+                    exit.reason,
+                ) {
                     return;
                 }
-                SidecarMessage::StopFailed { _error: _ } => {
-                    if let LifecycleAction::Fail = machine.observe(SidecarEvent::StartupFailed) {
-                        abort_attempt(
-                            &app,
-                            &state,
-                            generation,
-                            &process,
-                            DiagnosticCode::StopFailed,
-                        );
-                    }
-                    return;
-                }
-                SidecarMessage::Stopped => {
-                    if let LifecycleAction::Fail = machine.observe(SidecarEvent::Stopped) {
-                        abort_attempt(
-                            &app,
-                            &state,
-                            generation,
-                            &process,
-                            DiagnosticCode::UnexpectedExit,
-                        );
-                    }
-                    return;
-                }
-            }
-        }
-        if attempt_started.elapsed() >= PROLONGED_STARTUP_AFTER
-            && state
-                .snapshot
-                .lock()
-                .ok()
-                .is_some_and(|snapshot| snapshot.state == LifecycleState::WaitingForClient)
-        {
-            transition(
-                &app,
-                &state,
-                LifecycleState::ProlongedStartup,
-                "Startup is taking longer than expected. You can retry when ready.",
-            );
-        }
-        match process.child_has_exited() {
-            Ok(true)
-                if is_current(&state, generation)
-                    && matches!(machine.observe(SidecarEvent::Exited), LifecycleAction::Fail) =>
-            {
                 abort_attempt(
                     &app,
                     &state,
@@ -1267,8 +1461,7 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
                 );
                 return;
             }
-            Ok(true) => return,
-            Ok(false) => {}
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
             Err(_) => {
                 abort_attempt(
                     &app,
@@ -1282,37 +1475,72 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
         }
     }
 }
-
-/// 启动一个新的、唯一的 sidecar 启动轮次。
+/// 启动一个新的、唯一的 CLI 启动轮次。
 fn start_attempt(app: &AppHandle, state: &Arc<RuntimeState>) {
+    let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+        return;
+    };
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return;
+    };
     let generation = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
     if let Ok(mut started) = state.attempt_started.lock() {
         *started = Some(Instant::now());
     }
-    if let Ok(mut origin) = state.host_origin.lock() {
-        *origin = None;
-    }
-    if let Ok(mut origin_generation) = state.host_generation.lock() {
-        *origin_generation = None;
-    }
+    reset_host_observation(state);
     transition(app, state, LifecycleState::Starting, "Starting.");
+    drop(_gate);
     let app = app.clone();
     let state = Arc::clone(state);
     thread::spawn(move || run_attempt(app, state, generation));
 }
 
+/// 只允许用户在失败或超时但仍可恢复的状态发起 Retry。
+fn retry_allowed(lifecycle: LifecycleState) -> bool {
+    matches!(
+        lifecycle,
+        LifecycleState::Failed | LifecycleState::ProlongedStartup
+    )
+}
+
 /// 请求一次串行重试；旧进程回收完成前绝不启动新 Host。
 fn request_retry(app: &AppHandle, state: &Arc<RuntimeState>) {
-    if state.shutting_down.load(Ordering::Acquire) || state.retrying.swap(true, Ordering::AcqRel) {
+    if state.shutting_down.load(Ordering::Acquire)
+        || !state
+            .snapshot
+            .lock()
+            .ok()
+            .is_some_and(|snapshot| retry_allowed(snapshot.state))
+        || state.retrying.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+        state.retrying.store(false, Ordering::Release);
+        return;
+    };
+    let Ok(_event_gate) = state.generation_event_gate.lock() else {
+        state.retrying.store(false, Ordering::Release);
+        return;
+    };
+    if !state
+        .snapshot
+        .lock()
+        .ok()
+        .is_some_and(|snapshot| retry_allowed(snapshot.state))
+    {
+        state.retrying.store(false, Ordering::Release);
         return;
     }
     let cleanup_generation = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
+    reset_host_observation(state);
     transition(
         app,
         state,
         LifecycleState::Stopping,
         "Stopping the previous Host before retry.",
     );
+    drop(_event_gate);
     let app = app.clone();
     let state = Arc::clone(state);
     thread::spawn(move || {
@@ -1325,20 +1553,16 @@ fn request_retry(app: &AppHandle, state: &Arc<RuntimeState>) {
             .lock()
             .ok()
             .and_then(|mut current| current.take());
-        let cleanup = cleanup_then_restart(
-            process
-                .as_deref()
-                .map(|process| process as &dyn ProcessControl),
-            SIDECAR_STOP_AFTER,
-            SIDECAR_FORCE_CONFIRM_AFTER,
-            || {
-                state.retrying.store(false, Ordering::Release);
-                if !state.shutting_down.load(Ordering::Acquire) {
-                    start_attempt(&app, &state);
-                }
-            },
-        );
-        if cleanup.is_err() {
+        let cleanup = process
+            .as_ref()
+            .map(|process| stop_cli(&state, process))
+            .transpose();
+        if cleanup.is_ok() {
+            state.retrying.store(false, Ordering::Release);
+            if !state.shutting_down.load(Ordering::Acquire) {
+                start_attempt(&app, &state);
+            }
+        } else {
             if let Some(process) = process {
                 if let Ok(mut current) = state.process.lock() {
                     *current = Some(process);
@@ -1356,13 +1580,58 @@ fn request_retry(app: &AppHandle, state: &Arc<RuntimeState>) {
     });
 }
 
-/// 请求应用退出，并保证 sidecar 进程树被回收。
-fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>) {
+/// 标识触发应用退出的真实原生窗口事件。
+#[derive(Clone, Copy)]
+enum ShutdownSource {
+    /// 最终窗口收到关闭请求。
+    CloseRequested,
+    /// 最终窗口已被销毁后的兜底事件。
+    Destroyed,
+}
+
+#[cfg(all(debug_assertions, feature = "wdio"))]
+impl ShutdownSource {
+    /// 返回结构化测试记录使用的 shutdown 来源。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CloseRequested => "close-requested",
+            Self::Destroyed => "destroyed",
+        }
+    }
+}
+
+/// 请求应用退出，并保证 CLI 进程树被回收。
+fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>, source: ShutdownSource) {
     if state.shutting_down.swap(true, Ordering::AcqRel) {
         return;
     }
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    let shutdown_generation = state
+        .process
+        .lock()
+        .ok()
+        .and_then(|process| process.as_ref().map(|process| process.generation()))
+        .unwrap_or_else(|| state.generation.load(Ordering::Acquire));
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    record_wdio_event(serde_json::json!({
+        "event": "native-shutdown-requested",
+        "generation": shutdown_generation,
+        "source": source.as_str()
+    }));
+    #[cfg(not(all(debug_assertions, feature = "wdio")))]
+    let _ = source;
+    let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+        app.exit(1);
+        return;
+    };
+    let Ok(_event_gate) = state.generation_event_gate.lock() else {
+        app.exit(1);
+        return;
+    };
     state.generation.fetch_add(1, Ordering::AcqRel);
+    reset_host_observation(state);
     transition(app, state, LifecycleState::Stopping, "Stopping local Host.");
+    drop(_event_gate);
     let app = app.clone();
     let state = Arc::clone(state);
     thread::spawn(move || {
@@ -1377,8 +1646,14 @@ fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>) {
             .and_then(|mut current| current.take());
         let cleanup_failed = process
             .as_ref()
-            .is_some_and(|process| stop_sidecar(process).is_err());
+            .is_some_and(|process| stop_cli(&state, process).is_err());
         drop(_gate);
+        #[cfg(all(debug_assertions, feature = "wdio"))]
+        record_wdio_event(serde_json::json!({
+            "event": "native-shutdown-completed",
+            "generation": shutdown_generation,
+            "cleanupSucceeded": !cleanup_failed
+        }));
         app.exit(if cleanup_failed { 1 } else { 0 });
     });
 }
@@ -1400,6 +1675,14 @@ fn startup_snapshot(state: State<'_, Arc<RuntimeState>>) -> LifecycleSnapshot {
 /// 处理启动页的 Retry 命令。
 #[tauri::command]
 fn startup_retry(app: AppHandle, state: State<'_, Arc<RuntimeState>>) -> Result<(), String> {
+    if !state
+        .snapshot
+        .lock()
+        .ok()
+        .is_some_and(|snapshot| retry_allowed(snapshot.state))
+    {
+        return Err("Retry is only available after failure or prolonged startup.".into());
+    }
     request_retry(&app, state.inner());
     Ok(())
 }
@@ -1419,10 +1702,12 @@ struct StartupDiagnostics {
     lifecycle_state: String,
     /// 当前轮次已经运行的毫秒数。
     lifecycle_elapsed_ms: u128,
-    /// 官方 Node/sidecar 路径来源的脱敏状态。
-    sidecar_path_status: String,
-    /// 当前是否仍有被桌面端拥有的 sidecar。
-    sidecar_process_status: String,
+    /// 官方 Node/CLI 路径来源的脱敏状态。
+    cli_path_status: String,
+    /// 当前是否仍有被桌面端拥有的 CLI。
+    cli_process_status: String,
+    /// 最近一次 CLI 退出与 cleanup 的稳定监督结果。
+    process_observation: Option<ProcessObservation>,
     /// 最近一次允许复制的稳定错误分类。
     error_code: Option<DiagnosticCode>,
 }
@@ -1435,7 +1720,7 @@ fn build_startup_diagnostics(state: &RuntimeState, snapshot: &LifecycleSnapshot)
         .ok()
         .and_then(|started| started.map(|value| value.elapsed().as_millis()))
         .unwrap_or(0);
-    let sidecar_process_status = state
+    let cli_process_status = state
         .process
         .lock()
         .ok()
@@ -1450,12 +1735,17 @@ fn build_startup_diagnostics(state: &RuntimeState, snapshot: &LifecycleSnapshot)
         lifecycle_state: serde_json::to_string(&snapshot.state)
             .unwrap_or_else(|_| "unknown".into()),
         lifecycle_elapsed_ms: elapsed,
-        sidecar_path_status: state
+        cli_path_status: state
             .node_path_status
             .lock()
             .map(|value| value.clone())
             .unwrap_or_else(|_| "unknown".into()),
-        sidecar_process_status: sidecar_process_status.into(),
+        cli_process_status: cli_process_status.into(),
+        process_observation: state
+            .last_process_observation
+            .lock()
+            .ok()
+            .and_then(|value| value.clone()),
         error_code,
     };
     serde_json::to_string_pretty(&diagnostics).unwrap_or_else(|_| "diagnostics unavailable".into())
@@ -1490,23 +1780,13 @@ fn startup_copy_diagnostics(
         .map_err(|error| error.to_string())
 }
 
-/// 在系统文件管理器中打开日志目录。
-#[tauri::command]
-fn startup_reveal_logs(app: AppHandle, state: State<'_, Arc<RuntimeState>>) -> Result<(), String> {
-    fs::create_dir_all(&state.logs_dir).map_err(|error| error.to_string())?;
-    #[cfg(all(debug_assertions, feature = "wdio"))]
-    if std::env::var_os("DSH_TEST_RECORD_FILE").is_some() {
-        record_wdio_event(serde_json::json!({ "event": "logs-opened" }));
-        return Ok(());
-    }
-    app.opener()
-        .open_path(state.logs_dir.to_string_lossy().to_string(), None::<String>)
-        .map_err(|error| error.to_string())
-}
-
-/// 创建 startup window，注册 Tauri IPC，并启动 sidecar 生命周期监督线程。
+/// 创建 Startup window，注册 Tauri IPC，并启动 direct CLI 生命周期监督线程。
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let logs_dir = app.path().app_data_dir()?.join("logs");
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    record_wdio_event(serde_json::json!({
+        "event": "backend-started",
+        "pid": std::process::id()
+    }));
     let state = Arc::new(RuntimeState {
         snapshot: Mutex::new(LifecycleSnapshot {
             state: LifecycleState::Starting,
@@ -1514,16 +1794,22 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             origin: None,
         }),
         process: Mutex::new(None),
+        generation_event_gate: Mutex::new(()),
+        navigation_operation_gate: Mutex::new(()),
         lifecycle_gate: Mutex::new(()),
         host_origin: Mutex::new(None),
         host_generation: Mutex::new(None),
+        webview_navigation_generation: Mutex::new(None),
+        webview_navigation_url: Mutex::new(None),
+        webview_load_generation: Mutex::new(None),
+        webview_load_url: Mutex::new(None),
         startup_url: Mutex::new(None),
         generation: AtomicU64::new(0),
         retrying: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
         attempt_started: Mutex::new(None),
         node_path_status: Mutex::new("not-checked".into()),
-        logs_dir,
+        last_process_observation: Mutex::new(None),
         last_error: Mutex::new(None),
     });
     app.manage(Arc::clone(&state));
@@ -1538,10 +1824,14 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let state = Arc::clone(&state);
                 let app = app.handle().clone();
                 move |_window, payload| {
+                    let url = payload.url();
+                    if payload.event() == PageLoadEvent::Started {
+                        begin_client_page_load(&state, url);
+                        return;
+                    }
                     if !is_finished_page_load(payload.event()) {
                         return;
                     }
-                    let url = payload.url();
                     let is_app_page = (url.scheme() == "http"
                         && url.host_str() == Some("tauri.localhost"))
                         || (url.scheme() == "tauri" && url.host_str() == Some("localhost"));
@@ -1593,13 +1883,31 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 }
             })
             .build()?;
+    if let Ok(url) = startup_window.url() {
+        if is_packaged_startup_url(&url) {
+            if let Ok(mut startup_url) = state.startup_url.lock() {
+                *startup_url = Some(url.to_string());
+            }
+        }
+        #[cfg(all(debug_assertions, feature = "wdio"))]
+        record_wdio_event(serde_json::json!({
+            "event": "startup-window-created",
+            "url": url.as_str()
+        }));
+    }
     let state_for_close = Arc::clone(&state);
     startup_window.on_window_event(move |event| match event {
         WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
-            request_shutdown(&app_handle, &state_for_close);
+            request_shutdown(
+                &app_handle,
+                &state_for_close,
+                ShutdownSource::CloseRequested,
+            );
         }
-        WindowEvent::Destroyed => request_shutdown(&app_handle, &state_for_close),
+        WindowEvent::Destroyed => {
+            request_shutdown(&app_handle, &state_for_close, ShutdownSource::Destroyed)
+        }
         _ => {}
     });
     start_attempt(app.handle(), &state);
@@ -1646,13 +1954,12 @@ fn main() {
                 .open_js_links_on_click(false)
                 .build(),
         )
-        .plugin(tauri_plugin_clipboard_manager::init())
-        .invoke_handler(tauri::generate_handler![
-            startup_snapshot,
-            startup_retry,
-            startup_copy_diagnostics,
-            startup_reveal_logs
-        ]);
+        .plugin(tauri_plugin_clipboard_manager::init());
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        startup_snapshot,
+        startup_retry,
+        startup_copy_diagnostics
+    ]);
     #[cfg(feature = "wdio")]
     let builder = builder
         .plugin(tauri_plugin_wdio::init())
@@ -1666,49 +1973,38 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_startup_diagnostics, bundled_node_relative_path, configure_sidecar_node_path,
-        decide_navigation, is_allowed_host_origin, is_current_host_page, is_finished_page_load,
-        is_html_client_response, is_packaged_startup_url, parse_loopback_address,
-        parse_sidecar_message, prepend_node_directory_to_path, DiagnosticCode, LifecycleSnapshot,
-        LifecycleState, NavigationDecision, PageLoadEvent, RuntimeState, SidecarMessage,
+        build_startup_diagnostics, bundled_node_relative_path, decide_navigation,
+        exit_requires_failure, inspect_http_client_response, is_current_host_page_event,
+        is_finished_page_load, is_html_client_response, is_packaged_startup_url,
+        navigation_event_matches, parse_loopback_address, probe_client_page_with_timeout,
+        retry_allowed, DiagnosticCode, ExitReason, HttpResponseState, LifecycleSnapshot,
+        LifecycleState, NavigationDecision, PageLoadEvent, ProcessObservation, RuntimeState,
+        HTTP_BODY_CAP,
     };
-    use std::ffi::OsString;
-    use std::path::PathBuf;
-    use std::process::Command;
+    use std::io::Write;
+    use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Mutex;
-    /// 验证生命周期 ready 消息可解析。
-    #[test]
-    fn parses_ready_message() {
-        let message =
-            parse_sidecar_message(r#"{"type":"ready","origin":"http://127.0.0.1:1234/"}"#).unwrap();
-        assert!(
-            matches!(message, SidecarMessage::Ready { origin } if origin == "http://127.0.0.1:1234/")
-        );
-    }
-    /// 验证 sidecar 错误载荷只用于分类，不会进入可复制诊断状态。
-    #[test]
-    fn parses_but_discards_sidecar_error_details() {
-        let message = parse_sidecar_message(
-            r#"{"type":"startup-failed","error":{"name":"Error","message":"token=secret"}}"#,
-        )
-        .unwrap();
-        assert!(matches!(message, SidecarMessage::StartupFailed { .. }));
-    }
+    use std::thread;
+    use std::time::{Duration, Instant};
     /// 验证生命周期保留可恢复状态。
     #[test]
     fn lifecycle_has_recoverable_states() {
         assert_ne!(LifecycleState::Failed, LifecycleState::Ready);
         assert_ne!(LifecycleState::Stopping, LifecycleState::Starting);
+        assert_eq!(
+            LifecycleState::ALL,
+            [
+                LifecycleState::Starting,
+                LifecycleState::WaitingForClient,
+                LifecycleState::ProlongedStartup,
+                LifecycleState::Ready,
+                LifecycleState::Failed,
+                LifecycleState::Stopping,
+            ]
+        );
     }
-    /// 验证只接受带端口的 127.0.0.1 HTTP origin。
-    #[test]
-    fn validates_host_origin() {
-        assert!(is_allowed_host_origin("http://127.0.0.1:1234/"));
-        assert!(!is_allowed_host_origin("http://localhost:1234/"));
-        assert!(!is_allowed_host_origin("https://127.0.0.1:1234/"));
-    }
-    /// 验证 sidecar 返回的规范 origin 尾斜杠不会破坏 TCP readiness 探测。
+    /// 验证固定 origin 的尾斜杠不会破坏 TCP readiness 探测。
     #[test]
     fn parses_loopback_origin_with_trailing_slash() {
         assert_eq!(
@@ -1729,55 +2025,77 @@ mod tests {
         assert!(!is_html_client_response(
             b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n\r\n<html></html>"
         ));
-    }
-
-    /// 验证官方 Node 所在目录始终位于继承 PATH 的首位。
-    #[test]
-    fn prepends_official_node_directory_to_path() {
-        let node = PathBuf::from("desktop/resources/node/current/node");
-        let inherited =
-            std::env::join_paths([PathBuf::from("system-node"), PathBuf::from("tools")]).unwrap();
-        let configured = prepend_node_directory_to_path(&node, Some(inherited)).unwrap();
-        let configured = std::env::split_paths(&configured).collect::<Vec<_>>();
+        assert!(!is_html_client_response(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:3080/login\r\nContent-Type: text/html\r\n\r\n<html></html>"
+        ));
+        assert!(!is_html_client_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n   \n"
+        ));
+        assert!(!is_html_client_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/htmlfoo\r\nContent-Length: 6\r\n\r\n<html>"
+        ));
         assert_eq!(
-            configured.first(),
-            Some(&node.parent().unwrap().to_path_buf())
+            inspect_http_client_response(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 12\r\n\r\n<html>",
+                true,
+            ),
+            HttpResponseState::Reject
         );
-        assert!(configured.contains(&PathBuf::from("system-node")));
-    }
-
-    /// 验证没有继承 PATH 时仍只提供官方 Node 所在目录。
-    #[test]
-    fn creates_node_path_without_inherited_path() {
-        let node = PathBuf::from("desktop/resources/node/current/node");
-        let configured = prepend_node_directory_to_path(&node, None::<OsString>).unwrap();
         assert_eq!(
-            std::env::split_paths(&configured).collect::<Vec<_>>(),
-            vec![node.parent().unwrap().to_path_buf()]
+            inspect_http_client_response(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\nd;node=\"yes;ok\"\r\n<html></html>\r\n0\r\nX-Node: yes\r\n\r\n",
+                true,
+            ),
+            HttpResponseState::Ready
         );
-    }
-
-    /// 验证 Command 仅保留一个前置官方 Node 目录的 PATH 覆盖，作为 Windows 大小写兼容回归保护。
-    #[test]
-    fn command_path_override_prefers_official_node_directory() {
-        let node = PathBuf::from("desktop/resources/node/current/node");
-        let mut command = Command::new("test-program");
-        configure_sidecar_node_path(&mut command, &node).unwrap();
-        let values = command
-            .get_envs()
-            .filter_map(|(name, value)| {
-                name.to_string_lossy()
-                    .eq_ignore_ascii_case("path")
-                    .then_some(value)
-                    .flatten()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(values.len(), 1);
+        for invalid in [
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\nz\r\n<html>\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n<html>\r\n0\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n<html>\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: gzip, chunked\r\n\r\n6\r\n<html>\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked, gzip\r\n\r\n6\r\n<html>\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n<html>\r\n0\r\n\r\n".as_slice(),
+        ] {
+            assert_eq!(
+                inspect_http_client_response(invalid, true),
+                HttpResponseState::Reject
+            );
+        }
+        let mut oversized = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n10001\r\n".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', HTTP_BODY_CAP + 1));
+        oversized.extend_from_slice(b"\r\n0\r\n\r\n");
         assert_eq!(
-            std::env::split_paths(values[0]).next(),
-            Some(node.parent().unwrap().to_path_buf())
+            inspect_http_client_response(&oversized, true),
+            HttpResponseState::Reject
         );
     }
+
+    /// 验证 slow-drip 响应无法通过重置单次 read timeout 超过绝对截止时间。
+    #[test]
+    fn client_probe_has_an_absolute_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            for byte in b"6\r\n<html>\r\n0\r\n\r\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        assert!(!probe_client_page_with_timeout(
+            address,
+            Duration::from_millis(100)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(400));
+        server.join().unwrap();
+    }
+
     /// 验证启动页、当前 Host 和外链导航边界。
     #[test]
     fn applies_navigation_policy() {
@@ -1804,6 +2122,9 @@ mod tests {
         ));
         assert!(is_packaged_startup_url(
             &"tauri://localhost/index.html".parse().unwrap()
+        ));
+        assert!(is_packaged_startup_url(
+            &"tauri://localhost".parse().unwrap()
         ));
         assert_eq!(
             decide_navigation("https://example.com", startup, host),
@@ -1836,16 +2157,28 @@ mod tests {
                 origin: None,
             }),
             process: Mutex::new(None),
+            generation_event_gate: Mutex::new(()),
+            navigation_operation_gate: Mutex::new(()),
             lifecycle_gate: Mutex::new(()),
             host_origin: Mutex::new(None),
             host_generation: Mutex::new(None),
+            webview_navigation_generation: Mutex::new(None),
+            webview_navigation_url: Mutex::new(None),
+            webview_load_generation: Mutex::new(None),
+            webview_load_url: Mutex::new(None),
             startup_url: Mutex::new(None),
             generation: AtomicU64::new(1),
             retrying: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             attempt_started: Mutex::new(None),
             node_path_status: Mutex::new("bundled".into()),
-            logs_dir: PathBuf::from(r#"C:\Users\alice\secret"#),
+            last_process_observation: Mutex::new(Some(ProcessObservation {
+                generation: 1,
+                exit_code: None,
+                exit_signal: Some(9),
+                exit_reason: "unexpected".into(),
+                cleanup_outcome: Some("forced".into()),
+            })),
             last_error: Mutex::new(Some(DiagnosticCode::SpawnFailed)),
         };
         let snapshot = LifecycleSnapshot {
@@ -1855,6 +2188,8 @@ mod tests {
         };
         let diagnostics = build_startup_diagnostics(&state, &snapshot);
         assert!(diagnostics.contains("spawn_failed"));
+        assert!(diagnostics.contains("stale_generation") || diagnostics.contains("unexpected"));
+        assert!(diagnostics.contains("forced"));
         assert!(!diagnostics.contains("example.test"));
         assert!(!diagnostics.contains("token"));
         assert!(!diagnostics.contains("alice"));
@@ -1863,33 +2198,104 @@ mod tests {
     /// 验证旧轮次或非等待状态的 Host 页面加载不会将桌面端误标为 Ready。
     #[test]
     fn only_current_waiting_host_page_is_client_ready() {
-        let state = RuntimeState {
-            snapshot: Mutex::new(LifecycleSnapshot {
-                state: LifecycleState::WaitingForClient,
-                message: "ignored".into(),
-                origin: Some("http://127.0.0.1:1234/".into()),
-            }),
-            process: Mutex::new(None),
-            lifecycle_gate: Mutex::new(()),
-            host_origin: Mutex::new(Some("http://127.0.0.1:1234/".into())),
-            host_generation: Mutex::new(Some(3)),
-            startup_url: Mutex::new(None),
-            generation: AtomicU64::new(3),
-            retrying: AtomicBool::new(false),
-            shutting_down: AtomicBool::new(false),
-            attempt_started: Mutex::new(None),
-            node_path_status: Mutex::new("bundled".into()),
-            logs_dir: PathBuf::from("logs"),
-            last_error: Mutex::new(None),
-        };
-        let current = "http://127.0.0.1:1234/".parse().unwrap();
-        let stale = "http://127.0.0.1:4321/".parse().unwrap();
-        assert!(is_current_host_page(&state, &current));
-        assert!(!is_current_host_page(&state, &stale));
-        state
-            .generation
-            .store(4, std::sync::atomic::Ordering::Release);
-        assert!(!is_current_host_page(&state, &current));
+        let current = "http://127.0.0.1:3080/#dsh-desktop-generation=3"
+            .parse()
+            .unwrap();
+        let stale = "http://127.0.0.1:3080/#dsh-desktop-generation=2"
+            .parse()
+            .unwrap();
+        assert!(is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            true,
+            Some("http://127.0.0.1:3080/#dsh-desktop-generation=3"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            4,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            true,
+            Some("http://127.0.0.1:3080/#dsh-desktop-generation=3"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            Some(2),
+            LifecycleState::WaitingForClient,
+            true,
+            Some("http://127.0.0.1:3080/#dsh-desktop-generation=3"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            false,
+            Some("http://127.0.0.1:3080/#dsh-desktop-generation=3"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::Ready,
+            true,
+            Some("http://127.0.0.1:3080/#dsh-desktop-generation=3"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            true,
+            Some("http://127.0.0.1:3080/#dsh-desktop-generation=3"),
+            &stale,
+        ));
+    }
+
+    /// 验证新导航已 arm 后，旧 fragment 的 Started/Finished 都不能借用当前 generation 发布 Ready。
+    #[test]
+    fn stale_page_events_cannot_claim_a_new_navigation_token() {
+        let old = "http://127.0.0.1:3080/#dsh-desktop-generation=2";
+        let current = "http://127.0.0.1:3080/#dsh-desktop-generation=3";
+        assert!(!navigation_event_matches(3, Some(3), Some(current), old));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            None,
+            LifecycleState::WaitingForClient,
+            true,
+            Some(current),
+            &old.parse().unwrap(),
+        ));
+        assert!(navigation_event_matches(3, Some(3), Some(current), current));
+        assert!(is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            true,
+            Some(current),
+            &current.parse().unwrap(),
+        ));
+    }
+
+    /// 验证只有 Failed 和 Prolonged startup 允许 IPC Retry。
+    #[test]
+    fn retry_is_limited_to_recoverable_states() {
+        assert!(retry_allowed(LifecycleState::Failed));
+        assert!(retry_allowed(LifecycleState::ProlongedStartup));
+        assert!(!retry_allowed(LifecycleState::Starting));
+        assert!(!retry_allowed(LifecycleState::WaitingForClient));
+        assert!(!retry_allowed(LifecycleState::Ready));
+        assert!(!retry_allowed(LifecycleState::Stopping));
     }
 
     /// 验证 WebView Started 事件不会提前满足 client readiness。
@@ -1897,5 +2303,14 @@ mod tests {
     fn client_readiness_requires_finished_page_load() {
         assert!(!is_finished_page_load(PageLoadEvent::Started));
         assert!(is_finished_page_load(PageLoadEvent::Finished));
+    }
+
+    /// 验证 Ready 后当前 CLI 的非预期退出会失败，而预期或旧轮次退出被忽略。
+    #[test]
+    fn classifies_runtime_exit_against_current_generation() {
+        assert!(exit_requires_failure(3, 3, ExitReason::Unexpected));
+        assert!(!exit_requires_failure(3, 3, ExitReason::Requested));
+        assert!(!exit_requires_failure(2, 3, ExitReason::Unexpected));
+        assert!(!exit_requires_failure(2, 3, ExitReason::StaleGeneration));
     }
 }
