@@ -30,7 +30,7 @@
     "verify:release-version": "node scripts/verify-release-version.mjs"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "2.8.4",
+    "@tauri-apps/cli": "2.11.4",
     "@types/js-yaml": "4.0.9",
     "@types/mocha": "10.0.10",
     "@types/node": "24.10.1",

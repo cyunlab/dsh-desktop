@@ -27,9 +27,17 @@ describe('Tauri resource layout', () => {
       'icons/128x128.png',
       'icons/128x128@2x.png',
       'icons/icon.png',
+      'icons/AppIcon.icon',
       'icons/icon.icns',
       'icons/icon.ico'
     ])
+  })
+
+  /** 验证 macOS 新式图标不会在缺少 Xcode 26 时静默退回传统 ICNS。 */
+  it('requires the macOS 26 icon compiler for packaging', async () => {
+    const runner = await readFile(path.join(root, 'scripts/run-tauri.mjs'), 'utf8')
+    expect(runner).toContain("execFileSync('xcrun', ['actool', '--version', '--output-format=human-readable-text']")
+    expect(runner).toContain('macOS packaging requires full Xcode 26 or newer')
   })
 
   /** 验证 dev hook 会准备完整资源并等待结束，避免 Cargo 在 dist 重建期间扫描资源。 */

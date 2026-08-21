@@ -35,12 +35,12 @@ jobs:
             arch: x64
             artifact_path: src-tauri/target/release/bundle/nsis/*.exe
             artifact: dsh-desktop-windows-x64
-          - runner: macos-15
+          - runner: macos-26
             platform: mac
             arch: arm64
             artifact_path: src-tauri/target/release/bundle/dmg/*.dmg
             artifact: dsh-desktop-macos-arm64
-          - runner: macos-15-intel
+          - runner: macos-26-intel
             platform: mac
             arch: x64
             artifact_path: src-tauri/target/release/bundle/dmg/*.dmg
