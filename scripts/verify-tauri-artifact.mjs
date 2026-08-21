@@ -145,7 +145,8 @@ async function verifyExecutableArchitecture(file, contract, label) {
 async function locateBundledRuntime(contentRoot, contract) {
   const canonicalRoot = await realpath(contentRoot)
   const contents = await walkFiles(canonicalRoot)
-  const normalized = file => file.replaceAll('\\', '/').toLowerCase()
+  /** 统一安装包内路径分隔符与大小写，供跨平台后缀匹配。 */
+  function normalized(file) { return file.replaceAll('\\', '/').toLowerCase() }
   const nodeSuffix = `/node/${contract.resourceName}/${contract.executableName}`.toLowerCase()
   const manifestSuffix = '/dist/node_modules/@deepseek-ai/dsh/package.json'
   const nodeExecutable = contents.find(file => normalized(file).endsWith(nodeSuffix))
@@ -172,7 +173,8 @@ function closureTarget(contract) {
 export async function verifyExtractedBundleContents(contentRoot, platformName, runtimeArch = hostArch()) {
   const contract = artifactContract(platformName, runtimeArch)
   const contents = await walkFiles(contentRoot)
-  const normalized = file => file.replaceAll('\\', '/').toLowerCase()
+  /** 统一安装包内路径分隔符与大小写，供跨平台应用入口匹配。 */
+  function normalized(file) { return file.replaceAll('\\', '/').toLowerCase() }
   const runtime = await locateBundledRuntime(contentRoot, contract)
   await verifyExecutableArchitecture(runtime.nodeExecutable, contract, 'Official Node')
   await verifyRuntimeClosure(runtime.nodeModulesRoot, closureTarget(contract))

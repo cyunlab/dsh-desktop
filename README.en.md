@@ -46,7 +46,7 @@ DeepSeek Harness Desktop aims to carry this idea onto the desktop. We want Deskt
 
 ✅ Single-instance behavior that focuses the existing window on a second launch
 
-✅ Startup recovery, redacted diagnostics, and access to the platform log directory
+✅ Startup recovery and redacted diagnostics without persistent local logs
 
 ✅ Unit, real-Host integration, and an official Node + Harness smoke gate on every target platform
 
@@ -127,6 +127,6 @@ Current builds may be unsigned. On macOS, you may need to Control-click the app 
 - Run type checking and relevant tests before submitting a change
 - Share feature proposals and bugs in [GitHub Issues](https://github.com/XLCYun/dsh-desktop/issues)
 - Treat `deepseek-harness/` as a read-only Git submodule
-- Read [`docs/spec.md`](./docs/spec.md) and [`docs/adr/`](./docs/adr/) for design and implementation constraints
+- Read [`CONTEXT.md`](./CONTEXT.md), [ADR 0006](./docs/adr/0006-launch-the-published-dsh-web-cli-directly.md), and the [Tauri migration contract](./docs/tauri-migration.md) for current constraints; archived files such as `docs/spec.md` only record historical designs
 
 If you want desktop application UIs to be as adaptable as building blocks, you are welcome to help improve it.

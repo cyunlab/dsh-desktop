@@ -78,6 +78,7 @@ async function scenarioEnvironment(scenario) {
   const records = path.join(root, 'desktop-records.jsonl')
   const state = path.join(root, 'scenario-state.txt')
   const crashTrigger = path.join(root, 'crash-trigger')
+  const completion = path.join(root, 'wdio-tests-complete')
   const fixture = path.resolve('tests', 'e2e', 'fixtures', 'test-cli.mjs')
   await access(fixture)
   return {
@@ -89,16 +90,31 @@ async function scenarioEnvironment(scenario) {
     DSH_TEST_RECORD_FILE: records,
     DSH_TEST_STATE_FILE: state,
     DSH_TEST_CRASH_TRIGGER: crashTrigger,
+    DSH_TEST_COMPLETION_FILE: completion,
     DSH_TEST_RECORDS: records,
     ...(scenario === 'retry' || scenario === 'prolonged' ? { DSH_TEST_PROLONGED_AFTER_MS: '500' } : {})
   }
+}
+
+/** 仅在测试体已通过且 native shutdown 完整落盘时识别预期的 WDIO backend 断连。 */
+async function expectedNativeShutdownDisconnect(environment) {
+  if (!await access(environment.DSH_TEST_COMPLETION_FILE).then(() => true).catch(() => false)) return false
+  const records = await readEvents(environment.DSH_TEST_RECORD_FILE)
+  const backendPid = records.find(event => event.event === 'backend-started')?.pid
+  return records.some(event => event.event === 'native-shutdown-requested')
+    && records.some(event => event.event === 'cli-cleaned')
+    && Number.isInteger(backendPid)
+    && !processExists(backendPid)
 }
 
 /** 验收一个场景退出后的进程树与 loopback listener，失败场景也必须执行。 */
 async function verifyScenarioCleanup(environment) {
   const events = await readEvents(environment.DSH_TEST_EVENTS)
   const records = await readEvents(environment.DSH_TEST_RECORD_FILE)
-  const pids = [...new Set([...events.filter(event => event.event === 'descendant-spawned').map(event => event.pid), ...records.filter(event => event.event === 'cli-spawned').map(event => event.pid)].filter(Number.isInteger))]
+  const pids = [...new Set([
+    ...events.filter(event => event.event === 'descendant-spawned').map(event => event.pid),
+    ...records.filter(event => event.event === 'cli-spawned' || event.event === 'backend-started').map(event => event.pid)
+  ].filter(Number.isInteger))]
   const origins = [...new Set(records.filter(event => event.event === 'client-page-served').map(event => event.origin).filter(origin => typeof origin === 'string'))]
   if (!pids.length) throw new Error('desktop cleanup verifier did not observe any CLI PID')
   if (!origins.length) throw new Error('desktop cleanup verifier did not observe any served client origin')
@@ -112,6 +128,7 @@ async function main() {
   for (const scenario of selectedScenarios()) {
     const environment = await scenarioEnvironment(scenario)
     let scenarioError
+    let cleanupSucceeded = false
     try {
       run('pnpm', ['exec', 'wdio', 'run', 'wdio.conf.ts'], environment)
     } catch (error) {
@@ -119,12 +136,14 @@ async function main() {
     } finally {
       try {
         await verifyScenarioCleanup(environment)
+        cleanupSucceeded = true
       } catch (cleanupError) {
         scenarioError = scenarioError
           ? new AggregateError([scenarioError, cleanupError], `${scenario} failed and left desktop resources behind`)
           : cleanupError
       }
     }
+    if (scenarioError && cleanupSucceeded && await expectedNativeShutdownDisconnect(environment)) scenarioError = undefined
     if (scenarioError) throw scenarioError
   }
 }

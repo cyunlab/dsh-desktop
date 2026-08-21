@@ -1739,8 +1739,21 @@ fn startup_copy_diagnostics(
         .map_err(|error| error.to_string())
 }
 
+/// 仅在 debug+WDIO 构建中触发与最终窗口关闭相同的原生 shutdown 路径。
+#[cfg(all(debug_assertions, feature = "wdio"))]
+#[tauri::command]
+fn e2e_request_shutdown(app: AppHandle, state: State<'_, Arc<RuntimeState>>) {
+    record_wdio_event(serde_json::json!({ "event": "native-shutdown-requested" }));
+    request_shutdown(&app, state.inner());
+}
+
 /// 创建 Startup window，注册 Tauri IPC，并启动 direct CLI 生命周期监督线程。
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    record_wdio_event(serde_json::json!({
+        "event": "backend-started",
+        "pid": std::process::id()
+    }));
     let state = Arc::new(RuntimeState {
         snapshot: Mutex::new(LifecycleSnapshot {
             state: LifecycleState::Starting,
@@ -1902,12 +1915,20 @@ fn main() {
                 .open_js_links_on_click(false)
                 .build(),
         )
-        .plugin(tauri_plugin_clipboard_manager::init())
-        .invoke_handler(tauri::generate_handler![
-            startup_snapshot,
-            startup_retry,
-            startup_copy_diagnostics
-        ]);
+        .plugin(tauri_plugin_clipboard_manager::init());
+    #[cfg(not(all(debug_assertions, feature = "wdio")))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        startup_snapshot,
+        startup_retry,
+        startup_copy_diagnostics
+    ]);
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        startup_snapshot,
+        startup_retry,
+        startup_copy_diagnostics,
+        e2e_request_shutdown
+    ]);
     #[cfg(feature = "wdio")]
     let builder = builder
         .plugin(tauri_plugin_wdio::init())

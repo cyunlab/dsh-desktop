@@ -1,10 +1,11 @@
 import { chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { inspectMountedDmg, probeBundledRuntime, verifyExtractedBundleContents, verifyTauriArtifact } from '../../scripts/verify-tauri-artifact.mjs'
 import { requiredRuntimeAssets, runtimeTarget } from '../../scripts/runtime-closure.mjs'
-import { waitForListenerClosed } from '../../scripts/smoke-dsh-cli.mjs'
+import { probeDirectDshWeb, waitForListenerClosed } from '../../scripts/smoke-dsh-cli.mjs'
 
 const desktopManifest = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'))
 const pinnedDshVersion = desktopManifest.dependencies['@deepseek-ai/dsh'] as string
@@ -85,12 +86,13 @@ function hostArtifactTarget(): { platformName: 'win' | 'mac' | 'linux'; runtimeA
 }
 
 /** 创建只依赖 Node 内置模块的 published CLI 夹具。 */
-async function createRuntimeFixture(cliSource: string): Promise<{ root: string; contentRoot: string; eventsFile: string; platformName: 'win' | 'mac' | 'linux'; runtimeArch: 'x64' | 'arm64' }> {
+async function createRuntimeFixture(cliSource: string): Promise<{ root: string; contentRoot: string; eventsFile: string; nodeExecutable: string; nodeModulesRoot: string; platformName: 'win' | 'mac' | 'linux'; runtimeArch: 'x64' | 'arm64' }> {
   const root = await mkdtemp(path.join(tmpdir(), 'dsh-artifact-direct-cli-fixture-'))
   const contentRoot = path.join(root, 'mounted')
   const target = hostArtifactTarget()
   const nodeExecutable = path.join(contentRoot, 'node', target.resourceName, target.executableName)
-  const dsh = path.join(contentRoot, 'dist', 'node_modules', '@deepseek-ai', 'dsh')
+  const nodeModulesRoot = path.join(contentRoot, 'dist', 'node_modules')
+  const dsh = path.join(nodeModulesRoot, '@deepseek-ai', 'dsh')
   const cliEntry = path.join(dsh, 'lib', 'fixture-cli.mjs')
   await Promise.all([path.dirname(nodeExecutable), path.dirname(cliEntry)].map(directory => mkdir(directory, { recursive: true })))
   if (process.platform === 'win32') await copyFile(process.execPath, nodeExecutable)
@@ -105,11 +107,11 @@ async function createRuntimeFixture(cliSource: string): Promise<{ root: string; 
     dependencies: {}
   }))
   await writeFile(cliEntry, cliSource)
-  return { root, contentRoot, eventsFile: path.join(root, 'events.log'), platformName: target.platformName, runtimeArch: target.runtimeArch }
+  return { root, contentRoot, eventsFile: path.join(root, 'events.log'), nodeExecutable, nodeModulesRoot, platformName: target.platformName, runtimeArch: target.runtimeArch }
 }
 
 /** 返回遵守 direct CLI argv、HTTP 与操作系统信号契约的夹具源码。 */
-function directCliSource(options: { readonly body?: string; readonly contentType?: string; readonly chunked?: boolean } = {}): string {
+function directCliSource(options: { readonly body?: string; readonly contentType?: string; readonly chunked?: boolean; readonly redirect?: boolean; readonly stdoutFlood?: boolean } = {}): string {
   return `
 import { appendFileSync } from 'node:fs'
 import { createServer } from 'node:http'
@@ -118,9 +120,10 @@ const record = event => eventsFile && appendFileSync(eventsFile, event + '\\n')
 const expected = ['web', '--host', '127.0.0.1', '--port', '3080']
 record('argv:' + JSON.stringify(process.argv.slice(2)))
 if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expected)) process.exit(64)
+${options.stdoutFlood ? "for (let index = 0; index < 256; index += 1) process.stdout.write('x'.repeat(65536))" : ''}
 const server = createServer((_request, response) => {
   record('http-request')
-  response.writeHead(200, { 'content-type': ${JSON.stringify(options.contentType ?? 'text/html; charset=utf-8')} })
+  response.writeHead(${options.redirect ? 302 : 200}, { 'content-type': ${JSON.stringify(options.contentType ?? 'text/html; charset=utf-8')}${options.redirect ? ", location: 'http://127.0.0.1:3080/final'" : ''} })
   ${options.chunked ? "response.write('<!doctype html><html>'); setTimeout(() => response.end('<body>chunked</body></html>'), 20)" : `response.end(${JSON.stringify(options.body ?? '<!doctype html><html><body>fixture</body></html>')})`}
 })
 server.listen(3080, '127.0.0.1', () => record('listener-started'))
@@ -136,22 +139,34 @@ process.once('SIGINT', () => stop('SIGINT'))
 `
 }
 
-/** 返回 leader 提前退出但 descendant 保留固定 listener 的夹具源码。 */
+/** 返回 HTML 正常、leader 正常退出且 descendant 不占 listener 的夹具源码。 */
 function leaderExitDescendantSource(): string {
   const descendant = JSON.stringify(`
 const { appendFileSync } = require('node:fs')
-const { createServer } = require('node:net')
-const server = createServer()
-server.listen(3080, '127.0.0.1', () => appendFileSync(process.env.DSH_FIXTURE_EVENTS, 'descendant-listener\\n'))
+process.on('SIGTERM', () => {})
+process.on('SIGINT', () => {})
 setInterval(() => {}, 1000)
 `)
   return `
 import { appendFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
+import { createServer } from 'node:http'
 appendFileSync(process.env.DSH_FIXTURE_EVENTS, 'argv:' + JSON.stringify(process.argv.slice(2)) + '\\n')
-spawn(process.execPath, ['-e', ${descendant}], { stdio: 'ignore' })
-setTimeout(() => process.exit(0), 200)
+const stubborn = spawn(process.execPath, ['-e', ${descendant}], { stdio: 'ignore' })
+appendFileSync(process.env.DSH_FIXTURE_EVENTS, 'descendant-alive:' + stubborn.pid + '\\n')
+const server = createServer((_request, response) => {
+  response.writeHead(200, { 'content-type': 'text/html' })
+  response.end('<!doctype html><p>leader exits</p>')
+  server.close(() => process.exit(0))
+})
+server.listen(3080, '127.0.0.1')
 `
+}
+
+/** 使用平台接口判断记录的 descendant PID 是否仍存活。 */
+function processExists(pid: number): boolean {
+  if (process.platform === 'win32') return spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true }).stdout.includes(`"${pid}"`)
+  try { process.kill(pid, 0); return true } catch { return false }
 }
 
 describe.sequential('Tauri artifact verification', () => {
@@ -262,18 +277,21 @@ describe.sequential('Tauri artifact verification', () => {
     }
   })
 
-  it.skipIf(process.platform === 'win32')('kills a detached descendant when the CLI leader exits first', async () => {
+  it('tracks and force-kills a stubborn descendant after a normally exiting HTML leader', async () => {
     const fixture = await createRuntimeFixture(leaderExitDescendantSource())
     try {
       process.env.DSH_FIXTURE_EVENTS = fixture.eventsFile
-      await expect(probeBundledRuntime(fixture.contentRoot, fixture.platformName, fixture.runtimeArch))
-        .rejects.toThrow('exited before HTML readiness')
+      await expect(probeBundledRuntime(fixture.contentRoot, fixture.platformName, fixture.runtimeArch)).resolves.toBeUndefined()
+      const events = await readFile(fixture.eventsFile, 'utf8')
+      const descendantPid = Number(events.match(/descendant-alive:(\d+)/)?.[1])
+      expect(Number.isInteger(descendantPid)).toBe(true)
+      expect(processExists(descendantPid)).toBe(false)
       await expect(waitForListenerClosed()).resolves.toBeUndefined()
     } finally {
       delete process.env.DSH_FIXTURE_EVENTS
       await rm(fixture.root, { recursive: true, force: true })
     }
-  })
+  }, 20_000)
 
   it('rejects non-text/html while still cleaning the listener', async () => {
     const fixture = await createRuntimeFixture(directCliSource({ contentType: 'application/xhtml+xml' }))
@@ -292,6 +310,49 @@ describe.sequential('Tauri artifact verification', () => {
       await expect(probeBundledRuntime(fixture.contentRoot, fixture.platformName, fixture.runtimeArch))
         .rejects.toThrow('non-empty HTML')
       await expect(waitForListenerClosed()).resolves.toBeUndefined()
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects redirects without following them', async () => {
+    const fixture = await createRuntimeFixture(directCliSource({ redirect: true }))
+    try {
+      await expect(probeBundledRuntime(fixture.contentRoot, fixture.platformName, fixture.runtimeArch))
+        .rejects.toThrow('HTTP 302')
+      await expect(waitForListenerClosed()).resolves.toBeUndefined()
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects HTML larger than the 64 KiB readiness bus limit', async () => {
+    const fixture = await createRuntimeFixture(directCliSource({ body: 'x'.repeat(64 * 1024 + 1) }))
+    try {
+      await expect(probeBundledRuntime(fixture.contentRoot, fixture.platformName, fixture.runtimeArch))
+        .rejects.toThrow('65536 byte HTML limit')
+      await expect(waitForListenerClosed()).resolves.toBeUndefined()
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  it('drains a flooding stdout pipe before HTML readiness', async () => {
+    const fixture = await createRuntimeFixture(directCliSource({ stdoutFlood: true }))
+    try {
+      await expect(probeBundledRuntime(fixture.contentRoot, fixture.platformName, fixture.runtimeArch)).resolves.toBeUndefined()
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  it('reports spawn errors and still completes cleanup', async () => {
+    const fixture = await createRuntimeFixture(directCliSource())
+    try {
+      await writeFile(fixture.nodeExecutable, 'not executable')
+      await chmod(fixture.nodeExecutable, 0o644)
+      await expect(probeDirectDshWeb({ nodeExecutable: fixture.nodeExecutable, nodeModulesRoot: fixture.nodeModulesRoot, timeoutMilliseconds: 2_000 }))
+        .rejects.toThrow('spawn failed')
     } finally {
       await rm(fixture.root, { recursive: true, force: true })
     }

@@ -5,6 +5,7 @@ import { applicationPath } from './support/paths.mjs'
 import { isPackagedStartupUrl, waitForPackagedStartupPage } from './support/startup-page.mjs'
 
 const scenario = process.env.DSH_TEST_SCENARIO ?? 'success'
+let scenarioTestsPassed = true
 
 /** 等待元素展示目标文本，兼容启动页到 loopback 页面之间的导航。 */
 async function waitForText(selector: string, expected: string, timeout = 15_000): Promise<void> {
@@ -86,6 +87,18 @@ async function waitForEvent(name: string): Promise<readonly Record<string, unkno
   return readEvents()
 }
 
+/** 不依赖 WebDriver 命令轮询 recorder，等待原生 shutdown 完成 CLI 回收。 */
+async function waitForNativeCleanup(): Promise<void> {
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    const records = await readRecords()
+    const backendPid = Number(records.find(event => event.event === 'backend-started')?.pid)
+    if (records.some(event => event.event === 'cli-cleaned') && Number.isInteger(backendPid) && !processExists(backendPid)) return
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  throw new Error(`Native shutdown did not complete CLI cleanup and backend exit: ${JSON.stringify(await readRecords())}`)
+}
+
 /** 使用平台进程接口判断 Retry 前的旧 PID 是否仍存活。 */
 function processExists(pid: number): boolean {
   if (process.platform === 'win32') return spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true }).stdout.includes(`"${pid}"`)
@@ -103,6 +116,10 @@ async function launchSecondInstance(): Promise<void> {
 }
 
 describe('DeepSeek Harness Desktop Tauri behavior', () => {
+  /** 记录任何行为断言失败，防止 runner 把真正失败误判成预期 backend 断连。 */
+  afterEach(function () {
+    if (this.currentTest?.state !== 'passed') scenarioTestsPassed = false
+  })
   if (scenario === 'delayed-success') {
     /** 验证 WebDriver 越过 about:blank 后先看到真实启动页，再看到 loopback Web Client。 */
     it('shows the startup page before loading the loopback Web Client', async () => {
@@ -207,8 +224,25 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
     it('loads before runner verifies hard process-tree cleanup', async () => { await waitForHarness() })
   }
 
-  /** 在每个桌面行为场景结束时销毁 WebView，验收 Tauri 侧的 CLI 回收。 */
+  /** 通过 debug-only 原生命令走最终窗口同一 shutdown 路径，并在 runner 存活时等待回收。 */
   after(async () => {
-    await browser.closeWindow()
+    const completionFile = process.env.DSH_TEST_COMPLETION_FILE
+    if (scenarioTestsPassed && completionFile) await writeFile(completionFile, 'passed', 'utf8')
+    const startupUrl = String((await readRecords()).find(event => event.event === 'startup-window-created')?.url ?? '')
+    if (!isPackagedStartupUrl(startupUrl)) throw new Error(`Packaged startup URL unavailable before shutdown: ${startupUrl}`)
+    await browser.url(startupUrl)
+    await browser.waitUntil(async () => isPackagedStartupUrl(await browser.getUrl()), { timeout: 5_000 })
+    await new Promise(resolve => setTimeout(resolve, 250))
+    try {
+      await browser.execute(() => {
+        const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke(command: string): Promise<unknown> } }).__TAURI_INTERNALS__
+        if (!internals) throw new Error('Tauri internals are unavailable')
+        setTimeout(() => { void internals.invoke('e2e_request_shutdown').catch(() => {}) }, 100)
+      })
+    } catch (error) {
+      const shutdownStarted = (await readRecords()).some(event => event.event === 'lifecycle-transition' && event.state === 'stopping')
+      if (!shutdownStarted) throw error
+    }
+    await waitForNativeCleanup()
   })
 })
