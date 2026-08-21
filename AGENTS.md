@@ -26,3 +26,7 @@ Domain documentation uses the single-context layout. See `docs/agents/domain.md`
 ## Subagent Handoff 开发模式
 当显式要求使用此模式时：使用 subagent + worktree + implement skill 的方式开发代码，需要给出详细的 spec 给 subagent。
 
+## 注意
+本项目使用 tauri，在构建过程中可能会产生大量的构建产物，占满内存，需要及时清理。
+
+
