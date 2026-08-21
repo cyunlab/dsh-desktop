@@ -12,7 +12,6 @@ use cli_supervisor::{
 };
 use lifecycle::{wait_for_readiness, ReadinessWaitError};
 use serde::Serialize;
-use std::fs;
 #[cfg(all(debug_assertions, feature = "wdio"))]
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -33,8 +32,12 @@ use std::os::unix::process::ExitStatusExt;
 
 const SNAPSHOT_EVENT: &str = "startup:snapshot";
 const PROLONGED_STARTUP_AFTER: Duration = Duration::from_secs(30);
-const SIDECAR_STOP_AFTER: Duration = Duration::from_secs(8);
-const SIDECAR_FORCE_CONFIRM_AFTER: Duration = Duration::from_secs(5);
+const HTTP_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+const HTTP_BODY_CAP: usize = 64 * 1024;
+const HTTP_METADATA_CAP: usize = 16 * 1024;
+const HTTP_WIRE_CAP: usize = HTTP_BODY_CAP + HTTP_METADATA_CAP;
+const CLI_STOP_AFTER: Duration = Duration::from_secs(8);
+const CLI_FORCE_CONFIRM_AFTER: Duration = Duration::from_secs(5);
 const BUNDLED_NODE_VERSION: &str = "24.19.0";
 
 /// 生命周期状态，序列化后作为启动页的稳定协议。
@@ -42,12 +45,24 @@ const BUNDLED_NODE_VERSION: &str = "24.19.0";
 #[serde(rename_all = "kebab-case")]
 enum LifecycleState {
     Starting,
-    StartingSidecar,
     WaitingForClient,
     ProlongedStartup,
     Ready,
     Failed,
     Stopping,
+}
+
+#[cfg(test)]
+impl LifecycleState {
+    /// 列出 Startup 协议允许的全部 direct CLI 状态。
+    const ALL: [Self; 6] = [
+        Self::Starting,
+        Self::WaitingForClient,
+        Self::ProlongedStartup,
+        Self::Ready,
+        Self::Failed,
+        Self::Stopping,
+    ];
 }
 
 /// 启动页可见的生命周期快照。
@@ -96,11 +111,23 @@ enum DiagnosticCode {
 struct RuntimeState {
     snapshot: Mutex<LifecycleSnapshot>,
     process: Mutex<Option<Arc<CliProcess>>>,
+    /// 串行 generation 切换与 generation-bound 事件发布。
+    generation_event_gate: Mutex<()>,
+    /// 串行主线程导航与 generation 切换，不在 WebView 回调期间持有。
+    navigation_operation_gate: Mutex<()>,
     /// 串行化 spawn、Retry 和 shutdown，避免旧进程尚未回收时创建替代 Host。
     lifecycle_gate: Mutex<()>,
     host_origin: Mutex<Option<String>>,
     /// 当前 Host origin 所属的启动轮次，防止旧页面加载误报新轮次 Ready。
     host_generation: Mutex<Option<u64>>,
+    /// 已调度到主线程的 Host 导航所属轮次。
+    webview_navigation_generation: Mutex<Option<u64>>,
+    /// 已调度 Host 导航的唯一 fragment URL。
+    webview_navigation_url: Mutex<Option<String>>,
+    /// 当前受控 Host 页面加载所属轮次。
+    webview_load_generation: Mutex<Option<u64>>,
+    /// Started 事件已确认的受控 fragment URL。
+    webview_load_url: Mutex<Option<String>>,
     startup_url: Mutex<Option<String>>,
     generation: AtomicU64,
     retrying: AtomicBool,
@@ -111,7 +138,6 @@ struct RuntimeState {
     node_path_status: Mutex<String>,
     /// 最近一次 CLI 的真实退出分类与清理结果。
     last_process_observation: Mutex<Option<ProcessObservation>>,
-    logs_dir: PathBuf,
     last_error: Mutex<Option<DiagnosticCode>>,
 }
 
@@ -121,7 +147,7 @@ fn is_packaged_startup_url(target: &tauri::Url) -> bool {
         && target.host_str() == Some("tauri.localhost"))
         || (target.scheme() == "tauri" && target.host_str() == Some("localhost"));
     packaged_origin
-        && matches!(target.path(), "/" | "/index.html")
+        && matches!(target.path(), "" | "/" | "/index.html")
         && target.query().is_none()
         && target.fragment().is_none()
 }
@@ -217,7 +243,7 @@ fn resolve_node_path(resource_dir: &Path) -> Result<PathBuf, String> {
         return Ok(bundled);
     }
     Err(format!(
-        "official Node sidecar is missing: {}",
+        "official Node executable is missing: {}",
         bundled.display()
     ))
 }
@@ -276,6 +302,51 @@ fn transition(
     );
 }
 
+/// 仅当 generation 仍处于等待阶段时发布计时器状态，拒绝迟到 timer。
+fn transition_waiting_generation(
+    app: &AppHandle,
+    state: &RuntimeState,
+    generation: u64,
+    lifecycle: LifecycleState,
+    message: impl Into<String>,
+) -> bool {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return false;
+    };
+    if !is_current(state, generation) {
+        return false;
+    }
+    let waiting = state.snapshot.lock().ok().is_some_and(|snapshot| {
+        matches!(
+            snapshot.state,
+            LifecycleState::WaitingForClient | LifecycleState::ProlongedStartup
+        )
+    });
+    if !waiting || !is_current(state, generation) {
+        return false;
+    }
+    transition(app, state, lifecycle, message);
+    true
+}
+
+/// 仅为当前 generation 发布生命周期快照，拒绝迟到进程事件。
+fn transition_generation(
+    app: &AppHandle,
+    state: &RuntimeState,
+    generation: u64,
+    lifecycle: LifecycleState,
+    message: impl Into<String>,
+) -> bool {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return false;
+    };
+    if !is_current(state, generation) {
+        return false;
+    }
+    transition(app, state, lifecycle, message);
+    true
+}
+
 /// 判断某个启动轮次是否仍然有效。
 fn is_current(state: &RuntimeState, generation: u64) -> bool {
     !state.shutting_down.load(Ordering::Acquire)
@@ -292,39 +363,159 @@ fn parse_loopback_address(origin: &str) -> Result<SocketAddr, ReadinessWaitError
         .map_err(|_| ReadinessWaitError::ProbeFailed)
 }
 
-/// 将当前轮次的 Host origin 与 generation 一起保存，供页面加载回调进行竞态校验。
-fn set_host_origin(state: &RuntimeState, generation: u64, origin: String) {
-    if !is_current(state, generation) {
-        return;
+/// 清除 Host readiness 与 WebView 观察令牌，使迟到事件无法穿过 Retry 边界。
+fn reset_host_observation(state: &RuntimeState) {
+    if let Ok(mut current) = state.host_origin.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = state.host_generation.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = state.webview_navigation_generation.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = state.webview_navigation_url.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = state.webview_load_generation.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = state.webview_load_url.lock() {
+        *current = None;
+    }
+}
+
+/// 在 HTTP readiness 二次确认后才公布当前 Host origin。
+fn set_ready_host_origin(state: &RuntimeState, generation: u64, origin: String) -> bool {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return false;
+    };
+    if !current_cli_is_alive(state, generation) {
+        return false;
     }
     if let Ok(mut current) = state.host_origin.lock() {
         *current = Some(origin);
+    } else {
+        return false;
     }
     if let Ok(mut current) = state.host_generation.lock() {
         *current = Some(generation);
+        true
+    } else {
+        reset_host_observation(state);
+        false
+    }
+}
+
+/// 确认该 generation 仍是当前轮次，且拥有的 CLI leader 尚未退出。
+fn current_cli_is_alive(state: &RuntimeState, generation: u64) -> bool {
+    if !is_current(state, generation) {
+        return false;
+    }
+    let process = state
+        .process
+        .lock()
+        .ok()
+        .and_then(|current| current.as_ref().map(Arc::clone));
+    process.is_some_and(|process| {
+        process.generation() == generation
+            && process
+                .try_exit(generation)
+                .is_ok_and(|exit| exit.is_none())
+    })
+}
+
+/// 判断 Started 事件是否精确命中当前 generation 的 fragment URL。
+fn navigation_event_matches(
+    current_generation: u64,
+    pending_generation: Option<u64>,
+    pending_url: Option<&str>,
+    loaded_url: &str,
+) -> bool {
+    pending_generation == Some(current_generation) && pending_url == Some(loaded_url)
+}
+
+/// 用纯值判断 WebView Finished 是否属于当前受控 fragment 加载。
+fn is_current_host_page_event(
+    current_generation: u64,
+    host_generation: Option<u64>,
+    load_generation: Option<u64>,
+    lifecycle: LifecycleState,
+    cli_alive: bool,
+    load_url: Option<&str>,
+    loaded_url: &tauri::Url,
+) -> bool {
+    host_generation == Some(current_generation)
+        && load_generation == Some(current_generation)
+        && cli_alive
+        && matches!(
+            lifecycle,
+            LifecycleState::WaitingForClient | LifecycleState::ProlongedStartup
+        )
+        && load_url == Some(loaded_url.as_str())
+}
+
+/// 把 Host Started 绑定到受控 fragment URL；应用在 Ready 前改 hash 不能替代该精确 token。
+fn begin_client_page_load(state: &RuntimeState, loaded_url: &tauri::Url) {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return;
+    };
+    let generation = state.generation.load(Ordering::Acquire);
+    let expected = state
+        .webview_navigation_generation
+        .lock()
+        .ok()
+        .and_then(|value| *value);
+    let expected_url = state
+        .webview_navigation_url
+        .lock()
+        .ok()
+        .and_then(|value| value.clone());
+    if !navigation_event_matches(
+        generation,
+        expected,
+        expected_url.as_deref(),
+        loaded_url.as_str(),
+    ) || !current_cli_is_alive(state, generation)
+    {
+        return;
+    }
+    if let Ok(mut loading) = state.webview_load_generation.lock() {
+        *loading = Some(generation);
+    }
+    if let Ok(mut loading_url) = state.webview_load_url.lock() {
+        *loading_url = Some(loaded_url.to_string());
     }
 }
 
 /// 判断实际完成加载的页面是否属于当前启动轮次等待中的 Host 客户端。
 fn is_current_host_page(state: &RuntimeState, loaded_url: &tauri::Url) -> bool {
     let generation = state.generation.load(Ordering::Acquire);
-    let origin = state
-        .host_origin
+    let host_generation = state.host_generation.lock().ok().and_then(|value| *value);
+    let load_generation = state
+        .webview_load_generation
+        .lock()
+        .ok()
+        .and_then(|value| *value);
+    let load_url = state
+        .webview_load_url
         .lock()
         .ok()
         .and_then(|value| value.clone());
-    let origin_generation = state.host_generation.lock().ok().and_then(|value| *value);
-    let waiting_for_client = state.snapshot.lock().ok().is_some_and(|snapshot| {
-        matches!(
-            snapshot.state,
-            LifecycleState::WaitingForClient | LifecycleState::ProlongedStartup
-        )
-    });
-    origin_generation == Some(generation)
-        && waiting_for_client
-        && origin.is_some_and(|origin| {
-            loaded_url.as_str().trim_end_matches('/') == origin.trim_end_matches('/')
-        })
+    let lifecycle = state
+        .snapshot
+        .lock()
+        .map(|snapshot| snapshot.state)
+        .unwrap_or(LifecycleState::Failed);
+    is_current_host_page_event(
+        generation,
+        host_generation,
+        load_generation,
+        lifecycle,
+        current_cli_is_alive(state, generation),
+        load_url.as_deref(),
+        loaded_url,
+    )
 }
 
 /// 仅在 WebView 完成页面加载后推进 client readiness，避免 Started 事件过早宣告 Ready。
@@ -334,6 +525,9 @@ fn is_finished_page_load(event: PageLoadEvent) -> bool {
 
 /// 在主 WebView 确认当前 Host 页面加载完成后，才对启动页发布客户端 Ready。
 fn mark_client_page_loaded(app: &AppHandle, state: &RuntimeState, loaded_url: &tauri::Url) {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return;
+    };
     if !is_current_host_page(state, loaded_url) {
         return;
     }
@@ -342,54 +536,390 @@ fn mark_client_page_loaded(app: &AppHandle, state: &RuntimeState, loaded_url: &t
         "event": "client-page-loaded",
         "url": loaded_url.as_str()
     }));
+    if let Ok(mut navigation) = state.webview_navigation_generation.lock() {
+        *navigation = None;
+    }
+    if let Ok(mut loading) = state.webview_load_generation.lock() {
+        *loading = None;
+    }
+    if let Ok(mut navigation_url) = state.webview_navigation_url.lock() {
+        *navigation_url = None;
+    }
+    if let Ok(mut loading_url) = state.webview_load_url.lock() {
+        *loading_url = None;
+    }
     transition(app, state, LifecycleState::Ready, "Ready.");
 }
 
-/// 判断 loopback HTTP 响应是否确认可提供 HTML 客户端页面。
-fn is_html_client_response(response: &[u8]) -> bool {
-    let Ok(response) = std::str::from_utf8(response) else {
-        return false;
-    };
-    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
-        return false;
-    };
-    let mut lines = headers.lines();
-    let Some(status) = lines.next() else {
-        return false;
-    };
-    let successful_status = status
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse::<u16>().ok())
-        .is_some_and(|code| (200..300).contains(&code));
-    successful_status
-        && lines.any(|line| {
-            line.split_once(':').is_some_and(|(name, value)| {
-                name.eq_ignore_ascii_case("content-type")
-                    && value.trim().to_ascii_lowercase().starts_with("text/html")
-            })
-        })
-        && !body.trim().is_empty()
+/// HTTP 响应在有界读取中的严格 framing 判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpResponseState {
+    NeedMore,
+    Ready,
+    Reject,
 }
 
-/// 通过一次受限的 HTTP GET 确认根页面可服务，而非仅确认 TCP 端口被监听。
-fn probe_client_page(address: SocketAddr) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(500)) else {
+/// 判断一个字节是否属于 RFC 9110 token 字符。
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// 判断字节串是否为非空 RFC 9110 token。
+fn is_http_token(value: &[u8]) -> bool {
+    !value.is_empty() && value.iter().copied().all(is_http_token_byte)
+}
+
+/// 按 grammar 扫描 chunk extensions，支持 quoted-string 内的分号和安全转义。
+fn valid_chunk_extensions(extensions: &[u8]) -> bool {
+    let mut offset = 0_usize;
+    while offset < extensions.len() {
+        if extensions[offset] != b';' {
+            return false;
+        }
+        offset += 1;
+        let name_start = offset;
+        while offset < extensions.len() && is_http_token_byte(extensions[offset]) {
+            offset += 1;
+        }
+        if offset == name_start {
+            return false;
+        }
+        if offset == extensions.len() || extensions[offset] == b';' {
+            continue;
+        }
+        if extensions[offset] != b'=' {
+            return false;
+        }
+        offset += 1;
+        if offset == extensions.len() {
+            return false;
+        }
+        if extensions[offset] != b'"' {
+            let value_start = offset;
+            while offset < extensions.len() && is_http_token_byte(extensions[offset]) {
+                offset += 1;
+            }
+            if offset == value_start || (offset < extensions.len() && extensions[offset] != b';') {
+                return false;
+            }
+            continue;
+        }
+        offset += 1;
+        let mut closed = false;
+        while offset < extensions.len() {
+            let byte = extensions[offset];
+            offset += 1;
+            if byte == b'"' {
+                closed = true;
+                break;
+            }
+            if byte == b'\\' {
+                if offset == extensions.len()
+                    || !extensions[offset].is_ascii()
+                    || extensions[offset].is_ascii_control()
+                {
+                    return false;
+                }
+                offset += 1;
+            } else if byte.is_ascii_control() {
+                return false;
+            }
+        }
+        if !closed || (offset < extensions.len() && extensions[offset] != b';') {
+            return false;
+        }
+    }
+    true
+}
+
+/// 解析合法的十六进制 chunk size，并保守校验可选 extension。
+fn parse_chunk_size(line: &[u8]) -> Option<usize> {
+    if line.is_empty() || line.len() > HTTP_METADATA_CAP {
+        return None;
+    }
+    let extension_offset = line
+        .iter()
+        .position(|byte| *byte == b';')
+        .unwrap_or(line.len());
+    let raw_size = &line[..extension_offset];
+    if raw_size.is_empty() || raw_size.len() > 16 || !raw_size.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    if !valid_chunk_extensions(&line[extension_offset..]) {
+        return None;
+    }
+    usize::from_str_radix(std::str::from_utf8(raw_size).ok()?, 16).ok()
+}
+
+/// 校验 trailer 行，拒绝折行、控制字符和会改变 framing 的字段。
+fn valid_chunk_trailer(line: &[u8]) -> bool {
+    let Some(separator) = line.iter().position(|byte| *byte == b':') else {
         return false;
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let name = &line[..separator];
+    let value = &line[separator + 1..];
+    is_http_token(name)
+        && !name.eq_ignore_ascii_case(b"content-length")
+        && !name.eq_ignore_ascii_case(b"transfer-encoding")
+        && value
+            .iter()
+            .all(|byte| *byte == b'\t' || !byte.is_ascii_control())
+}
+
+/// 在不分配解码缓冲区的前提下严格解析完整 chunked body。
+fn inspect_chunked_body(body: &[u8], eof: bool) -> HttpResponseState {
+    let incomplete = || {
+        if eof || body.len() == HTTP_WIRE_CAP {
+            HttpResponseState::Reject
+        } else {
+            HttpResponseState::NeedMore
+        }
+    };
+    let mut offset = 0_usize;
+    let mut decoded = 0_usize;
+    let mut nonempty = false;
+    loop {
+        let Some(line_end) = body[offset..]
+            .windows(2)
+            .position(|bytes| bytes == b"\r\n")
+            .map(|relative| offset + relative)
+        else {
+            return incomplete();
+        };
+        if line_end - offset > HTTP_METADATA_CAP {
+            return HttpResponseState::Reject;
+        }
+        let Some(chunk_size) = parse_chunk_size(&body[offset..line_end]) else {
+            return HttpResponseState::Reject;
+        };
+        offset = line_end + 2;
+        if chunk_size == 0 {
+            let trailer_start = offset;
+            loop {
+                let Some(trailer_end) = body[offset..]
+                    .windows(2)
+                    .position(|bytes| bytes == b"\r\n")
+                    .map(|relative| offset + relative)
+                else {
+                    return incomplete();
+                };
+                if trailer_end - trailer_start > HTTP_METADATA_CAP {
+                    return HttpResponseState::Reject;
+                }
+                if trailer_end == offset {
+                    offset += 2;
+                    return if offset == body.len() && nonempty {
+                        HttpResponseState::Ready
+                    } else {
+                        HttpResponseState::Reject
+                    };
+                }
+                if !valid_chunk_trailer(&body[offset..trailer_end]) {
+                    return HttpResponseState::Reject;
+                }
+                offset = trailer_end + 2;
+            }
+        }
+        let Some(next_decoded) = decoded.checked_add(chunk_size) else {
+            return HttpResponseState::Reject;
+        };
+        if next_decoded > HTTP_BODY_CAP {
+            return HttpResponseState::Reject;
+        }
+        let Some(data_end) = offset.checked_add(chunk_size) else {
+            return HttpResponseState::Reject;
+        };
+        let Some(framed_end) = data_end.checked_add(2) else {
+            return HttpResponseState::Reject;
+        };
+        if framed_end > body.len() {
+            return incomplete();
+        }
+        if &body[data_end..framed_end] != b"\r\n" {
+            return HttpResponseState::Reject;
+        }
+        nonempty |= body[offset..data_end]
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace());
+        decoded = next_decoded;
+        offset = framed_end;
+    }
+}
+
+/// 判断已读响应是否具有完整、有界且非空的 HTML body。
+fn inspect_http_client_response(response: &[u8], eof: bool) -> HttpResponseState {
+    if response.len() > HTTP_WIRE_CAP {
+        return HttpResponseState::Reject;
+    }
+    let Some(header_offset) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return if eof || response.len() > HTTP_METADATA_CAP {
+            HttpResponseState::Reject
+        } else {
+            HttpResponseState::NeedMore
+        };
+    };
+    if header_offset > HTTP_METADATA_CAP {
+        return HttpResponseState::Reject;
+    }
+    let body_offset = header_offset + 4;
+    let Ok(headers) = std::str::from_utf8(&response[..header_offset]) else {
+        return HttpResponseState::Reject;
+    };
+    let mut lines = headers.split("\r\n");
+    let Some(status) = lines.next() else {
+        return HttpResponseState::Reject;
+    };
+    let mut status_fields = status.split_ascii_whitespace();
+    let successful_status = status_fields.next() == Some("HTTP/1.1")
+        && status_fields
+            .next()
+            .filter(|code| code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|code| code.parse::<u16>().ok())
+            .is_some_and(|code| (200..300).contains(&code));
+    if !successful_status {
+        return HttpResponseState::Reject;
+    }
+    let mut content_types = Vec::new();
+    let mut content_lengths = Vec::new();
+    let mut transfer_encodings = Vec::new();
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return HttpResponseState::Reject;
+        };
+        if !is_http_token(name.as_bytes())
+            || value
+                .bytes()
+                .any(|byte| byte != b'\t' && byte.is_ascii_control())
+        {
+            return HttpResponseState::Reject;
+        }
+        if name.eq_ignore_ascii_case("content-type") {
+            content_types.push(value.trim());
+        } else if name.eq_ignore_ascii_case("content-length") {
+            content_lengths.push(value.trim());
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encodings.push(value.trim());
+        }
+    }
+    let html_type = content_types.len() == 1
+        && content_types[0]
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"));
+    if !html_type || content_lengths.len() > 1 || transfer_encodings.len() > 1 {
+        return HttpResponseState::Reject;
+    }
+    if let Some(transfer_encoding) = transfer_encodings.first() {
+        let mut codings = transfer_encoding.split(',').map(str::trim);
+        if !content_lengths.is_empty()
+            || !codings
+                .next()
+                .is_some_and(|coding| coding.eq_ignore_ascii_case("chunked"))
+            || codings.next().is_some()
+        {
+            return HttpResponseState::Reject;
+        }
+        return inspect_chunked_body(&response[body_offset..], eof);
+    }
+    let body_nonempty = |body: &[u8]| body.iter().any(|byte| !byte.is_ascii_whitespace());
+    if let Some(raw_length) = content_lengths.first() {
+        if raw_length.is_empty() || !raw_length.bytes().all(|byte| byte.is_ascii_digit()) {
+            return HttpResponseState::Reject;
+        }
+        let Ok(length) = raw_length.parse::<usize>() else {
+            return HttpResponseState::Reject;
+        };
+        let Some(expected_total) = body_offset.checked_add(length) else {
+            return HttpResponseState::Reject;
+        };
+        if length == 0 || length > HTTP_BODY_CAP || response.len() > expected_total {
+            return HttpResponseState::Reject;
+        }
+        if response.len() < expected_total {
+            return if eof {
+                HttpResponseState::Reject
+            } else {
+                HttpResponseState::NeedMore
+            };
+        }
+        return if body_nonempty(&response[body_offset..expected_total]) {
+            HttpResponseState::Ready
+        } else {
+            HttpResponseState::Reject
+        };
+    }
+    if response.len() - body_offset > HTTP_BODY_CAP {
+        return HttpResponseState::Reject;
+    }
+    if !eof {
+        return HttpResponseState::NeedMore;
+    }
+    if body_nonempty(&response[body_offset..]) {
+        HttpResponseState::Ready
+    } else {
+        HttpResponseState::Reject
+    }
+}
+
+/// 兼容已有纯值测试，把输入视为已经 EOF 的完整响应。
+#[cfg(test)]
+fn is_html_client_response(response: &[u8]) -> bool {
+    inspect_http_client_response(response, true) == HttpResponseState::Ready
+}
+
+/// 在一个绝对 deadline 内读取并严格验证根页面响应。
+fn probe_client_page_with_timeout(address: SocketAddr, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
+        return false;
+    };
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {address}\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
     );
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return false;
+    };
+    let _ = stream.set_write_timeout(Some(remaining));
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }
     let mut response = Vec::with_capacity(4096);
     let mut buffer = [0_u8; 4096];
-    while response.len() < 64 * 1024 {
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
+    loop {
+        match inspect_http_client_response(&response, false) {
+            HttpResponseState::Ready => return true,
+            HttpResponseState::Reject => return false,
+            HttpResponseState::NeedMore => {}
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        if remaining.is_zero() || response.len() == HTTP_WIRE_CAP {
+            return false;
+        }
+        let _ = stream.set_read_timeout(Some(remaining));
+        let available = (HTTP_WIRE_CAP - response.len()).min(buffer.len());
+        match stream.read(&mut buffer[..available]) {
+            Ok(0) => {
+                return inspect_http_client_response(&response, true) == HttpResponseState::Ready;
+            }
             Ok(read) => response.extend_from_slice(&buffer[..read]),
             Err(error)
                 if matches!(
@@ -397,12 +927,27 @@ fn probe_client_page(address: SocketAddr) -> bool {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                break
+                return false;
             }
             Err(_) => return false,
         }
     }
-    is_html_client_response(&response)
+}
+
+/// 使用生产小上限执行一次根页面探测。
+fn probe_client_page(address: SocketAddr) -> bool {
+    probe_client_page_with_timeout(address, HTTP_PROBE_TIMEOUT)
+}
+
+/// 生产始终使用 30 秒，仅 debug+wdio 允许缩短 Prolonged 门槛以消除 E2E 固定等待。
+fn prolonged_startup_after() -> Duration {
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    if let Ok(milliseconds) = std::env::var("DSH_TEST_PROLONGED_AFTER_MS") {
+        if let Ok(milliseconds) = milliseconds.parse::<u64>() {
+            return Duration::from_millis(milliseconds.max(1));
+        }
+    }
+    PROLONGED_STARTUP_AFTER
 }
 
 /// 等待 Harness 根页面可通过 HTTP 提供 HTML；超过 30 秒只进入可恢复状态，不自动失败。
@@ -424,12 +969,13 @@ fn wait_for_web_listener(
         },
         || Ok(probe_client_page(address)),
         attempt_started,
-        PROLONGED_STARTUP_AFTER,
+        prolonged_startup_after(),
         Duration::from_millis(100),
         || {
-            transition(
+            transition_waiting_generation(
                 app,
                 state,
+                generation,
                 LifecycleState::ProlongedStartup,
                 "Startup is taking longer than expected. You can retry when ready.",
             );
@@ -514,8 +1060,9 @@ fn spawn_direct_cli(
     let process = spawn_cli(&plan, generation).map_err(map_supervisor_error)?;
     #[cfg(all(debug_assertions, feature = "wdio"))]
     record_wdio_event(serde_json::json!({
-        "event": "sidecar-spawned",
+        "event": "cli-spawned",
         "generation": generation,
+        "pid": process.pid().ok(),
         "nodePathPrepended": true
     }));
     if !is_current(state, generation) {
@@ -599,11 +1146,7 @@ fn record_cleanup_failure(state: &RuntimeState, process: &CliProcess) {
 /// 对一个 CLI generation 执行八秒宽限停止并持久保留监督结果。
 fn stop_cli(state: &RuntimeState, process: &Arc<CliProcess>) -> Result<StopReport, String> {
     let current_generation = state.generation.load(Ordering::Acquire);
-    let report = match process.stop(
-        current_generation,
-        SIDECAR_STOP_AFTER,
-        SIDECAR_FORCE_CONFIRM_AFTER,
-    ) {
+    let report = match process.stop(current_generation, CLI_STOP_AFTER, CLI_FORCE_CONFIRM_AFTER) {
         Ok(report) => report,
         Err(error) => {
             record_cleanup_failure(state, process);
@@ -617,10 +1160,16 @@ fn stop_cli(state: &RuntimeState, process: &Arc<CliProcess>) -> Result<StopRepor
         };
         record_process_observation(state, process, exit, Some(outcome));
     }
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    record_wdio_event(serde_json::json!({
+        "event": "cli-cleaned",
+        "generation": process.generation(),
+        "pid": process.pid().ok()
+    }));
     Ok(report)
 }
-/// 将窗口导航到打包启动页，供失败和崩溃恢复复用。
-fn navigate_to_startup(app: &AppHandle, state: &RuntimeState) {
+/// 将窗口导航到打包启动页，主线程执行前再次校验 generation。
+fn navigate_to_startup(app: &AppHandle, state: &RuntimeState, generation: u64) {
     let Some(raw_url) = state
         .startup_url
         .lock()
@@ -629,14 +1178,25 @@ fn navigate_to_startup(app: &AppHandle, state: &RuntimeState) {
     else {
         return;
     };
-    let Ok(url) = raw_url.parse() else { return };
+    let Ok(url) = raw_url.parse::<tauri::Url>() else {
+        return;
+    };
     let app = app.clone();
     let app_for_task = app.clone();
     let _ = app.run_on_main_thread(move || {
+        let state = app_for_task.state::<Arc<RuntimeState>>();
+        let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+            return;
+        };
+        let Ok(_gate) = state.generation_event_gate.lock() else {
+            return;
+        };
+        if !is_current(&state, generation) {
+            return;
+        }
+        reset_host_observation(&state);
+        drop(_gate);
         if let Some(window) = app_for_task.get_webview_window("main") {
-            if window.url().is_ok_and(|current| current == url) {
-                return;
-            }
             let result = window.navigate(url.clone());
             #[cfg(not(all(debug_assertions, feature = "wdio")))]
             let _ = result;
@@ -650,16 +1210,55 @@ fn navigate_to_startup(app: &AppHandle, state: &RuntimeState) {
     });
 }
 
-/// 将窗口导航到当前启动轮次的 Host 页面。
-fn navigate_to_host(app: &AppHandle, origin: &str) {
-    let Ok(url) = origin.parse::<tauri::Url>() else {
+/// 将窗口导航到当前启动轮次的 Host 页面，拒绝迟到主线程任务。
+fn navigate_to_host(app: &AppHandle, generation: u64, origin: &str) {
+    let Ok(mut url) = origin.parse::<tauri::Url>() else {
         return;
     };
+    url.set_fragment(Some(&format!("dsh-desktop-generation={generation}")));
+    let navigation_url = url.to_string();
     let app = app.clone();
     let app_for_task = app.clone();
     let _ = app.run_on_main_thread(move || {
+        let state = app_for_task.state::<Arc<RuntimeState>>();
+        let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+            return;
+        };
+        let Ok(_gate) = state.generation_event_gate.lock() else {
+            return;
+        };
+        let host_generation = state.host_generation.lock().ok().and_then(|value| *value);
+        if host_generation != Some(generation) || !current_cli_is_alive(&state, generation) {
+            return;
+        }
+        if let Ok(mut expected) = state.webview_navigation_generation.lock() {
+            *expected = Some(generation);
+        } else {
+            return;
+        }
+        if let Ok(mut expected_url) = state.webview_navigation_url.lock() {
+            *expected_url = Some(navigation_url.clone());
+        } else {
+            reset_host_observation(&state);
+            return;
+        }
+        if let Ok(mut loading) = state.webview_load_generation.lock() {
+            *loading = None;
+        }
+        if let Ok(mut loading_url) = state.webview_load_url.lock() {
+            *loading_url = None;
+        }
+        drop(_gate);
         if let Some(window) = app_for_task.get_webview_window("main") {
             let result = window.navigate(url.clone());
+            if result.is_err() {
+                if let Ok(mut expected) = state.webview_navigation_generation.lock() {
+                    *expected = None;
+                }
+                if let Ok(mut expected_url) = state.webview_navigation_url.lock() {
+                    *expected_url = None;
+                }
+            }
             #[cfg(not(all(debug_assertions, feature = "wdio")))]
             let _ = result;
             #[cfg(all(debug_assertions, feature = "wdio"))]
@@ -674,15 +1273,13 @@ fn navigate_to_host(app: &AppHandle, origin: &str) {
 
 /// 记录启动失败并恢复到统一启动页。
 fn fail_attempt(app: &AppHandle, state: &RuntimeState, generation: u64, code: DiagnosticCode) {
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return;
+    };
     if !is_current(state, generation) {
         return;
     }
-    if let Ok(mut origin) = state.host_origin.lock() {
-        *origin = None;
-    }
-    if let Ok(mut origin_generation) = state.host_generation.lock() {
-        *origin_generation = None;
-    }
+    reset_host_observation(state);
     if let Ok(mut last_error) = state.last_error.lock() {
         *last_error = Some(code);
     }
@@ -690,9 +1287,10 @@ fn fail_attempt(app: &AppHandle, state: &RuntimeState, generation: u64, code: Di
         app,
         state,
         LifecycleState::Failed,
-        "Startup failed. Retry, copy diagnostics, or open logs.",
+        "Startup failed. Retry or copy diagnostics.",
     );
-    navigate_to_startup(app, state);
+    drop(_gate);
+    navigate_to_startup(app, state, generation);
 }
 
 /// 仅在状态仍指向同一个 CLI 时清除共享句柄，避免误删替代轮次。
@@ -731,14 +1329,17 @@ fn abort_attempt(
     );
 }
 
+/// 只有当前 generation 的非预期退出才应转入 Failed。
+fn exit_requires_failure(
+    process_generation: u64,
+    current_generation: u64,
+    reason: ExitReason,
+) -> bool {
+    process_generation == current_generation && reason == ExitReason::Unexpected
+}
+
 /// 执行 direct CLI 启动轮次，并只从进程、固定 HTTP 与 WebView 观察生命周期。
 fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
-    transition(
-        &app,
-        &state,
-        LifecycleState::StartingSidecar,
-        "Starting local Host.",
-    );
     let attempt_started = state
         .attempt_started
         .lock()
@@ -752,13 +1353,15 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
             return;
         }
     };
-    set_host_origin(&state, generation, HOST_ORIGIN.into());
-    transition(
+    if !transition_generation(
         &app,
         &state,
+        generation,
         LifecycleState::WaitingForClient,
         "Waiting for client to start.",
-    );
+    ) {
+        return;
+    }
     match wait_for_web_listener(
         &app,
         &state,
@@ -768,19 +1371,38 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
         attempt_started,
     ) {
         Ok(()) => {
+            if !set_ready_host_origin(&state, generation, HOST_ORIGIN.into()) {
+                if is_current(&state, generation) {
+                    abort_attempt(
+                        &app,
+                        &state,
+                        generation,
+                        &process,
+                        DiagnosticCode::UnexpectedExit,
+                    );
+                }
+                return;
+            }
             #[cfg(all(debug_assertions, feature = "wdio"))]
             record_wdio_event(serde_json::json!({
                 "event": "client-page-served",
                 "origin": HOST_ORIGIN
             }));
-            navigate_to_host(&app, HOST_ORIGIN);
+            navigate_to_host(&app, generation, HOST_ORIGIN);
         }
         Err(ReadinessWaitError::Cancelled) => return,
         Err(ReadinessWaitError::ProcessExited) => {
+            if !is_current(&state, generation) {
+                return;
+            }
             match process.try_exit(state.generation.load(Ordering::Acquire)) {
                 Ok(Some(exit)) => {
                     record_process_observation(&state, &process, &exit, None);
-                    if exit.reason == ExitReason::StaleGeneration {
+                    if !exit_requires_failure(
+                        process.generation(),
+                        state.generation.load(Ordering::Acquire),
+                        exit.reason,
+                    ) {
                         return;
                     }
                     abort_attempt(
@@ -802,6 +1424,9 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
             return;
         }
         Err(ReadinessWaitError::ProbeFailed) => {
+            if !is_current(&state, generation) {
+                return;
+            }
             abort_attempt(
                 &app,
                 &state,
@@ -820,9 +1445,10 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
         match process.try_exit(state.generation.load(Ordering::Acquire)) {
             Ok(Some(exit)) => {
                 record_process_observation(&state, &process, &exit, None);
-                if matches!(
+                if !exit_requires_failure(
+                    process.generation(),
+                    state.generation.load(Ordering::Acquire),
                     exit.reason,
-                    ExitReason::StaleGeneration | ExitReason::Requested
                 ) {
                     return;
                 }
@@ -851,34 +1477,70 @@ fn run_attempt(app: AppHandle, state: Arc<RuntimeState>, generation: u64) {
 }
 /// 启动一个新的、唯一的 CLI 启动轮次。
 fn start_attempt(app: &AppHandle, state: &Arc<RuntimeState>) {
+    let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+        return;
+    };
+    let Ok(_gate) = state.generation_event_gate.lock() else {
+        return;
+    };
     let generation = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
     if let Ok(mut started) = state.attempt_started.lock() {
         *started = Some(Instant::now());
     }
-    if let Ok(mut origin) = state.host_origin.lock() {
-        *origin = None;
-    }
-    if let Ok(mut origin_generation) = state.host_generation.lock() {
-        *origin_generation = None;
-    }
+    reset_host_observation(state);
     transition(app, state, LifecycleState::Starting, "Starting.");
+    drop(_gate);
     let app = app.clone();
     let state = Arc::clone(state);
     thread::spawn(move || run_attempt(app, state, generation));
 }
 
+/// 只允许用户在失败或超时但仍可恢复的状态发起 Retry。
+fn retry_allowed(lifecycle: LifecycleState) -> bool {
+    matches!(
+        lifecycle,
+        LifecycleState::Failed | LifecycleState::ProlongedStartup
+    )
+}
+
 /// 请求一次串行重试；旧进程回收完成前绝不启动新 Host。
 fn request_retry(app: &AppHandle, state: &Arc<RuntimeState>) {
-    if state.shutting_down.load(Ordering::Acquire) || state.retrying.swap(true, Ordering::AcqRel) {
+    if state.shutting_down.load(Ordering::Acquire)
+        || !state
+            .snapshot
+            .lock()
+            .ok()
+            .is_some_and(|snapshot| retry_allowed(snapshot.state))
+        || state.retrying.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+        state.retrying.store(false, Ordering::Release);
+        return;
+    };
+    let Ok(_event_gate) = state.generation_event_gate.lock() else {
+        state.retrying.store(false, Ordering::Release);
+        return;
+    };
+    if !state
+        .snapshot
+        .lock()
+        .ok()
+        .is_some_and(|snapshot| retry_allowed(snapshot.state))
+    {
+        state.retrying.store(false, Ordering::Release);
         return;
     }
     let cleanup_generation = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
+    reset_host_observation(state);
     transition(
         app,
         state,
         LifecycleState::Stopping,
         "Stopping the previous Host before retry.",
     );
+    drop(_event_gate);
     let app = app.clone();
     let state = Arc::clone(state);
     thread::spawn(move || {
@@ -923,8 +1585,18 @@ fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>) {
     if state.shutting_down.swap(true, Ordering::AcqRel) {
         return;
     }
+    let Ok(_navigation_gate) = state.navigation_operation_gate.lock() else {
+        app.exit(1);
+        return;
+    };
+    let Ok(_event_gate) = state.generation_event_gate.lock() else {
+        app.exit(1);
+        return;
+    };
     state.generation.fetch_add(1, Ordering::AcqRel);
+    reset_host_observation(state);
     transition(app, state, LifecycleState::Stopping, "Stopping local Host.");
+    drop(_event_gate);
     let app = app.clone();
     let state = Arc::clone(state);
     thread::spawn(move || {
@@ -962,6 +1634,14 @@ fn startup_snapshot(state: State<'_, Arc<RuntimeState>>) -> LifecycleSnapshot {
 /// 处理启动页的 Retry 命令。
 #[tauri::command]
 fn startup_retry(app: AppHandle, state: State<'_, Arc<RuntimeState>>) -> Result<(), String> {
+    if !state
+        .snapshot
+        .lock()
+        .ok()
+        .is_some_and(|snapshot| retry_allowed(snapshot.state))
+    {
+        return Err("Retry is only available after failure or prolonged startup.".into());
+    }
     request_retry(&app, state.inner());
     Ok(())
 }
@@ -1059,23 +1739,8 @@ fn startup_copy_diagnostics(
         .map_err(|error| error.to_string())
 }
 
-/// 在系统文件管理器中打开日志目录。
-#[tauri::command]
-fn startup_reveal_logs(app: AppHandle, state: State<'_, Arc<RuntimeState>>) -> Result<(), String> {
-    fs::create_dir_all(&state.logs_dir).map_err(|error| error.to_string())?;
-    #[cfg(all(debug_assertions, feature = "wdio"))]
-    if std::env::var_os("DSH_TEST_RECORD_FILE").is_some() {
-        record_wdio_event(serde_json::json!({ "event": "logs-opened" }));
-        return Ok(());
-    }
-    app.opener()
-        .open_path(state.logs_dir.to_string_lossy().to_string(), None::<String>)
-        .map_err(|error| error.to_string())
-}
-
-/// 创建 startup window，注册 Tauri IPC，并启动 sidecar 生命周期监督线程。
+/// 创建 Startup window，注册 Tauri IPC，并启动 direct CLI 生命周期监督线程。
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let logs_dir = app.path().app_data_dir()?.join("logs");
     let state = Arc::new(RuntimeState {
         snapshot: Mutex::new(LifecycleSnapshot {
             state: LifecycleState::Starting,
@@ -1083,9 +1748,15 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             origin: None,
         }),
         process: Mutex::new(None),
+        generation_event_gate: Mutex::new(()),
+        navigation_operation_gate: Mutex::new(()),
         lifecycle_gate: Mutex::new(()),
         host_origin: Mutex::new(None),
         host_generation: Mutex::new(None),
+        webview_navigation_generation: Mutex::new(None),
+        webview_navigation_url: Mutex::new(None),
+        webview_load_generation: Mutex::new(None),
+        webview_load_url: Mutex::new(None),
         startup_url: Mutex::new(None),
         generation: AtomicU64::new(0),
         retrying: AtomicBool::new(false),
@@ -1093,7 +1764,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         attempt_started: Mutex::new(None),
         node_path_status: Mutex::new("not-checked".into()),
         last_process_observation: Mutex::new(None),
-        logs_dir,
         last_error: Mutex::new(None),
     });
     app.manage(Arc::clone(&state));
@@ -1108,10 +1778,14 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let state = Arc::clone(&state);
                 let app = app.handle().clone();
                 move |_window, payload| {
+                    let url = payload.url();
+                    if payload.event() == PageLoadEvent::Started {
+                        begin_client_page_load(&state, url);
+                        return;
+                    }
                     if !is_finished_page_load(payload.event()) {
                         return;
                     }
-                    let url = payload.url();
                     let is_app_page = (url.scheme() == "http"
                         && url.host_str() == Some("tauri.localhost"))
                         || (url.scheme() == "tauri" && url.host_str() == Some("localhost"));
@@ -1163,6 +1837,18 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 }
             })
             .build()?;
+    if let Ok(url) = startup_window.url() {
+        if is_packaged_startup_url(&url) {
+            if let Ok(mut startup_url) = state.startup_url.lock() {
+                *startup_url = Some(url.to_string());
+            }
+        }
+        #[cfg(all(debug_assertions, feature = "wdio"))]
+        record_wdio_event(serde_json::json!({
+            "event": "startup-window-created",
+            "url": url.as_str()
+        }));
+    }
     let state_for_close = Arc::clone(&state);
     startup_window.on_window_event(move |event| match event {
         WindowEvent::CloseRequested { api, .. } => {
@@ -1220,8 +1906,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             startup_snapshot,
             startup_retry,
-            startup_copy_diagnostics,
-            startup_reveal_logs
+            startup_copy_diagnostics
         ]);
     #[cfg(feature = "wdio")]
     let builder = builder
@@ -1237,20 +1922,37 @@ fn main() {
 mod tests {
     use super::{
         build_startup_diagnostics, bundled_node_relative_path, decide_navigation,
-        is_current_host_page, is_finished_page_load, is_html_client_response,
-        is_packaged_startup_url, parse_loopback_address, DiagnosticCode, LifecycleSnapshot,
+        exit_requires_failure, inspect_http_client_response, is_current_host_page_event,
+        is_finished_page_load, is_html_client_response, is_packaged_startup_url,
+        navigation_event_matches, parse_loopback_address, probe_client_page_with_timeout,
+        retry_allowed, DiagnosticCode, ExitReason, HttpResponseState, LifecycleSnapshot,
         LifecycleState, NavigationDecision, PageLoadEvent, ProcessObservation, RuntimeState,
+        HTTP_BODY_CAP,
     };
-    use std::path::PathBuf;
+    use std::io::Write;
+    use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Mutex;
+    use std::thread;
+    use std::time::{Duration, Instant};
     /// 验证生命周期保留可恢复状态。
     #[test]
     fn lifecycle_has_recoverable_states() {
         assert_ne!(LifecycleState::Failed, LifecycleState::Ready);
         assert_ne!(LifecycleState::Stopping, LifecycleState::Starting);
+        assert_eq!(
+            LifecycleState::ALL,
+            [
+                LifecycleState::Starting,
+                LifecycleState::WaitingForClient,
+                LifecycleState::ProlongedStartup,
+                LifecycleState::Ready,
+                LifecycleState::Failed,
+                LifecycleState::Stopping,
+            ]
+        );
     }
-    /// 验证 sidecar 返回的规范 origin 尾斜杠不会破坏 TCP readiness 探测。
+    /// 验证固定 origin 的尾斜杠不会破坏 TCP readiness 探测。
     #[test]
     fn parses_loopback_origin_with_trailing_slash() {
         assert_eq!(
@@ -1271,6 +1973,75 @@ mod tests {
         assert!(!is_html_client_response(
             b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n\r\n<html></html>"
         ));
+        assert!(!is_html_client_response(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:3080/login\r\nContent-Type: text/html\r\n\r\n<html></html>"
+        ));
+        assert!(!is_html_client_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n   \n"
+        ));
+        assert!(!is_html_client_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/htmlfoo\r\nContent-Length: 6\r\n\r\n<html>"
+        ));
+        assert_eq!(
+            inspect_http_client_response(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 12\r\n\r\n<html>",
+                true,
+            ),
+            HttpResponseState::Reject
+        );
+        assert_eq!(
+            inspect_http_client_response(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\nd;node=\"yes;ok\"\r\n<html></html>\r\n0\r\nX-Node: yes\r\n\r\n",
+                true,
+            ),
+            HttpResponseState::Ready
+        );
+        for invalid in [
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\nz\r\n<html>\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n<html>\r\n0\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n<html>\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: gzip, chunked\r\n\r\n6\r\n<html>\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked, gzip\r\n\r\n6\r\n<html>\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n<html>\r\n0\r\n\r\n".as_slice(),
+        ] {
+            assert_eq!(
+                inspect_http_client_response(invalid, true),
+                HttpResponseState::Reject
+            );
+        }
+        let mut oversized = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n10001\r\n".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', HTTP_BODY_CAP + 1));
+        oversized.extend_from_slice(b"\r\n0\r\n\r\n");
+        assert_eq!(
+            inspect_http_client_response(&oversized, true),
+            HttpResponseState::Reject
+        );
+    }
+
+    /// 验证 slow-drip 响应无法通过重置单次 read timeout 超过绝对截止时间。
+    #[test]
+    fn client_probe_has_an_absolute_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            for byte in b"6\r\n<html>\r\n0\r\n\r\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        assert!(!probe_client_page_with_timeout(
+            address,
+            Duration::from_millis(100)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(400));
+        server.join().unwrap();
     }
 
     /// 验证启动页、当前 Host 和外链导航边界。
@@ -1299,6 +2070,9 @@ mod tests {
         ));
         assert!(is_packaged_startup_url(
             &"tauri://localhost/index.html".parse().unwrap()
+        ));
+        assert!(is_packaged_startup_url(
+            &"tauri://localhost".parse().unwrap()
         ));
         assert_eq!(
             decide_navigation("https://example.com", startup, host),
@@ -1331,9 +2105,15 @@ mod tests {
                 origin: None,
             }),
             process: Mutex::new(None),
+            generation_event_gate: Mutex::new(()),
+            navigation_operation_gate: Mutex::new(()),
             lifecycle_gate: Mutex::new(()),
             host_origin: Mutex::new(None),
             host_generation: Mutex::new(None),
+            webview_navigation_generation: Mutex::new(None),
+            webview_navigation_url: Mutex::new(None),
+            webview_load_generation: Mutex::new(None),
+            webview_load_url: Mutex::new(None),
             startup_url: Mutex::new(None),
             generation: AtomicU64::new(1),
             retrying: AtomicBool::new(false),
@@ -1347,7 +2127,6 @@ mod tests {
                 exit_reason: "unexpected".into(),
                 cleanup_outcome: Some("forced".into()),
             })),
-            logs_dir: PathBuf::from(r#"C:\Users\alice\secret"#),
             last_error: Mutex::new(Some(DiagnosticCode::SpawnFailed)),
         };
         let snapshot = LifecycleSnapshot {
@@ -1367,34 +2146,104 @@ mod tests {
     /// 验证旧轮次或非等待状态的 Host 页面加载不会将桌面端误标为 Ready。
     #[test]
     fn only_current_waiting_host_page_is_client_ready() {
-        let state = RuntimeState {
-            snapshot: Mutex::new(LifecycleSnapshot {
-                state: LifecycleState::WaitingForClient,
-                message: "ignored".into(),
-                origin: Some("http://127.0.0.1:1234/".into()),
-            }),
-            process: Mutex::new(None),
-            lifecycle_gate: Mutex::new(()),
-            host_origin: Mutex::new(Some("http://127.0.0.1:1234/".into())),
-            host_generation: Mutex::new(Some(3)),
-            startup_url: Mutex::new(None),
-            generation: AtomicU64::new(3),
-            retrying: AtomicBool::new(false),
-            shutting_down: AtomicBool::new(false),
-            attempt_started: Mutex::new(None),
-            node_path_status: Mutex::new("bundled".into()),
-            last_process_observation: Mutex::new(None),
-            logs_dir: PathBuf::from("logs"),
-            last_error: Mutex::new(None),
-        };
-        let current = "http://127.0.0.1:1234/".parse().unwrap();
-        let stale = "http://127.0.0.1:4321/".parse().unwrap();
-        assert!(is_current_host_page(&state, &current));
-        assert!(!is_current_host_page(&state, &stale));
-        state
-            .generation
-            .store(4, std::sync::atomic::Ordering::Release);
-        assert!(!is_current_host_page(&state, &current));
+        let current = "http://127.0.0.1:3080/#dsh-desktop-generation=3"
+            .parse()
+            .unwrap();
+        let stale = "http://127.0.0.1:3080/#dsh-desktop-generation=2"
+            .parse()
+            .unwrap();
+        assert!(is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            true,
+            Some("http://127.0.0.1:3080/#dsh-desktop-generation=3"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            4,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            true,
+            Some("http://127.0.0.1:3080/#dsh-desktop-generation=3"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            Some(2),
+            LifecycleState::WaitingForClient,
+            true,
+            Some("http://127.0.0.1:3080/#dsh-desktop-generation=3"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            false,
+            Some("http://127.0.0.1:3080/#dsh-desktop-generation=3"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::Ready,
+            true,
+            Some("http://127.0.0.1:3080/#dsh-desktop-generation=3"),
+            &current,
+        ));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            true,
+            Some("http://127.0.0.1:3080/#dsh-desktop-generation=3"),
+            &stale,
+        ));
+    }
+
+    /// 验证新导航已 arm 后，旧 fragment 的 Started/Finished 都不能借用当前 generation 发布 Ready。
+    #[test]
+    fn stale_page_events_cannot_claim_a_new_navigation_token() {
+        let old = "http://127.0.0.1:3080/#dsh-desktop-generation=2";
+        let current = "http://127.0.0.1:3080/#dsh-desktop-generation=3";
+        assert!(!navigation_event_matches(3, Some(3), Some(current), old));
+        assert!(!is_current_host_page_event(
+            3,
+            Some(3),
+            None,
+            LifecycleState::WaitingForClient,
+            true,
+            Some(current),
+            &old.parse().unwrap(),
+        ));
+        assert!(navigation_event_matches(3, Some(3), Some(current), current));
+        assert!(is_current_host_page_event(
+            3,
+            Some(3),
+            Some(3),
+            LifecycleState::WaitingForClient,
+            true,
+            Some(current),
+            &current.parse().unwrap(),
+        ));
+    }
+
+    /// 验证只有 Failed 和 Prolonged startup 允许 IPC Retry。
+    #[test]
+    fn retry_is_limited_to_recoverable_states() {
+        assert!(retry_allowed(LifecycleState::Failed));
+        assert!(retry_allowed(LifecycleState::ProlongedStartup));
+        assert!(!retry_allowed(LifecycleState::Starting));
+        assert!(!retry_allowed(LifecycleState::WaitingForClient));
+        assert!(!retry_allowed(LifecycleState::Ready));
+        assert!(!retry_allowed(LifecycleState::Stopping));
     }
 
     /// 验证 WebView Started 事件不会提前满足 client readiness。
@@ -1402,5 +2251,14 @@ mod tests {
     fn client_readiness_requires_finished_page_load() {
         assert!(!is_finished_page_load(PageLoadEvent::Started));
         assert!(is_finished_page_load(PageLoadEvent::Finished));
+    }
+
+    /// 验证 Ready 后当前 CLI 的非预期退出会失败，而预期或旧轮次退出被忽略。
+    #[test]
+    fn classifies_runtime_exit_against_current_generation() {
+        assert!(exit_requires_failure(3, 3, ExitReason::Unexpected));
+        assert!(!exit_requires_failure(3, 3, ExitReason::Requested));
+        assert!(!exit_requires_failure(2, 3, ExitReason::Unexpected));
+        assert!(!exit_requires_failure(2, 3, ExitReason::StaleGeneration));
     }
 }

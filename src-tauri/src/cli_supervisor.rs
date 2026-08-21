@@ -1266,6 +1266,15 @@ impl CliProcess {
         self.generation
     }
 
+    /// 返回 CLI leader PID，仅用于进程监督与 debug 测试 recorder。
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    pub(crate) fn pid(&self) -> Result<u32, String> {
+        self.child
+            .lock()
+            .map(|child| child.id())
+            .map_err(|_| "CLI child lock poisoned".to_string())
+    }
+
     /// 串行执行一次有界停止，避免 Retry 与窗口关闭重复操作进程树。
     pub(crate) fn with_stop_lock<T>(&self, stop: impl FnOnce() -> T) -> Result<T, String> {
         let _guard = self
