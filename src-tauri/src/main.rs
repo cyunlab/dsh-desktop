@@ -1743,7 +1743,7 @@ struct StartupDiagnostics {
     /// 当前编译目标 CPU 架构。
     arch: String,
     /// 当前生命周期状态。
-    lifecycle_state: String,
+    lifecycle_state: LifecycleState,
     /// 当前轮次已经运行的毫秒数。
     lifecycle_elapsed_ms: u128,
     /// 官方 Node/CLI 路径来源的脱敏状态。
@@ -1776,8 +1776,7 @@ fn build_startup_diagnostics(state: &RuntimeState, snapshot: &LifecycleSnapshot)
         node_version: BUNDLED_NODE_VERSION.into(),
         platform: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
-        lifecycle_state: serde_json::to_string(&snapshot.state)
-            .unwrap_or_else(|_| "unknown".into()),
+        lifecycle_state: snapshot.state,
         lifecycle_elapsed_ms: elapsed,
         cli_path_status: state
             .node_path_status
@@ -2239,6 +2238,8 @@ mod tests {
             origin: Some("http://127.0.0.1:1234/?token=secret".into()),
         };
         let diagnostics = build_startup_diagnostics(&state, &snapshot);
+        let diagnostics_value: serde_json::Value = serde_json::from_str(&diagnostics).unwrap();
+        assert_eq!(diagnostics_value["lifecycle_state"], "failed");
         assert!(diagnostics.contains("spawn_failed"));
         assert!(diagnostics.contains("stale_generation") || diagnostics.contains("unexpected"));
         assert!(diagnostics.contains("forced"));
