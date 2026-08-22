@@ -60,19 +60,15 @@ pub(crate) const HOST_ADDRESS: &str = "127.0.0.1";
 pub(crate) const HOST_PORT: u16 = 3080;
 pub(crate) const HOST_ORIGIN: &str = "http://127.0.0.1:3080/";
 const PINNED_DSH_VERSION: &str = "0.1.0-rc.6";
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const CREATE_NEW_CONSOLE_FLAG: u32 = 0x0000_0010;
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const CREATE_SUSPENDED_FLAG: u32 = 0x0000_0004;
-#[cfg(test)]
-const CREATE_NEW_PROCESS_GROUP_FLAG: u32 = 0x0000_0200;
-#[cfg(test)]
-const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const SW_HIDE_VALUE: u16 = 0;
 
 /// 描述 Windows CLI 创建标志和窗口可见性。
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WindowsLaunchContract {
     creation_flags: u32,
@@ -80,7 +76,7 @@ struct WindowsLaunchContract {
 }
 
 /// 返回 Windows direct CLI 的稳定创建契约，供实现与跨平台测试共用。
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn windows_launch_contract() -> WindowsLaunchContract {
     WindowsLaunchContract {
         creation_flags: CREATE_NEW_CONSOLE_FLAG | CREATE_SUSPENDED_FLAG,
@@ -89,7 +85,7 @@ fn windows_launch_contract() -> WindowsLaunchContract {
 }
 
 /// 用生产相同控制流保证挂起进程先接管 Job，再恢复初始线程。
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn assign_then_resume<C, O, E>(
     child: &mut C,
     assign: impl FnOnce(&C) -> Result<O, E>,
@@ -106,7 +102,7 @@ fn assign_then_resume<C, O, E>(
 static WINDOWS_CONSOLE_CONTROL: Mutex<()> = Mutex::new(());
 
 /// 按 CommandLineToArgvW 兼容规则引用一个 Windows UTF-16 参数。
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn quote_windows_argument(argument: &[u16]) -> Vec<u16> {
     let needs_quotes = argument.is_empty()
         || argument.iter().any(|character| {
@@ -301,7 +297,7 @@ impl Drop for WindowsAttributeList {
 }
 
 /// 去除无效和重复句柄，构造唯一的 Windows 继承 allowlist。
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn unique_handle_allowlist(handles: impl IntoIterator<Item = isize>) -> Vec<isize> {
     let mut allowed = Vec::new();
     for handle in handles {

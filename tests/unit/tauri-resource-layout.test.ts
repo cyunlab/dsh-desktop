@@ -54,6 +54,8 @@ describe('Tauri resource layout', () => {
       const source = await readFile(path.join(root, 'src-tauri/src', moduleName), 'utf8')
       expect(source).toContain('#[cfg(test)]\nmod tests;')
       expect(source).not.toContain('mod tests {')
+      const productionOnly = source.replace('#[cfg(test)]\nmod tests;', '')
+      expect(productionOnly).not.toMatch(/#\[cfg\([^\]]*\btest\b[^\]]*\)\]/)
     }
     await Promise.all([
       readFile(path.join(root, 'src-tauri/src/tests/mod.rs'), 'utf8'),

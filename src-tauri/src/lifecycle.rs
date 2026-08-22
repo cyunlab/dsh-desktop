@@ -3,9 +3,6 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
-use std::sync::{Arc, Mutex};
-
 /// 一个由桌面端拥有的进程树控制接口。
 pub trait ProcessControl: Send + Sync {
     /// 按调用当下的轮次请求被管理进程优雅地停止。
@@ -66,29 +63,6 @@ pub fn stop_process(
     Ok(StopOutcome::Forced)
 }
 
-/// 确认旧进程树清理成功后才执行替代轮次启动回调。
-#[cfg(test)]
-pub fn cleanup_then_restart(
-    process: Option<&dyn ProcessControl>,
-    current_generation: u64,
-    graceful_timeout: Duration,
-    forced_timeout: Duration,
-    restart: impl FnOnce(),
-) -> Result<Option<StopOutcome>, String> {
-    let outcome = process
-        .map(|process| {
-            stop_process(
-                process,
-                current_generation,
-                graceful_timeout,
-                forced_timeout,
-            )
-        })
-        .transpose()?;
-    restart();
-    Ok(outcome)
-}
-
 /// readiness 等待可能结束的安全分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadinessWaitError {
@@ -134,121 +108,6 @@ pub fn wait_for_readiness(
         if !poll_interval.is_zero() {
             thread::sleep(poll_interval);
         }
-    }
-}
-
-/// 测试进程的内部状态。
-#[cfg(test)]
-#[derive(Default)]
-struct FakeProcessState {
-    /// 是否已经退出。
-    exited: bool,
-    /// 是否已经回收。
-    reaped: bool,
-}
-
-/// 测试用的可控进程树。
-#[cfg(test)]
-struct FakeProcess {
-    /// 是否拒绝优雅停止。
-    stubborn: bool,
-    /// 是否让强制终止返回错误。
-    force_error: bool,
-    /// 是否在强制终止后仍报告存活。
-    ignores_force: bool,
-    /// 是否在强杀前让退出探测返回错误。
-    probe_error_before_force: bool,
-    /// 是否在强杀后仍让退出探测返回错误。
-    probe_error_after_force: bool,
-    /// 可断言的调用顺序。
-    events: Arc<Mutex<Vec<&'static str>>>,
-    /// 当前模拟状态。
-    state: Mutex<FakeProcessState>,
-}
-
-#[cfg(test)]
-impl FakeProcess {
-    /// 创建一个具有指定停止行为的测试进程。
-    fn new(stubborn: bool, force_error: bool, ignores_force: bool) -> Arc<Self> {
-        Arc::new(Self {
-            stubborn,
-            force_error,
-            ignores_force,
-            probe_error_before_force: false,
-            probe_error_after_force: false,
-            events: Arc::new(Mutex::new(Vec::new())),
-            state: Mutex::new(FakeProcessState::default()),
-        })
-    }
-
-    /// 创建一个优雅阶段退出探测失败、强杀后恢复正常的测试进程。
-    fn with_graceful_probe_error() -> Arc<Self> {
-        Arc::new(Self {
-            stubborn: true,
-            force_error: false,
-            ignores_force: false,
-            probe_error_before_force: true,
-            probe_error_after_force: false,
-            events: Arc::new(Mutex::new(Vec::new())),
-            state: Mutex::new(FakeProcessState::default()),
-        })
-    }
-
-    /// 创建一个始终无法确认退出状态的测试进程。
-    fn with_persistent_probe_error() -> Arc<Self> {
-        Arc::new(Self {
-            stubborn: true,
-            force_error: false,
-            ignores_force: false,
-            probe_error_before_force: true,
-            probe_error_after_force: true,
-            events: Arc::new(Mutex::new(Vec::new())),
-            state: Mutex::new(FakeProcessState::default()),
-        })
-    }
-}
-
-#[cfg(test)]
-impl ProcessControl for FakeProcess {
-    /// 记录优雅停止，并让普通进程立即退出。
-    fn request_graceful_stop(&self, _current_generation: u64) -> Result<(), String> {
-        self.events.lock().unwrap().push("graceful");
-        if !self.stubborn {
-            self.state.lock().unwrap().exited = true;
-        }
-        Ok(())
-    }
-
-    /// 返回测试进程树是否全部退出。
-    fn has_exited(&self) -> Result<bool, String> {
-        let forced = self.events.lock().unwrap().contains(&"force");
-        if (self.probe_error_before_force && !forced) || (self.probe_error_after_force && forced) {
-            return Err("graceful probe failed".into());
-        }
-        Ok(self.state.lock().unwrap().exited)
-    }
-
-    /// 记录强杀请求并按配置返回结果。
-    fn force_kill_tree(&self) -> Result<(), String> {
-        self.events.lock().unwrap().push("force");
-        if self.force_error {
-            return Err("forced termination failed".into());
-        }
-        if !self.ignores_force {
-            self.state.lock().unwrap().exited = true;
-        }
-        Ok(())
-    }
-
-    /// 记录已经确认退出后的回收动作。
-    fn reap(&self) -> Result<(), String> {
-        self.events.lock().unwrap().push("reap");
-        let mut state = self.state.lock().unwrap();
-        if !state.exited {
-            return Err("process is still running".into());
-        }
-        state.reaped = true;
-        Ok(())
     }
 }
 

@@ -52,19 +52,6 @@ enum LifecycleState {
     Stopping,
 }
 
-#[cfg(test)]
-impl LifecycleState {
-    /// 列出 Startup 协议允许的全部 direct CLI 状态。
-    const ALL: [Self; 6] = [
-        Self::Starting,
-        Self::WaitingForClient,
-        Self::ProlongedStartup,
-        Self::Ready,
-        Self::Failed,
-        Self::Stopping,
-    ];
-}
-
 /// 启动页可见的生命周期快照。
 #[derive(Debug, Serialize, Clone)]
 struct LifecycleSnapshot {
@@ -894,12 +881,6 @@ fn inspect_http_client_response(response: &[u8], eof: bool) -> HttpResponseState
     } else {
         HttpResponseState::Reject
     }
-}
-
-/// 兼容已有纯值测试，把输入视为已经 EOF 的完整响应。
-#[cfg(test)]
-fn is_html_client_response(response: &[u8]) -> bool {
-    inspect_http_client_response(response, true) == HttpResponseState::Ready
 }
 
 /// 在一个绝对 deadline 内读取并严格验证根页面响应。

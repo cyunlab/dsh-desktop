@@ -1,11 +1,10 @@
 use super::{
     build_startup_diagnostics, bundled_node_relative_path, decide_navigation,
     exit_requires_failure, inspect_http_client_response, is_current_host_page_event,
-    is_finished_page_load, is_html_client_response, is_packaged_startup_url,
-    navigation_event_matches, parse_loopback_address, probe_client_page_with_timeout,
-    retry_allowed, DiagnosticCode, ExitReason, HttpResponseState, LifecycleSnapshot,
-    LifecycleState, NavigationDecision, PageLoadEvent, ProcessObservation, RuntimeState,
-    HTTP_BODY_CAP,
+    is_finished_page_load, is_packaged_startup_url, navigation_event_matches,
+    parse_loopback_address, probe_client_page_with_timeout, retry_allowed, DiagnosticCode,
+    ExitReason, HttpResponseState, LifecycleSnapshot, LifecycleState, NavigationDecision,
+    PageLoadEvent, ProcessObservation, RuntimeState, HTTP_BODY_CAP,
 };
 use std::io::Write;
 use std::net::TcpListener;
@@ -350,4 +349,21 @@ fn classifies_runtime_exit_against_current_generation() {
     assert!(!exit_requires_failure(3, 3, ExitReason::Requested));
     assert!(!exit_requires_failure(2, 3, ExitReason::Unexpected));
     assert!(!exit_requires_failure(2, 3, ExitReason::StaleGeneration));
+}
+
+impl LifecycleState {
+    /// 列出 Startup 协议允许的全部 direct CLI 状态。
+    const ALL: [Self; 6] = [
+        Self::Starting,
+        Self::WaitingForClient,
+        Self::ProlongedStartup,
+        Self::Ready,
+        Self::Failed,
+        Self::Stopping,
+    ];
+}
+
+/// 兼容已有纯值测试，把输入视为已经 EOF 的完整响应。
+fn is_html_client_response(response: &[u8]) -> bool {
+    inspect_http_client_response(response, true) == HttpResponseState::Ready
 }

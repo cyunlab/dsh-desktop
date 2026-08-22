@@ -1,14 +1,16 @@
 #[cfg(any(unix, windows))]
 use super::spawn_owned_command_with_graceful_action;
-use super::{
-    assign_then_resume, classify_exit, classify_exit_with_code, preflight_address,
-    prepend_node_path, quote_windows_argument, resolve_dsh_cli_entry, spawn_owned_command,
-    unique_handle_allowlist, windows_launch_contract, CliCommandPlan, ExitReason, SupervisorError,
-    CREATE_NEW_CONSOLE_FLAG, CREATE_NEW_PROCESS_GROUP_FLAG, CREATE_NO_WINDOW_FLAG,
-    CREATE_SUSPENDED_FLAG, HOST_ADDRESS, SW_HIDE_VALUE,
-};
 #[cfg(windows)]
-use super::{merge_windows_environment, open_inheritable_null};
+use super::{
+    assign_then_resume, merge_windows_environment, open_inheritable_null, quote_windows_argument,
+    unique_handle_allowlist, windows_launch_contract, CREATE_NEW_CONSOLE_FLAG,
+    CREATE_SUSPENDED_FLAG, SW_HIDE_VALUE,
+};
+use super::{
+    classify_exit, classify_exit_with_code, preflight_address, prepend_node_path,
+    resolve_dsh_cli_entry, spawn_owned_command, CliCommandPlan, ExitReason, SupervisorError,
+    HOST_ADDRESS,
+};
 use crate::lifecycle::StopOutcome;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -38,6 +40,11 @@ use windows_sys::Win32::System::Threading::{
 
 #[cfg(unix)]
 static HELPER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP_FLAG: u32 = 0x0000_0200;
+#[cfg(windows)]
+const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
 
 /// POSIX helper 的信号处理器只设置原子标志，实际清理留在普通控制流。
 #[cfg(unix)]
@@ -174,6 +181,7 @@ fn classifies_exit_against_owned_generation() {
 }
 
 /// 验证 Windows CLI 必须在隐藏的专属 console 中以挂起态创建。
+#[cfg(windows)]
 #[test]
 fn windows_launch_contract_uses_hidden_dedicated_console() {
     let contract = windows_launch_contract();
@@ -185,6 +193,7 @@ fn windows_launch_contract_uses_hidden_dedicated_console() {
 }
 
 /// 验证生产消费的接管 seam 始终先 Assign Job，再 Resume 初始线程。
+#[cfg(windows)]
 #[test]
 fn windows_takeover_sequence_assigns_before_resume() {
     let calls = std::cell::RefCell::new(Vec::new());
@@ -206,12 +215,14 @@ fn windows_takeover_sequence_assigns_before_resume() {
 }
 
 /// 验证 Windows 继承 allowlist 会过滤无效句柄并保持唯一。
+#[cfg(windows)]
 #[test]
 fn windows_handle_allowlist_contains_only_unique_valid_handles() {
     assert_eq!(unique_handle_allowlist([0, 41, -1, 42, 41]), [41, 42]);
 }
 
 /// 验证 CreateProcessW 命令行对空白、引号、Unicode 和结尾反斜杠正确转义。
+#[cfg(windows)]
 #[test]
 fn quotes_windows_arguments_without_changing_argv_values() {
     let quote = |value: &str| {
