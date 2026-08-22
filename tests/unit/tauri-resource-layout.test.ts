@@ -46,4 +46,20 @@ describe('Tauri resource layout', () => {
     expect(manifest.scripts['tauri:dev']).toBe('pnpm ensure:official-node && node scripts/run-tauri.mjs dev')
     expect(manifest.scripts['tauri:build']).toBe('pnpm ensure:official-node && node scripts/run-tauri.mjs build')
   })
+
+  /** 验证 Rust 生产模块只声明外置测试模块，不再内嵌测试实现。 */
+  it('keeps Rust unit and integration tests outside production files', async () => {
+    const productionModules = ['main.rs', 'lifecycle.rs', 'cli_supervisor.rs']
+    for (const moduleName of productionModules) {
+      const source = await readFile(path.join(root, 'src-tauri/src', moduleName), 'utf8')
+      expect(source).toContain('#[cfg(test)]\nmod tests;')
+      expect(source).not.toContain('mod tests {')
+    }
+    await Promise.all([
+      readFile(path.join(root, 'src-tauri/src/tests/mod.rs'), 'utf8'),
+      readFile(path.join(root, 'src-tauri/src/lifecycle/tests/mod.rs'), 'utf8'),
+      readFile(path.join(root, 'src-tauri/src/cli_supervisor/tests/mod.rs'), 'utf8'),
+      readFile(path.join(root, 'src-tauri/tests/README.md'), 'utf8')
+    ])
+  })
 })
