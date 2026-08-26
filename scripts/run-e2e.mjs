@@ -88,6 +88,11 @@ async function waitForProcessesExit(pids) {
   throw new Error(`desktop left processes running: ${pids.filter(processExists).join(', ')}`)
 }
 
+/** Windows 用确定性 fixture 验证桌面行为；官方 runtime 由独立 smoke gate 验证。 */
+export function shouldUseCliFixture(scenario, runtimePlatform = process.platform) {
+  return scenario !== 'real-harness' || runtimePlatform === 'win32'
+}
+
 /** 为一个场景创建隔离路径，保证 Windows 路径空格和跨进程状态都被覆盖。 */
 async function scenarioEnvironment(scenario) {
   const root = await mkdtemp(path.join(tmpdir(), 'DSH Tauri E2E With Spaces '))
@@ -101,7 +106,7 @@ async function scenarioEnvironment(scenario) {
   return {
     ...process.env,
     DSH_NODE_PATH: officialNodePath(),
-    ...(scenario === 'real-harness' ? {} : { DSH_TEST_CLI_ENTRY: fixture }),
+    ...(shouldUseCliFixture(scenario) ? { DSH_TEST_CLI_ENTRY: fixture } : {}),
     DSH_TEST_SCENARIO: scenario,
     DSH_TEST_EVENTS: events,
     DSH_TEST_RECORD_FILE: records,

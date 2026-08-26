@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { expectedNativeShutdownDisconnect } from '../../scripts/run-e2e.mjs'
+import { expectedNativeShutdownDisconnect, shouldUseCliFixture } from '../../scripts/run-e2e.mjs'
 
 /** 创建 generation-bound shutdown 证明文件与 WDIO deleteSession 结果。 */
 async function shutdownProofFixture(): Promise<{
@@ -55,5 +55,21 @@ describe('E2E shutdown disconnect proof', () => {
     } finally {
       await rm(fixture.root, { recursive: true, force: true })
     }
+  })
+})
+
+describe('E2E CLI selection', () => {
+  it('uses the deterministic fixture for real-harness behavior on Windows', () => {
+    expect(shouldUseCliFixture('real-harness', 'win32')).toBe(true)
+  })
+
+  it('keeps the official CLI real-harness coverage on Linux and macOS', () => {
+    expect(shouldUseCliFixture('real-harness', 'linux')).toBe(false)
+    expect(shouldUseCliFixture('real-harness', 'darwin')).toBe(false)
+  })
+
+  it('uses the fixture for synthetic lifecycle scenarios on every platform', () => {
+    expect(shouldUseCliFixture('retry', 'win32')).toBe(true)
+    expect(shouldUseCliFixture('retry', 'linux')).toBe(true)
   })
 })

@@ -35,12 +35,14 @@ function page() {
 <html lang="en">
   <head><meta charset="utf-8"><title>DeepSeek Harness Test Client</title></head>
   <body>
-    <main>
-      <h1 data-testid="harness-ready">DeepSeek Harness Test Client</h1>
-      <p data-testid="loopback-origin">${origin ?? ''}</p>
-      <button id="external" type="button">Open external link</button>
-      <button id="custom" type="button">Open custom protocol</button>
-    </main>
+    <div id="root">
+      <main>
+        <h1 data-testid="harness-ready">DeepSeek Harness Test Client</h1>
+        <p data-testid="loopback-origin">${origin ?? ''}</p>
+        <button id="external" type="button">Open external link</button>
+        <button id="custom" type="button">Open custom protocol</button>
+      </main>
+    </div>
     <script>
       document.querySelector('#external').addEventListener('click', () => window.open('https://example.com/dsh-e2e', '_blank'))
       document.querySelector('#custom').addEventListener('click', () => window.open('file:///dsh-e2e-private', '_blank'))

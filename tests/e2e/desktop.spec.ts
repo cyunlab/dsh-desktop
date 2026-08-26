@@ -38,9 +38,23 @@ async function waitForHarness(): Promise<string> {
 
 /** 等待真实 Harness UI 根节点完成挂载。 */
 async function waitForRealHarness(): Promise<string> {
-  await browser.waitUntil(async () => (await browser.getUrl()).startsWith('http://127.0.0.1:'), { timeout: 60_000 })
-  await browser.waitUntil(async () => (await browser.execute(() => document.querySelector('#root')?.childElementCount ?? 0)) > 0, { timeout: 60_000 })
-  return browser.getUrl()
+  try {
+    await browser.waitUntil(async () => (await browser.getUrl()).startsWith('http://127.0.0.1:'), { timeout: 60_000 })
+    await browser.waitUntil(async () => (await browser.execute(() => document.querySelector('#root')?.childElementCount ?? 0)) > 0, { timeout: 60_000 })
+    return browser.getUrl()
+  } catch (error) {
+    const url = await browser.getUrl().catch(() => '<unavailable>')
+    throw new Error(`${String(error)}; current URL: ${url}; records: ${JSON.stringify(await readRecords())}`)
+  }
+}
+
+/** 等待 Tauri 原生窗口确认最小化，避免第二实例激活早于窗口状态提交。 */
+async function waitForNativeMinimized(): Promise<void> {
+  await browser.waitUntil(async () => browser.execute(async () => {
+    const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke(command: string, args?: Record<string, unknown>): Promise<unknown> } }).__TAURI_INTERNALS__
+    if (!internals) return false
+    return internals.invoke('plugin:window|is_minimized', { label: 'main' })
+  }), { timeout: 15_000, timeoutMsg: 'Tauri main window did not become minimized' })
 }
 
 /** 通过真实用户点击触发 target=_blank 请求，兼容 WebKit 的脚本 popup 手势限制。 */
@@ -232,6 +246,7 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
     it('focuses the existing Desktop without starting another Host on a second launch', async () => {
       const origin = await waitForRealHarness()
       await browser.minimizeWindow()
+      await waitForNativeMinimized()
       await launchSecondInstance()
       const records = await waitForRecord('single-instance-activated')
       expect(await browser.getWindowHandles()).toHaveLength(1)

@@ -464,8 +464,8 @@ fn posix_listener_helper() {
         b"ready",
     )
     .unwrap();
-    let mut descendant = Command::new("/bin/sh")
-        .args(["-c", "sleep 60"])
+    let mut descendant = Command::new("sleep")
+        .arg("60")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
