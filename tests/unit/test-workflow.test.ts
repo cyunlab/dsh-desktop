@@ -32,8 +32,13 @@ describe('manual Desktop behavior workflow', () => {
   it('supports manual and reusable invocation only', async () => {
     const contents = await workflow()
     const triggerBlock = contents.match(/^on:\n([\s\S]*?)\npermissions:/m)?.[1]
-    expect(triggerBlock).toBe('  workflow_dispatch:\n  workflow_call:\n')
+    expect(triggerBlock).toContain('  workflow_dispatch:\n  workflow_call:\n    inputs:\n      release_ref:')
     expect(contents).not.toMatch(/^\s+(?:push|pull_request):/m)
+  })
+
+  it('checks out an optional exact release ref for reusable release tests', async () => {
+    const contents = await workflow()
+    expect(contents.match(/ref: \$\{\{ inputs\.release_ref \|\| github\.sha \}\}/g)).toHaveLength(2)
   })
 
   it('uses an exact toolchain, frozen install, cache, and read-only submodule guard', async () => {

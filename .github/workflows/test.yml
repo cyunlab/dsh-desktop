@@ -3,6 +3,10 @@ name: Desktop behavior tests
 on:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      release_ref:
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -20,6 +24,7 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
+          ref: ${{ inputs.release_ref || github.sha }}
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 11.7.0
@@ -118,6 +123,7 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
+          ref: ${{ inputs.release_ref || github.sha }}
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 11.7.0

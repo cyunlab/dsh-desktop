@@ -15,10 +15,16 @@ describe('native build workflow contract', () => {
 
   it('only accepts version-candidate tags', () => {
     expect(workflow).toMatch(/^on:\n  push:\n    tags:/m)
-    expect(workflow).not.toContain('workflow_dispatch')
+    expect(workflow).toMatch(/workflow_dispatch:\n    inputs:\n      release_tag:/)
     expect(workflow).not.toMatch(/^\s+pull_request:/m)
     expect(workflow).not.toMatch(/^\s+branches:/m)
     expect(workflow).toContain("- 'v*'")
+  })
+
+  it('rebuilds only an explicit existing release tag when manually dispatched', () => {
+    expect(workflow).toContain('ref: ${{ inputs.release_tag || github.ref_name }}')
+    expect(workflow).toContain('refs/tags/${RELEASE_TAG}^{}')
+    expect(workflow).toContain('release_ref: ${{ inputs.release_tag || github.ref_name }}')
   })
 
   it('pins the toolchain and frozen installation', () => {
