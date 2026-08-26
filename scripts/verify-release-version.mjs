@@ -3,6 +3,7 @@ import { pathToFileURL } from 'node:url'
 
 const SEMANTIC_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
 
+/** 验证发布 tag 与 package.json 的语义版本完全一致。 */
 export function verifyReleaseVersion(tag, packageVersion) {
   if (typeof tag !== 'string' || !tag.startsWith('v')) {
     throw new Error(`release tag must start with v: ${tag ?? '<missing>'}`)
@@ -20,6 +21,7 @@ export function verifyReleaseVersion(tag, packageVersion) {
   return tagVersion
 }
 
+/** 从命令行读取发布 tag 与清单并执行版本校验。 */
 async function main() {
   const tag = process.argv[2] ?? process.env.GITHUB_REF_NAME
   const manifestPath = process.argv[3] ?? 'package.json'

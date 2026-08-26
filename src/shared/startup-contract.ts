@@ -1,11 +1,10 @@
 export const startupChannels = {
   snapshot: 'startup:snapshot',
   retry: 'startup:retry',
-  copyDiagnostics: 'startup:copy-diagnostics',
-  revealLogs: 'startup:reveal-logs'
+  copyDiagnostics: 'startup:copy-diagnostics'
 } as const
 
-export type LifecycleState = 'idle' | 'preparing' | 'booting' | 'probing' | 'ready' | 'failed' | 'retrying' | 'stopping' | 'stopped'
+export type LifecycleState = 'starting' | 'waiting-for-client' | 'prolonged-startup' | 'ready' | 'failed' | 'stopping'
 
 export interface LifecycleSnapshot {
   readonly state: LifecycleState
@@ -18,7 +17,6 @@ export interface StartupApi {
   onSnapshot(listener: (snapshot: LifecycleSnapshot) => void): () => void
   retry(): Promise<void>
   copyDiagnostics(): Promise<void>
-  revealLogs(): Promise<void>
 }
 
 declare global {

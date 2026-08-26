@@ -17,10 +17,16 @@ jobs:
         include:
           - name: Linux
             os: ubuntu-24.04
-          - name: macOS
+            e2e-command: pnpm test:e2e:xvfb
+          - name: macOS arm64
             os: macos-14
+            e2e-command: pnpm test:e2e
+          - name: macOS x64
+            os: macos-15-intel
+            e2e-command: pnpm test:e2e
           - name: Windows
             os: windows-2022
+            e2e-command: pnpm test:e2e
 
     steps:
       - name: Check out the pinned Harness source reference
@@ -44,6 +50,29 @@ jobs:
 
       - name: Install frozen dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Install Linux Tauri and WebView test dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            file \
+            libayatana-appindicator3-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            patchelf \
+            xvfb
+
+      - name: Install stable Rust toolchain
+        shell: bash
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Prove release builds cannot enable debug WDIO seams
+        run: pnpm test:e2e:release-guard
 
       - name: Create diagnostics directory
         shell: bash
@@ -70,21 +99,26 @@ jobs:
         shell: bash
         run: set -o pipefail; pnpm test:integration 2>&1 | tee artifacts/integration.log
 
-      - name: Run packaged Electron E2E tests
-        id: e2e
-        if: runner.os != 'Linux'
+      - name: Download the fixed official Node and build the runtime closure
+        id: runtime_build
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 15
         shell: bash
-        run: set -o pipefail; pnpm test:e2e 2>&1 | tee artifacts/e2e.log
+        run: set -o pipefail; { pnpm ensure:official-node && pnpm build; } 2>&1 | tee artifacts/runtime-build.log
 
-      - name: Run packaged Electron E2E tests under Xvfb
-        id: e2e_linux
-        if: runner.os == 'Linux'
+      - name: Run real official Node plus published dsh web smoke test
+        id: smoke
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 20
         shell: bash
-        run: set -o pipefail; pnpm test:e2e:xvfb 2>&1 | tee artifacts/e2e.log
+        run: set -o pipefail; pnpm smoke:dsh-cli 2>&1 | tee artifacts/smoke.log
+
+      - name: Run embedded Tauri desktop E2E
+        id: e2e
+        continue-on-error: true
+        timeout-minutes: 45
+        shell: bash
+        run: set -o pipefail; ${{ matrix.e2e-command }} 2>&1 | tee artifacts/e2e.log
 
       - name: Verify the Harness submodule stayed unchanged
         id: harness_guard
@@ -119,17 +153,13 @@ jobs:
           TYPECHECK_OUTCOME: ${{ steps.typecheck.outcome }}
           UNIT_OUTCOME: ${{ steps.unit.outcome }}
           INTEGRATION_OUTCOME: ${{ steps.integration.outcome }}
+          RUNTIME_BUILD_OUTCOME: ${{ steps.runtime_build.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
           E2E_OUTCOME: ${{ steps.e2e.outcome }}
-          E2E_LINUX_OUTCOME: ${{ steps.e2e_linux.outcome }}
           HARNESS_GUARD_OUTCOME: ${{ steps.harness_guard.outcome }}
           SANITIZE_OUTCOME: ${{ steps.sanitize.outcome }}
         run: |
-          outcomes="$TYPECHECK_OUTCOME $UNIT_OUTCOME $INTEGRATION_OUTCOME $HARNESS_GUARD_OUTCOME $SANITIZE_OUTCOME"
-          if [ "$RUNNER_OS" = Linux ]; then
-            outcomes="$outcomes $E2E_LINUX_OUTCOME"
-          else
-            outcomes="$outcomes $E2E_OUTCOME"
-          fi
+          outcomes="$TYPECHECK_OUTCOME $UNIT_OUTCOME $INTEGRATION_OUTCOME $RUNTIME_BUILD_OUTCOME $SMOKE_OUTCOME $E2E_OUTCOME $HARNESS_GUARD_OUTCOME $SANITIZE_OUTCOME"
           case " $outcomes " in
             *" failure "*|*" cancelled "*) exit 1 ;;
           esac

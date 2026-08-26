@@ -3,5 +3,11 @@
 dist/
 release/
 node_modules/
+.pnpm-store/
+src-tauri/target/
+src-tauri/gen/
+resources/node/*
+!resources/node/.gitkeep
 test-results/
+logs/
 .DS_Store

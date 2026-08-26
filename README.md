@@ -46,9 +46,9 @@ DeepSeek Harness Desktop 希望把这套思路继续带到桌面。我们希望 
 
 ✅ 单实例运行，重复启动时聚焦已有窗口
 
-✅ 提供启动失败恢复、脱敏诊断和日志目录入口
+✅ 提供启动失败恢复和不写入本地日志的脱敏诊断
 
-✅ 包含单元测试、真实 Host 集成测试和 Electron 端到端测试
+✅ 包含单元测试、真实 Host 集成测试和每个平台的官方 Node + Harness smoke 验证
 
 <a id="roadmap"></a>
 
@@ -93,9 +93,10 @@ corepack pnpm typecheck
 corepack pnpm build
 corepack pnpm test
 corepack pnpm test:integration
+corepack pnpm smoke:dsh-cli
 ```
 
-运行完整 Electron 端到端测试
+运行真实桌面端到端测试。Windows、macOS 与 Linux CI 都使用 embedded `@wdio/tauri-service` provider；Linux 通过 Xvfb 运行。
 
 ```sh
 corepack pnpm test:e2e
@@ -109,7 +110,7 @@ corepack pnpm test:e2e
 corepack pnpm package
 ```
 
-产物会写入 `release/`。
+产物会写入 `src-tauri/target/release/bundle/`。
 
 | 平台 | 架构 | 格式 |
 | --- | --- | --- |
@@ -124,6 +125,6 @@ corepack pnpm package
 - 在提交改动前运行类型检查和相关测试
 - 将功能建议与问题提交到 [GitHub Issues](https://github.com/XLCYun/dsh-desktop/issues)
 - `deepseek-harness/` 是只读 Git 子模块，请勿直接修改
-- 设计与实现约束见 [`docs/spec.md`](./docs/spec.md) 和 [`docs/adr/`](./docs/adr/)
+- 当前设计与实现约束见 [`CONTEXT.md`](./CONTEXT.md)、[ADR 0006](./docs/adr/0006-launch-the-published-dsh-web-cli-directly.md) 和 [Tauri 迁移说明](./docs/tauri-migration.md)；`docs/spec.md` 等归档材料只记录历史方案
 
 如果你也希望桌面应用 UI 可以像搭积木一样调整，欢迎一起完善它。

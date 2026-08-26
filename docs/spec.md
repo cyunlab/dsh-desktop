@@ -1,4 +1,6 @@
-# First runnable DeepSeek Harness Desktop
+# Archived: First runnable DeepSeek Harness Desktop
+
+> Superseded by the Tauri migration and ADR 0005. This document records the original Electron milestone for historical traceability; current implementation requirements live in `docs/tauri-migration.md` and `CONTEXT.md`.
 
 ## Problem Statement
 

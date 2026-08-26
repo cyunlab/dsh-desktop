@@ -14,6 +14,7 @@ const DEFAULT_MAX_FILE_BYTES = 1024 * 1024
 const DEFAULT_MAX_TOTAL_BYTES = 4 * 1024 * 1024
 const TRUNCATED = '\n[artifact truncated at sanitizer byte limit]\n'
 
+/** 清除 CI 文本中的凭据、用户内容和精确 URL 位置。 */
 export function redactCiText(value) {
   return value
     .replace(/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]*PRIVATE KEY-----/gi, '[private key redacted]')
@@ -31,6 +32,7 @@ export function redactCiText(value) {
     .replace(/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*$/gi, '[private key redacted]')
 }
 
+/** 仅保留 HTTP URL 的公开 origin。 */
 function redactHttpUrl(value) {
   try {
     const url = new URL(value)
@@ -43,6 +45,7 @@ function redactHttpUrl(value) {
   }
 }
 
+/** 读取白名单诊断文件并输出受大小限制的脱敏副本。 */
 export async function sanitizeArtifactDirectory(options = {}) {
   const workspace = path.resolve(options.workspace ?? '.')
   const canonicalWorkspace = await realpath(workspace)
@@ -88,6 +91,7 @@ export async function sanitizeArtifactDirectory(options = {}) {
   return { files, omitted, totalBytes }
 }
 
+/** 验证候选日志位于工作区且不是符号链接。 */
 async function safeCandidate(workspace, candidate) {
   if (path.extname(candidate) !== '.log') throw new Error(`artifact is not allowlisted text: ${candidate}`)
   const resolved = path.resolve(workspace, candidate)
@@ -100,6 +104,7 @@ async function safeCandidate(workspace, candidate) {
   return { path: resolved, identity }
 }
 
+/** 在文件身份不变的前提下读取有限字节。 */
 async function readBounded(file, expected, limit) {
   const noFollow = process.platform !== 'win32' && typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0
   const handle = await open(file, fsConstants.O_RDONLY | noFollow)
@@ -115,10 +120,12 @@ async function readBounded(file, expected, limit) {
   }
 }
 
+/** 判断目标是否严格位于根目录内。 */
 function isInside(root, target) {
   return target.startsWith(`${root}${path.sep}`)
 }
 
+/** 验证所有诊断产物限制均为正安全整数。 */
 function validateLimits(maxFiles, maxFileBytes, maxTotalBytes) {
   for (const [name, value] of Object.entries({ maxFiles, maxFileBytes, maxTotalBytes })) {
     if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`)

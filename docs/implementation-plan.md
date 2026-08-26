@@ -1,4 +1,6 @@
-# First runnable Desktop implementation plan
+# Archived: First runnable Desktop implementation plan
+
+> Superseded by the Tauri migration and ADR 0005. The original Electron plan is retained as historical context; do not use its Electron entry points or packaging instructions for new work.
 
 ## Outcome
 

@@ -1,6 +1,8 @@
 # Package with electron-builder
 
-Status: accepted
+Status: superseded by ADR 0005 and the Tauri migration plan
+
+> This historical packaging decision is retained for context. Current builds use Tauri bundling; the electron-builder configuration below is archived and must not be extended.
 
 DeepSeek Harness Desktop uses pnpm and electron-builder for distributable artifacts. Builds run on the matching operating-system runner because the shipped Harness dependency graph may contain platform-specific or native components.
 

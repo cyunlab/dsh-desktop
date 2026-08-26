@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DeepSeek Harness Desktop",
+  "version": "1.1.1",
+  "identifier": "io.github.xlcyun.dsh-desktop",
+  "build": {
+    "beforeDevCommand": {
+      "script": "pnpm ensure:official-node && pnpm build",
+      "wait": true
+    },
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist/startup"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": []
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "dmg", "appimage"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "../dist": "dist",
+      "../resources/node": "node"
+    }
+  }
+}

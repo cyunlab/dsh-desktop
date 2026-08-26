@@ -5,19 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self' data:">
     <title>DeepSeek Harness Desktop</title>
-    <link rel="icon" href="../assets/dsh-desktop-logo.svg" type="image/svg+xml">
+    <link rel="icon" href="./assets/dsh-desktop-logo.svg" type="image/svg+xml">
     <link rel="stylesheet" href="./index.css">
   </head>
   <body>
     <main>
-      <img class="mark" src="../assets/dsh-desktop-logo.svg" alt="" aria-hidden="true">
+      <img class="mark" src="./assets/dsh-desktop-logo.svg" alt="" aria-hidden="true">
       <p class="eyebrow">DeepSeek Harness Desktop</p>
       <h1 id="state">Starting…</h1>
-      <p id="message" aria-live="polite">Preparing the local Web Client.</p>
+      <p id="message" aria-live="polite">Waiting for client to start.</p>
       <div id="actions" hidden>
         <button id="retry" type="button">Retry</button>
         <button id="copy" type="button">Copy diagnostics</button>
-        <button id="logs" type="button">Open logs</button>
       </div>
     </main>
     <script type="module" src="./index.js"></script>

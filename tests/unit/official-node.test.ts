@@ -1,0 +1,95 @@
+import { describe, expect, it } from 'vitest'
+import { mkdir, mkdtemp, readFile, rename, stat, utimes, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { NODE_VERSION, ensureOfficialNode, getNodeCacheRoot, getNodeTarget, withDirectoryLock } from '../../scripts/ensure-official-node.mjs'
+
+describe('official Node resource', () => {
+  it('keeps one fixed Node 24 release and maps the four supported targets', () => {
+    expect(NODE_VERSION).toBe('24.19.0')
+    expect(getNodeTarget('win32', 'x64')).toMatchObject({ resourceName: 'windows-x86_64', relativeExecutable: 'node.exe', archiveSha256: '57f71ab3652e797d84acddc79c81cc9ff1c6ddb2a1974cdb83f00fee9bff4c73' })
+    expect(getNodeTarget('darwin', 'arm64')).toMatchObject({ resourceName: 'macos-aarch64', relativeExecutable: 'node', archiveSha256: '3f1cf157479c1480352083105e13faf9d008ede98e7e157746b6df940d197b94' })
+    expect(getNodeTarget('darwin', 'x64')).toMatchObject({ resourceName: 'macos-x86_64', relativeExecutable: 'node', archiveSha256: 'd35e95230f46f6f0751df497c56622c6735e05d5e1fb1630996a005b9d328fe4' })
+    expect(getNodeTarget('linux', 'x64')).toMatchObject({ resourceName: 'linux-x86_64', relativeExecutable: 'node', archiveSha256: '14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647' })
+    expect(() => getNodeTarget('linux', 'arm64')).toThrow('Unsupported official Node target')
+  })
+
+  it('uses platform cache conventions and never lets DSH_NODE_PATH change the download cache', () => {
+    expect(getNodeCacheRoot({ LOCALAPPDATA: 'C:/Local', DSH_NODE_CACHE_DIR: 'C:/ignored', DSH_NODE_PATH: 'C:/custom/node.exe' }, 'C:/Users/test', 'win32'))
+      .toBe(path.join('C:/Local', 'dsh-desktop', 'node'))
+    expect(getNodeCacheRoot({ XDG_CACHE_HOME: '/tmp/cache', DSH_NODE_PATH: '/custom/node' }, '/home/test', 'linux'))
+      .toBe(path.join('/tmp/cache', 'dsh-desktop', 'node'))
+  })
+
+  it('does not redownload an existing resource and restores POSIX execute permission', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-node-existing-'))
+    const executable = path.join(root, 'resources', 'node', 'linux-x86_64', 'node')
+    await mkdir(path.dirname(executable), { recursive: true })
+    await writeFile(executable, 'existing')
+    await ensureOfficialNode({
+      projectRoot: root,
+      runtimePlatform: 'linux',
+      runtimeArch: 'x64',
+      fetchImpl: async () => { throw new Error('network should not be used') }
+    })
+    const information = await stat(executable)
+    expect(information.isFile()).toBe(true)
+    if (process.platform !== 'win32') expect(information.mode & 0o111).not.toBe(0)
+  })
+
+  it('serializes concurrent target work with an atomic directory lock', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-node-lock-'))
+    const lockPath = path.join(root, 'windows-x86_64.lock')
+    let active = 0
+    let maximumActive = 0
+    await Promise.all([0, 1, 2].map(index => withDirectoryLock(lockPath, async () => {
+      active += 1
+      maximumActive = Math.max(maximumActive, active)
+      await new Promise(resolve => setTimeout(resolve, 10 + index))
+      active -= 1
+    }, { retryMilliseconds: 1, staleMilliseconds: 5_000, timeoutMilliseconds: 2_000 })))
+    expect(maximumActive).toBe(1)
+    await expect(stat(lockPath)).rejects.toThrow()
+  })
+
+  it('recovers an abandoned stale target lock', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-node-stale-lock-'))
+    const lockPath = path.join(root, 'linux-x86_64.lock')
+    await mkdir(lockPath)
+    await utimes(lockPath, new Date(0), new Date(0))
+    await expect(withDirectoryLock(lockPath, async () => 'recovered', {
+      retryMilliseconds: 1,
+      staleMilliseconds: 1,
+      timeoutMilliseconds: 2_000
+    })).resolves.toBe('recovered')
+    await expect(stat(lockPath)).rejects.toThrow()
+  })
+
+  it('keeps a long-lived active lock fresh until its owner finishes', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-node-heartbeat-lock-'))
+    const lockPath = path.join(root, 'linux-x86_64.lock')
+    const order: string[] = []
+    const first = withDirectoryLock(lockPath, async () => {
+      order.push('first-enter')
+      await new Promise(resolve => setTimeout(resolve, 100))
+      order.push('first-exit')
+    }, { retryMilliseconds: 2, staleMilliseconds: 25, heartbeatMilliseconds: 5, timeoutMilliseconds: 2_000 })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    const second = withDirectoryLock(lockPath, async () => {
+      order.push('second-enter')
+    }, { retryMilliseconds: 2, staleMilliseconds: 25, heartbeatMilliseconds: 5, timeoutMilliseconds: 2_000 })
+    await Promise.all([first, second])
+    expect(order).toEqual(['first-enter', 'first-exit', 'second-enter'])
+  })
+
+  it('does not remove a successor lock after ownership changes', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-node-lock-owner-'))
+    const lockPath = path.join(root, 'macos-aarch64.lock')
+    await withDirectoryLock(lockPath, async () => {
+      await rename(lockPath, `${lockPath}.previous`)
+      await mkdir(lockPath)
+      await writeFile(path.join(lockPath, 'owner'), 'successor')
+    })
+    await expect(readFile(path.join(lockPath, 'owner'), 'utf8')).resolves.toBe('successor')
+  })
+})

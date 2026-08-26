@@ -1,5 +1,7 @@
 # Issue #3 release-candidate acceptance
 
+> Archived: this document records the superseded desktop-shell release candidate and is retained only as historical evidence.
+
 Accepted 2026-08-16 UTC for commit `ef6ab1bdd847fbc259b1937d4cb5cbac74a1650e` on `issue/3-final-acceptance`. This commit is based on requested `main` commit `452b0b1ba34f00fbd3aa3ff4e64e22a1b088c818`.
 
 ## Authoritative workflow evidence
