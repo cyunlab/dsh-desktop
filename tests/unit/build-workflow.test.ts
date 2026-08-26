@@ -54,9 +54,12 @@ describe('native build workflow contract', () => {
     expect(workflow).not.toContain('APPIMAGE_EXTRACT_AND_RUN')
   })
 
-  it('bounds transient Intel DMG failures to one verbose retry', () => {
-    expect(workflow).toContain('Build Intel macOS package with one bounded DMG retry')
-    expect(workflow).toContain('run: pnpm package -- --verbose || pnpm package -- --verbose')
+  it('builds the Intel app and creates its DMG without Finder automation', () => {
+    expect(workflow).toContain('Build Intel macOS package without Finder DMG automation')
+    expect(workflow).toContain('pnpm tauri:build --bundles app --verbose')
+    expect(workflow).toContain('hdiutil create -volname "DeepSeek Harness Desktop"')
+    expect(workflow).toContain('-format UDZO "$dmg_path"')
+    expect(workflow).not.toContain('pnpm package -- --verbose || pnpm package -- --verbose')
   })
 
   it('allows the Windows Job controller enough time to initialize', () => {

@@ -104,10 +104,19 @@ jobs:
       - name: Build native Tauri package with official Node and published CLI
         if: ${{ !(matrix.platform == 'mac' && matrix.arch == 'x64') }}
         run: pnpm package -- --verbose
-      - name: Build Intel macOS package with one bounded DMG retry
+      - name: Build Intel macOS package without Finder DMG automation
         if: ${{ matrix.platform == 'mac' && matrix.arch == 'x64' }}
         shell: bash
-        run: pnpm package -- --verbose || pnpm package -- --verbose
+        run: |
+          pnpm tauri:build --bundles app --verbose
+          version="$(node -p "require('./package.json').version")"
+          app_path="src-tauri/target/release/bundle/macos/DeepSeek Harness Desktop.app"
+          dmg_directory="src-tauri/target/release/bundle/dmg"
+          dmg_path="${dmg_directory}/DeepSeek Harness Desktop_${version}_x64.dmg"
+          test -d "$app_path"
+          mkdir -p "$dmg_directory"
+          hdiutil create -volname "DeepSeek Harness Desktop" \
+            -srcfolder "$app_path" -ov -format UDZO "$dmg_path"
       - name: Smoke test official Node plus published dsh web
         run: pnpm smoke:dsh-cli
         env:
