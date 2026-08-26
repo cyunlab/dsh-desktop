@@ -33,6 +33,18 @@ describe('Tauri resource layout', () => {
     expect(config.bundle.targets).toEqual(['nsis', 'dmg', 'deb'])
   })
 
+  /** 验证平台配置不会把发布矩阵声明的安装包类型覆盖回其他格式。 */
+  it('keeps platform-specific bundle targets aligned with release artifacts', async () => {
+    const [linux, macos, windows] = await Promise.all([
+      readFile(path.join(root, 'src-tauri/tauri.linux.conf.json'), 'utf8'),
+      readFile(path.join(root, 'src-tauri/tauri.macos.conf.json'), 'utf8'),
+      readFile(path.join(root, 'src-tauri/tauri.windows.conf.json'), 'utf8')
+    ]).then(configs => configs.map(config => JSON.parse(config)))
+    expect(linux.bundle.targets).toEqual(['deb'])
+    expect(macos.bundle.targets).toEqual(['dmg'])
+    expect(windows.bundle.targets).toEqual(['nsis'])
+  })
+
   /** 验证 dev hook 会准备完整资源并等待结束，避免 Cargo 在 dist 重建期间扫描资源。 */
   it('waits for the complete development resource build before starting Cargo', async () => {
     const config = JSON.parse(await readFile(path.join(root, 'src-tauri/tauri.conf.json'), 'utf8'))
