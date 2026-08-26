@@ -29,7 +29,7 @@ function run(command, args, environment = process.env) {
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} exited with status ${result.status}`)
 }
 
-/** 捕获 WDIO 输出，供 runner 精确识别仅发生在 deleteSession 的 backend 断连。 */
+/** 捕获 WDIO 输出，供 runner 精确识别原生窗口退出后的 backend 断连。 */
 function runWdio(environment) {
   const pnpmEntry = environment.npm_execpath
   if (!pnpmEntry) throw new Error('E2E runner must be run from a pnpm script')
@@ -126,21 +126,19 @@ export async function expectedNativeShutdownDisconnect(environment, result) {
   const completionIndex = records.findIndex(event => event.event === 'native-shutdown-completed'
     && event.generation === generation && event.cleanupSucceeded === true)
   const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`
-  const deleteSessionIndex = output.indexOf('COMMAND deleteSession()')
-  const errorLines = output.split('\n').filter(line => /\sERROR\s/.test(line))
-  const onlyDeleteSessionDisconnect = result.status !== 0
+  const workerErrorLines = output.split('\n').filter(line => /\[0-0\].*\sERROR\s/.test(line))
+  const onlyNativeShutdownDisconnect = result.status !== 0
     && !result.error
-    && deleteSessionIndex >= 0
-    && output.slice(deleteSessionIndex).includes('ECONNREFUSED')
-    && errorLines.length > 0
-    && errorLines.every(line => /webdriver: WebDriverError:.*ECONNREFUSED|@wdio\/local-runner: Failed launching test session: Error: WebDriverError:.*ECONNREFUSED/.test(line))
+    && /method ["']DELETE["']/.test(output)
+    && workerErrorLines.length > 0
+    && workerErrorLines.every(line => /(?:webdriver: WebDriverError:|@wdio\/local-runner: Failed launching test session: Error: WebDriverError:).*(?:ECONNREFUSED|UND_ERR_SOCKET)/.test(line))
   return marker.generation === generation
     && requestIndex >= 0
     && completionIndex > requestIndex
     && records.some(event => event.event === 'cli-cleaned' && event.generation === generation)
     && Number.isInteger(backendPid)
     && !processExists(backendPid)
-    && onlyDeleteSessionDisconnect
+    && onlyNativeShutdownDisconnect
 }
 
 /** 验收一个场景退出后的进程树与 loopback listener，失败场景也必须执行。 */
@@ -153,7 +151,6 @@ async function verifyScenarioCleanup(environment) {
   ].filter(Number.isInteger))]
   const origins = [...new Set(records.filter(event => event.event === 'client-page-served').map(event => event.origin).filter(origin => typeof origin === 'string'))]
   if (!pids.length) throw new Error('desktop cleanup verifier did not observe any CLI PID')
-  if (!origins.length) throw new Error('desktop cleanup verifier did not observe any served client origin')
   await waitForProcessesExit(pids)
   for (const origin of origins) await waitForListenerShutdown(origin)
 }

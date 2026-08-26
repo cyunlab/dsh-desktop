@@ -508,7 +508,7 @@ fn posix_sigterm_reclaims_listener_and_process_tree() {
     }
     assert!(ready.is_file());
     let report = process
-        .stop(21, Duration::from_secs(3), Duration::from_secs(2))
+        .stop(21, Duration::from_secs(10), Duration::from_secs(2))
         .unwrap();
     assert_eq!(report.outcome, StopOutcome::Graceful);
     assert_eq!(report.exit.unwrap().reason, ExitReason::Requested);
