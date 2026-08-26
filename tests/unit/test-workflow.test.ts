@@ -81,7 +81,11 @@ describe('manual Desktop behavior workflow', () => {
 
   it('retains bounded diagnostics without building installer artifacts', async () => {
     const contents = await workflow()
-    expect(contents).toMatch(/if: always\(\)\n        uses: actions\/upload-artifact@[0-9a-f]{40} # v\d+\.\d+\.\d+/)
+    expect(
+      contents.match(
+        /- name: Retain (?:quality|E2E) diagnostics\n        if: always\(\)\n        continue-on-error: true\n        uses: actions\/upload-artifact@[0-9a-f]{40} # v\d+\.\d+\.\d+/g
+      )
+    ).toHaveLength(2)
     expect(contents).toContain('node scripts/sanitize-ci-artifacts.mjs')
     expect(contents).toContain('path: sanitized-artifacts/')
     expect(contents).not.toMatch(/^\s+path: (?:artifacts|test-results)\//m)
