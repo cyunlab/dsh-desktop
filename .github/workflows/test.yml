@@ -2,13 +2,99 @@ name: Desktop behavior tests
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
+env:
+  CI: true
+
 jobs:
-  test:
-    name: ${{ matrix.name }} behavior tests
+  quality:
+    name: Linux quality and behavior tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 11.7.0
+          run_install: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install Linux Tauri dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential file libayatana-appindicator3-dev libssl-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev patchelf
+      - name: Install stable Rust quality toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Create diagnostics directory
+        run: mkdir -p artifacts
+      - name: Run Linux quality and behavior gate
+        id: quality_gate
+        continue-on-error: true
+        timeout-minutes: 50
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee artifacts/quality.log) 2>&1
+          pnpm test:e2e:release-guard
+          pnpm typecheck
+          pnpm test
+          pnpm test:integration
+          pnpm ensure:official-node
+          pnpm build
+          pnpm smoke:dsh-cli
+          scripts/cargo-agent.sh fmt --all --manifest-path src-tauri/Cargo.toml -- --check
+          scripts/cargo-agent.sh clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          scripts/cargo-agent.sh test --manifest-path src-tauri/Cargo.toml --all-targets
+      - name: Verify the Harness submodule stayed unchanged
+        id: harness_guard
+        if: always()
+        continue-on-error: true
+        run: |
+          test -z "$(git -C deepseek-harness status --porcelain)"
+          git diff --exit-code --submodule=short -- deepseek-harness
+      - name: Sanitize bounded textual diagnostics
+        id: sanitize
+        if: always()
+        continue-on-error: true
+        run: node scripts/sanitize-ci-artifacts.mjs
+      - name: Retain quality diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quality-test-diagnostics-linux-x64
+          path: sanitized-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Fail if a Linux quality check failed
+        if: always()
+        env:
+          QUALITY_OUTCOME: ${{ steps.quality_gate.outcome }}
+          HARNESS_GUARD_OUTCOME: ${{ steps.harness_guard.outcome }}
+          SANITIZE_OUTCOME: ${{ steps.sanitize.outcome }}
+        run: |
+          outcomes="$QUALITY_OUTCOME $HARNESS_GUARD_OUTCOME $SANITIZE_OUTCOME"
+          case " $outcomes " in
+            *" failure "*|*" cancelled "*) exit 1 ;;
+          esac
+
+  e2e:
+    name: ${{ matrix.name }} desktop E2E
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -27,139 +113,62 @@ jobs:
           - name: Windows
             os: windows-2022
             e2e-command: pnpm test:e2e
-
     steps:
-      - name: Check out the pinned Harness source reference
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
-
-      - name: Install pnpm 11.7.0
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 11.7.0
           run_install: false
-
-      - name: Install Node 24
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
-
       - name: Install frozen dependencies
         run: pnpm install --frozen-lockfile
-
       - name: Install Linux Tauri and WebView test dependencies
         if: runner.os == 'Linux'
-        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            build-essential \
-            file \
-            libayatana-appindicator3-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            librsvg2-dev \
-            patchelf \
-            xvfb
-
+            build-essential file libayatana-appindicator3-dev libssl-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev patchelf xvfb
       - name: Install stable Rust toolchain
-        shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
-
-      - name: Prove release builds cannot enable debug WDIO seams
-        run: pnpm test:e2e:release-guard
-
+      - name: Prepare the official Node runtime and frontend
+        run: pnpm ensure:official-node && pnpm build
       - name: Create diagnostics directory
         shell: bash
         run: mkdir -p artifacts
-
-      - name: Typecheck
-        id: typecheck
-        continue-on-error: true
-        timeout-minutes: 5
-        shell: bash
-        run: set -o pipefail; pnpm typecheck 2>&1 | tee artifacts/typecheck.log
-
-      - name: Run unit tests
-        id: unit
-        continue-on-error: true
-        timeout-minutes: 10
-        shell: bash
-        run: set -o pipefail; pnpm test 2>&1 | tee artifacts/unit.log
-
-      - name: Run real-Host integration tests
-        id: integration
-        continue-on-error: true
-        timeout-minutes: 15
-        shell: bash
-        run: set -o pipefail; pnpm test:integration 2>&1 | tee artifacts/integration.log
-
-      - name: Download the fixed official Node and build the runtime closure
-        id: runtime_build
-        continue-on-error: true
-        timeout-minutes: 15
-        shell: bash
-        run: set -o pipefail; { pnpm ensure:official-node && pnpm build; } 2>&1 | tee artifacts/runtime-build.log
-
-      - name: Run real official Node plus published dsh web smoke test
-        id: smoke
-        continue-on-error: true
-        timeout-minutes: 20
-        shell: bash
-        run: set -o pipefail; pnpm smoke:dsh-cli 2>&1 | tee artifacts/smoke.log
-
       - name: Run embedded Tauri desktop E2E
         id: e2e
         continue-on-error: true
         timeout-minutes: 45
         shell: bash
         run: set -o pipefail; ${{ matrix.e2e-command }} 2>&1 | tee artifacts/e2e.log
-
-      - name: Verify the Harness submodule stayed unchanged
-        id: harness_guard
-        if: always()
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -o pipefail
-          test -z "$(git -C deepseek-harness status --porcelain)"
-          git diff --exit-code --submodule=short -- deepseek-harness
-
       - name: Sanitize bounded textual diagnostics
         id: sanitize
         if: always()
         continue-on-error: true
-        shell: bash
         run: node scripts/sanitize-ci-artifacts.mjs
-
-      - name: Retain test diagnostics
+      - name: Retain E2E diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: behavior-test-diagnostics-${{ runner.os }}-${{ runner.arch }}
+          name: e2e-test-diagnostics-${{ runner.os }}-${{ runner.arch }}
           path: sanitized-artifacts/
           if-no-files-found: warn
           retention-days: 7
-
-      - name: Fail if any behavior check failed
+      - name: Fail if an E2E check failed
         if: always()
-        shell: bash
         env:
-          TYPECHECK_OUTCOME: ${{ steps.typecheck.outcome }}
-          UNIT_OUTCOME: ${{ steps.unit.outcome }}
-          INTEGRATION_OUTCOME: ${{ steps.integration.outcome }}
-          RUNTIME_BUILD_OUTCOME: ${{ steps.runtime_build.outcome }}
-          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
           E2E_OUTCOME: ${{ steps.e2e.outcome }}
-          HARNESS_GUARD_OUTCOME: ${{ steps.harness_guard.outcome }}
           SANITIZE_OUTCOME: ${{ steps.sanitize.outcome }}
         run: |
-          outcomes="$TYPECHECK_OUTCOME $UNIT_OUTCOME $INTEGRATION_OUTCOME $RUNTIME_BUILD_OUTCOME $SMOKE_OUTCOME $E2E_OUTCOME $HARNESS_GUARD_OUTCOME $SANITIZE_OUTCOME"
+          outcomes="$E2E_OUTCOME $SANITIZE_OUTCOME"
           case " $outcomes " in
             *" failure "*|*" cancelled "*) exit 1 ;;
           esac

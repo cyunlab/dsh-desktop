@@ -5,7 +5,7 @@ const workflow = (await readFile(new URL('../../.github/workflows/build.yml', im
 
 describe('native build workflow contract', () => {
   it('pins every third-party action to a reviewed commit', () => {
-    const actions = [...workflow.matchAll(/uses:\s+([^\s#]+)(?:\s+#\s+(v\S+))?/g)]
+    const actions = [...workflow.matchAll(/uses:\s+([^\s#]+@[^\s#]+)(?:\s+#\s+(v\S+))?/g)]
     expect(actions).toHaveLength(7)
     for (const [, action, version] of actions) {
       expect(action).toMatch(/^[\w-]+\/[\w-]+@[0-9a-f]{40}$/)
@@ -13,8 +13,9 @@ describe('native build workflow contract', () => {
     }
   })
 
-  it('only has manual and version-candidate tag entry points', () => {
-    expect(workflow).toMatch(/^on:\n  workflow_dispatch:\n  push:\n    tags:/m)
+  it('only accepts version-candidate tags', () => {
+    expect(workflow).toMatch(/^on:\n  push:\n    tags:/m)
+    expect(workflow).not.toContain('workflow_dispatch')
     expect(workflow).not.toMatch(/^\s+pull_request:/m)
     expect(workflow).not.toMatch(/^\s+branches:/m)
     expect(workflow).toContain("- 'v*'")
@@ -58,17 +59,20 @@ describe('native build workflow contract', () => {
   })
 
   it('gates a draft-only tag release on all build jobs', () => {
-    expect(workflow).toMatch(/draft-release:[\s\S]*if: github\.event_name == 'push'[\s\S]*needs: build/)
+    expect(workflow).toMatch(/draft-release:[\s\S]*needs: build/)
     expect(workflow).toMatch(/draft-release:[\s\S]*actions\/checkout@[0-9a-f]{40}[\s\S]*node scripts\/reconcile-draft-release\.mjs/)
     expect(workflow).toContain('node scripts/verify-release-version.mjs')
     expect(workflow).toContain('node scripts/reconcile-draft-release.mjs')
+    expect(workflow).toContain('node scripts/generate-release-notes.mjs')
+    expect(workflow).toContain('fetch-depth: 0')
     expect(workflow).not.toMatch(/gh release (?:edit|create)[^\n]*--draft=false/)
     expect(workflow).not.toContain('gh release publish')
   })
 
   it('validates every tag candidate before allowing native builds', () => {
-    expect(workflow).toMatch(/validate-release-version:[\s\S]*if: github\.event_name == 'push'[\s\S]*node scripts\/verify-release-version\.mjs/)
-    expect(workflow).toMatch(/build:[\s\S]*needs: validate-release-version/)
+    expect(workflow).toMatch(/validate-release-version:[\s\S]*git merge-base --is-ancestor[\s\S]*node scripts\/verify-release-version\.mjs/)
+    expect(workflow).toMatch(/behavior-tests:[\s\S]*needs: validate-release-version[\s\S]*uses: \.\/\.github\/workflows\/test\.yml/)
+    expect(workflow).toMatch(/build:[\s\S]*needs: behavior-tests/)
   })
 
   it('uses release-ready artifact and workflow labels', () => {
@@ -83,8 +87,6 @@ describe('native build workflow contract', () => {
     expect(workflow).toContain('pattern: dsh-desktop-*')
     expect(workflow.toLowerCase()).not.toContain('unsigned')
     expect(workflow.toLowerCase()).not.toContain('development')
-    expect(workflow).toContain('SmartScreen')
-    expect(workflow).toContain('Gatekeeper')
-    expect(workflow).toContain('chmod +x')
+    expect(workflow).toContain('generate-release-notes.mjs')
   })
 })

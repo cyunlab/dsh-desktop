@@ -1,0 +1,3 @@
+# Gate tagged Tauri releases on tests and synchronized versions
+
+Tagged Tauri releases are accepted only from `main` when every Desktop manifest matches the semantic-version tag. A reusable test workflow runs platform-independent quality and behavior checks once on Linux and real desktop E2E on all four supported targets; native packages and a commit-derived Draft Release are created only after that gate succeeds. This keeps release provenance strict without repeating every static check on every runner, while a local atomic tagging command prevents routine version drift across npm, Tauri, and Cargo manifests.

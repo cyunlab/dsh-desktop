@@ -1,7 +1,6 @@
 name: Build desktop artifacts
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - 'v*'
@@ -15,17 +14,28 @@ env:
 
 jobs:
   validate-release-version:
-    name: Validate release version
+    name: Validate release candidate
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Require the tag to exactly match package.json
-        if: github.event_name == 'push'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the tag commit to belong to main
+        run: git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main
+      - name: Require every application manifest to match the tag
         run: node scripts/verify-release-version.mjs "${GITHUB_REF_NAME}"
+
+  behavior-tests:
+    name: Run release test gate
+    needs: validate-release-version
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
 
   build:
     name: Build ${{ matrix.artifact }}
-    needs: validate-release-version
+    needs: behavior-tests
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +63,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 11.7.0
@@ -69,26 +81,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            build-essential \
-            file \
-            libayatana-appindicator3-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            librsvg2-dev \
-            patchelf
+            build-essential file libayatana-appindicator3-dev libssl-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev patchelf
       - name: Install stable Rust toolchain
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Build native Tauri package with official Node and published CLI
         run: pnpm package
         env:
-          # Ubuntu 24.04 system libraries use DT_RELR; linuxdeploy's bundled strip cannot parse it.
+          # Ubuntu 24.04 libraries use DT_RELR, unsupported by linuxdeploy's bundled strip.
           NO_STRIP: ${{ runner.os == 'Linux' && 'true' || '' }}
       - name: Smoke test official Node plus published dsh web
         run: pnpm smoke:dsh-cli
       - name: Verify the exact native Tauri artifact
-        shell: bash
         run: node scripts/verify-tauri-artifact.mjs "${{ matrix.platform }}"
       - name: Upload desktop artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -100,32 +105,22 @@ jobs:
 
   draft-release:
     name: Create draft release
-    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: dsh-desktop-*
           path: artifacts
           merge-multiple: true
-      - name: Write installation notes
-        shell: bash
-        run: |
-          cat > release-notes.md <<'EOF'
-          ## Desktop build
-
-          Verify the downloaded filename and source before installing. Platform security prompts depend on the signing and notarization configuration used for this build.
-
-          - **Windows (x64, NSIS):** Microsoft Defender SmartScreen may warn that the publisher is unknown. Choose **More info**, verify the downloaded filename, then choose **Run anyway** only if you trust this repository and build.
-          - **macOS (Apple silicon arm64 or Intel x64, DMG):** Gatekeeper will block an unnotarized app. After verifying the downloaded filename, control-click the app in Finder, choose **Open**, then confirm **Open** only if you trust this repository and build.
-          - **Linux (x64, AppImage):** make the file executable with `chmod +x <filename>.AppImage`, then launch it directly.
-
-          Publishing this draft is an explicit maintainer action. This workflow never publishes a release automatically.
-          EOF
+      - name: Generate changes from the previous reachable release
+        run: node scripts/generate-release-notes.mjs "${GITHUB_REF_NAME}" release-notes.md
       - name: Create or update unpublished draft with native artifacts
         env:
           GH_TOKEN: ${{ github.token }}

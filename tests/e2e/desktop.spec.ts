@@ -249,11 +249,16 @@ describe('DeepSeek Harness Desktop Tauri behavior', () => {
   /** 调用真实 Tauri Window.close 触发 CloseRequested，并在 WebDriver session 断开后只轮询文件系统。 */
   after(async () => {
     const completionFile = process.env.DSH_TEST_COMPLETION_FILE
-    await browser.execute(async () => {
-      const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke(command: string, args?: Record<string, unknown>): Promise<unknown> } }).__TAURI_INTERNALS__
-      if (!internals) throw new Error('Tauri internals are unavailable')
-      await internals.invoke('plugin:window|close', { label: 'main' })
-    })
+    try {
+      await browser.execute(async () => {
+        const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke(command: string, args?: Record<string, unknown>): Promise<unknown> } }).__TAURI_INTERNALS__
+        if (!internals) throw new Error('Tauri internals are unavailable')
+        await internals.invoke('plugin:window|close', { label: 'main' })
+      })
+    } catch (error) {
+      // embedded provider 随最后窗口退出，成功的 close 可能先切断命令响应；后续 native cleanup 验证决定是否真的成功。
+      if (!/ECONNREFUSED|UND_ERR_SOCKET/.test(String(error))) throw error
+    }
     const generation = await waitForNativeCleanup()
     if (scenarioTestsPassed && completionFile) {
       await writeFile(completionFile, JSON.stringify({ status: 'passed', generation }), 'utf8')
