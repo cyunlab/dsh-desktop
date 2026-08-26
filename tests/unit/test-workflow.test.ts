@@ -64,6 +64,7 @@ describe('manual Desktop behavior workflow', () => {
     expect(contents.match(/e2e-command: pnpm test:e2e$/gm)).toHaveLength(3)
     expect(contents).toContain('pnpm test:e2e:xvfb')
     expect(contents).toContain('${{ matrix.e2e-command }} 2>&1')
+    expect(contents).toMatch(/- name: Fail if an E2E check failed\n[\s\S]*?shell: bash\n\s+run: \|/)
     expect(contents).toContain('pnpm test:e2e:release-guard')
     expect(contents).toContain('cargo-agent.sh fmt --all')
     expect(contents).toContain('cargo-agent.sh clippy')

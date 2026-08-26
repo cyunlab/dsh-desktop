@@ -167,6 +167,7 @@ jobs:
         env:
           E2E_OUTCOME: ${{ steps.e2e.outcome }}
           SANITIZE_OUTCOME: ${{ steps.sanitize.outcome }}
+        shell: bash
         run: |
           outcomes="$E2E_OUTCOME $SANITIZE_OUTCOME"
           case " $outcomes " in
