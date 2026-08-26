@@ -43,6 +43,7 @@ describe('native build workflow contract', () => {
   })
 
   it('installs the Linux Tauri system dependencies before packaging', () => {
+    expect(workflow).toContain("sudo find /etc/apt/sources.list.d -maxdepth 1 -type f ! -name 'ubuntu.sources' -delete")
     expect(workflow).toContain('libwebkit2gtk-4.1-dev')
     expect(workflow).toContain('libayatana-appindicator3-dev')
     expect(workflow).toContain('patchelf')

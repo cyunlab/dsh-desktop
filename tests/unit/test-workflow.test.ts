@@ -49,6 +49,7 @@ describe('manual Desktop behavior workflow', () => {
     expect(contents).toContain('node-version: 24')
     expect(contents).toContain('cache: pnpm')
     expect(contents).toContain('pnpm install --frozen-lockfile')
+    expect(contents.match(/sudo find \/etc\/apt\/sources\.list\.d -maxdepth 1 -type f ! -name 'ubuntu\.sources' -delete/g)).toHaveLength(2)
     expect(contents).toContain('git -C deepseek-harness status --porcelain')
     expect(contents).toContain('git diff --exit-code --submodule=short -- deepseek-harness')
   })
