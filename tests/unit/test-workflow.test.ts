@@ -10,9 +10,13 @@ async function workflow(): Promise<string> {
 describe('manual Desktop behavior workflow', () => {
   it('pins every third-party action to a reviewed commit with an exact version comment', async () => {
     const contents = await workflow()
-    const uses = [...contents.matchAll(/^\s*uses:\s+(\S+?@\S+)(?:\s+#\s+(\S+))?\s*$/gm)]
-    expect(uses).toHaveLength(4)
+    const uses = [...contents.matchAll(/uses:\s+(\S+?@\S+)(?:\s+#\s+(\S+))?\s*$/gm)]
+    expect(uses).toHaveLength(8)
     expect(uses.map(match => `${match[1]} # ${match[2]}`)).toEqual([
+      'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1',
+      'pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10',
+      'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0',
+      'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1',
       'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1',
       'pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10',
       'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0',
@@ -25,10 +29,10 @@ describe('manual Desktop behavior workflow', () => {
     expect(contents).not.toMatch(/^\s*uses:\s+\S+@(?:v\d+|main|master)\s*$/m)
   })
 
-  it('has workflow_dispatch as its only trigger', async () => {
+  it('supports manual and reusable invocation only', async () => {
     const contents = await workflow()
     const triggerBlock = contents.match(/^on:\n([\s\S]*?)\npermissions:/m)?.[1]
-    expect(triggerBlock).toBe('  workflow_dispatch:\n')
+    expect(triggerBlock).toBe('  workflow_dispatch:\n  workflow_call:\n')
     expect(contents).not.toMatch(/^\s+(?:push|pull_request):/m)
   })
 
@@ -44,7 +48,7 @@ describe('manual Desktop behavior workflow', () => {
     expect(contents).toContain('git diff --exit-code --submodule=short -- deepseek-harness')
   })
 
-  it('runs every behavior layer in a non-fail-fast three-platform matrix', async () => {
+  it('runs quality once on Linux and E2E in a non-fail-fast four-target matrix', async () => {
     const contents = await workflow()
     expect(contents).toContain('fail-fast: false')
     expect(contents).toContain('os: ubuntu-24.04')
@@ -52,15 +56,20 @@ describe('manual Desktop behavior workflow', () => {
     expect(contents).toContain('os: macos-15-intel')
     expect(contents).toContain('os: windows-2022')
     expect(contents).toContain('pnpm typecheck')
-    expect(contents).toContain('pnpm test 2>&1')
+    expect(contents).toContain('pnpm test\n')
     expect(contents).toContain('pnpm test:integration')
     expect(contents).toContain('pnpm ensure:official-node')
     expect(contents).toContain('pnpm build')
-    expect(contents).toContain('pnpm smoke:dsh-cli 2>&1')
+    expect(contents).toContain('pnpm smoke:dsh-cli')
     expect(contents.match(/e2e-command: pnpm test:e2e$/gm)).toHaveLength(3)
     expect(contents).toContain('pnpm test:e2e:xvfb')
     expect(contents).toContain('${{ matrix.e2e-command }} 2>&1')
     expect(contents).toContain('pnpm test:e2e:release-guard')
+    expect(contents).toContain('cargo-agent.sh fmt --all')
+    expect(contents).toContain('cargo-agent.sh clippy')
+    expect(contents).toContain('cargo-agent.sh test --manifest-path src-tauri/Cargo.toml --all-targets')
+    expect(contents).not.toContain('cargo-agent.sh test --manifest-path src-tauri/Cargo.toml --doc')
+    expect(contents).toContain('--component rustfmt --component clippy')
     expect(contents).not.toContain('tauri-driver')
   })
 

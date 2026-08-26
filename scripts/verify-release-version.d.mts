@@ -1,2 +1,5 @@
-/** 验证发布 tag 与 package.json 的语义版本完全一致。 */
-export function verifyReleaseVersion(tag: string | undefined, packageVersion: string): string
+export const SEMANTIC_VERSION: RegExp
+export function verifyReleaseVersion(tag: string | undefined, manifestVersion: string): string
+export function readCargoPackageVersion(contents: string, packageName: string): string
+export function readDesktopVersions(root?: string): Promise<Record<string, string>>
+export function verifyDesktopVersions(tag: string, versions: Record<string, string>): string
