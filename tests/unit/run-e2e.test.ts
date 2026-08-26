@@ -27,9 +27,10 @@ async function shutdownProofFixture(): Promise<{
     result: {
       status: 1,
       stdout: [
-        'COMMAND deleteSession()',
-        ' ERROR webdriver: WebDriverError: Request failed with error code ECONNREFUSED',
-        ' ERROR @wdio/local-runner: Failed launching test session: Error: WebDriverError: Request failed with error code ECONNREFUSED'
+        'ERROR diagnostics: Tauri Driver: tauri-driver not found. Install it with: cargo install tauri-driver',
+        '[0-0] ERROR webdriver: WebDriverError: Request failed with error code ECONNREFUSED when running "execute/sync" with method "POST"',
+        '[0-0] ERROR webdriver: WebDriverError: Request failed with error code ECONNREFUSED when running "http://127.0.0.1:4445/session/example" with method "DELETE"',
+        '[0-0] ERROR @wdio/local-runner: Failed launching test session: Error: WebDriverError: Request failed with error code ECONNREFUSED when running "http://127.0.0.1:4445/session/example" with method "DELETE"'
       ].join('\n'),
       stderr: ''
     }
@@ -49,7 +50,7 @@ describe('E2E shutdown disconnect proof', () => {
   it('rejects an arbitrary WDIO error even when cleanup evidence exists', async () => {
     const fixture = await shutdownProofFixture()
     try {
-      fixture.result.stdout += '\n ERROR webdriver: AssertionError: expected false to be true'
+      fixture.result.stdout += '\n[0-0] ERROR webdriver: AssertionError: expected false to be true'
       await expect(expectedNativeShutdownDisconnect(fixture.environment, fixture.result as never)).resolves.toBe(false)
     } finally {
       await rm(fixture.root, { recursive: true, force: true })
