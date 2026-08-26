@@ -15,12 +15,17 @@ const TRANSIENT_CLEANUP_ERRORS = new Set(['EBUSY', 'ENOTEMPTY', 'EPERM'])
 export async function removeInspectionRoot(directory, remover = rm, options = {}) {
   const maxRetries = options.maxRetries ?? 5
   const retryDelayMilliseconds = options.retryDelayMilliseconds ?? 200
+  const warn = options.warn ?? console.warn
   for (let attempt = 0; ; attempt += 1) {
     try {
       await remover(directory, { recursive: true, force: true })
       return
     } catch (error) {
-      if (!TRANSIENT_CLEANUP_ERRORS.has(error?.code) || attempt >= maxRetries) throw error
+      if (!TRANSIENT_CLEANUP_ERRORS.has(error?.code)) throw error
+      if (attempt >= maxRetries) {
+        warn(`Temporary artifact inspection directory remains busy after cleanup retries (${error.code}): ${directory}`)
+        return
+      }
       await new Promise(resolve => setTimeout(resolve, retryDelayMilliseconds * (attempt + 1)))
     }
   }

@@ -24,7 +24,11 @@ export function probeBundledRuntime(contentRoot: string, platformName: string, r
 export function removeInspectionRoot(
   directory: string,
   remover?: (directory: string, options: { recursive: true; force: true }) => Promise<void>,
-  options?: { readonly maxRetries?: number; readonly retryDelayMilliseconds?: number }
+  options?: {
+    readonly maxRetries?: number
+    readonly retryDelayMilliseconds?: number
+    readonly warn?: (message: string) => void
+  }
 ): Promise<void>
 
 /** 在真实 DMG 挂载点内执行检查，并在异常路径也确认卸载命令已发出。 */

@@ -423,4 +423,16 @@ describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TI
     }, { retryDelayMilliseconds: 1 })).resolves.toBeUndefined()
     expect(attempts).toBe(3)
   })
+
+  it('does not invalidate a verified artifact when detached mount cleanup stays busy', async () => {
+    const warnings: string[] = []
+    await expect(removeInspectionRoot('/tmp/fixture', async () => {
+      throw Object.assign(new Error('busy'), { code: 'EBUSY' })
+    }, {
+      maxRetries: 2,
+      retryDelayMilliseconds: 1,
+      warn: message => warnings.push(message)
+    })).resolves.toBeUndefined()
+    expect(warnings).toEqual([expect.stringContaining('EBUSY')])
+  })
 })
