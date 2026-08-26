@@ -40,7 +40,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: windows-2025
+          - runner: windows-2022
             platform: win
             arch: x64
             artifact_path: src-tauri/target/release/bundle/nsis/*.exe
@@ -87,12 +87,22 @@ jobs:
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Build native Tauri package with official Node and published CLI
-        run: pnpm package
+        if: ${{ !(matrix.platform == 'mac' && matrix.arch == 'x64') }}
+        run: pnpm package -- --verbose
         env:
           # Ubuntu 24.04 libraries use DT_RELR, unsupported by linuxdeploy's bundled strip.
           NO_STRIP: ${{ runner.os == 'Linux' && 'true' || '' }}
+          # Run AppImage tools without relying on FUSE being available in the hosted runner.
+          APPIMAGE_EXTRACT_AND_RUN: ${{ runner.os == 'Linux' && '1' || '' }}
+      - name: Build Intel macOS package with one bounded DMG retry
+        if: ${{ matrix.platform == 'mac' && matrix.arch == 'x64' }}
+        shell: bash
+        run: pnpm package -- --verbose || pnpm package -- --verbose
       - name: Smoke test official Node plus published dsh web
         run: pnpm smoke:dsh-cli
+        env:
+          # PowerShell startup is occasionally slower on hosted Windows runners.
+          DSH_WINDOWS_CONTROLLER_START_TIMEOUT_MS: ${{ runner.os == 'Windows' && '60000' || '' }}
       - name: Verify the exact native Tauri artifact
         run: node scripts/verify-tauri-artifact.mjs "${{ matrix.platform }}"
       - name: Upload desktop artifact

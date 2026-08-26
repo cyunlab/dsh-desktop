@@ -10,10 +10,20 @@ import { packagedDshCliCommand } from './runtime-closure.mjs'
 const root = path.resolve(import.meta.dirname, '..')
 const MAX_HTML_BYTES = 64 * 1024
 const WINDOWS_COMMAND_TIMEOUT_MS = 2_000
-const WINDOWS_CONTROLLER_START_TIMEOUT_MS = 15_000
+const DEFAULT_WINDOWS_CONTROLLER_START_TIMEOUT_MS = 60_000
 const WINDOWS_JOB_CONTROLLER = path.join(root, 'scripts', 'windows-job-controller.ps1')
 export const FIXED_HOST_ORIGIN = 'http://127.0.0.1:3080/'
 export const DIRECT_DSH_WEB_ARGS = Object.freeze(['web', '--host', '127.0.0.1', '--port', '3080'])
+
+/** 从环境变量读取正整数毫秒值，无效配置立即失败。 */
+export function readPositiveMilliseconds(value, fallback, variableName) {
+  if (value === undefined || value === '') return fallback
+  const milliseconds = Number(value)
+  if (!Number.isSafeInteger(milliseconds) || milliseconds <= 0) {
+    throw new Error(`${variableName} must be a positive integer`)
+  }
+  return milliseconds
+}
 
 /** 从命令行读取可选资源根与 runtime closure 根。 */
 function readOptions(argumentsList) {
@@ -202,7 +212,12 @@ async function spawnOwnedCli(command, workDirectory) {
   })
   const transport = createWindowsControllerTransport(controller)
   try {
-    const rootPid = await transport.ready(WINDOWS_CONTROLLER_START_TIMEOUT_MS)
+    const startTimeoutMilliseconds = readPositiveMilliseconds(
+      process.env.DSH_WINDOWS_CONTROLLER_START_TIMEOUT_MS,
+      DEFAULT_WINDOWS_CONTROLLER_START_TIMEOUT_MS,
+      'DSH_WINDOWS_CONTROLLER_START_TIMEOUT_MS'
+    )
+    const rootPid = await transport.ready(startTimeoutMilliseconds)
     return {
       child: controller,
       ownership: ownProcessTree(controller, {

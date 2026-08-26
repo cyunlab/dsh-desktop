@@ -28,7 +28,7 @@ describe('native build workflow contract', () => {
   })
 
   it('builds the Tauri package through the public package command', () => {
-    expect(workflow).toContain('pnpm package')
+    expect(workflow).toContain('pnpm package -- --verbose')
     expect(workflow).toContain('Build native Tauri package with official Node and published CLI')
     expect(workflow).toContain('Smoke test official Node plus published dsh web')
     expect(workflow).toContain('pnpm smoke:dsh-cli')
@@ -44,10 +44,20 @@ describe('native build workflow contract', () => {
 
   it('disables linuxdeploy stripping for the Linux AppImage build', () => {
     expect(workflow).toMatch(/Build native Tauri package with official Node and published CLI[\s\S]*NO_STRIP: \$\{\{ runner\.os == 'Linux' && 'true' \|\| '' \}\}/)
+    expect(workflow).toContain("APPIMAGE_EXTRACT_AND_RUN: ${{ runner.os == 'Linux' && '1' || '' }}")
+  })
+
+  it('bounds transient Intel DMG failures to one verbose retry', () => {
+    expect(workflow).toContain('Build Intel macOS package with one bounded DMG retry')
+    expect(workflow).toContain('run: pnpm package -- --verbose || pnpm package -- --verbose')
+  })
+
+  it('allows the Windows Job controller enough time to initialize', () => {
+    expect(workflow).toContain("DSH_WINDOWS_CONTROLLER_START_TIMEOUT_MS: ${{ runner.os == 'Windows' && '60000' || '' }}")
   })
 
   it.each([
-    ['windows-2025', 'win', 'x64', 'nsis/*.exe'],
+    ['windows-2022', 'win', 'x64', 'nsis/*.exe'],
     ['macos-15', 'mac', 'arm64', 'dmg/*.dmg'],
     ['macos-15-intel', 'mac', 'x64', 'dmg/*.dmg'],
     ['ubuntu-24.04', 'linux', 'x64', 'appimage/*.AppImage']

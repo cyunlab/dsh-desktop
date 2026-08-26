@@ -4,6 +4,9 @@ import type { PackagedDshCliCommand } from './runtime-closure.mjs'
 export const FIXED_HOST_ORIGIN: 'http://127.0.0.1:3080/'
 export const DIRECT_DSH_WEB_ARGS: readonly ['web', '--host', '127.0.0.1', '--port', '3080']
 
+/** 从环境变量读取正整数毫秒值。 */
+export function readPositiveMilliseconds(value: string | undefined, fallback: number, variableName: string): number
+
 export interface ProcessTreeOwnership {
   readonly rootPid?: number
   readonly platformName: NodeJS.Platform
