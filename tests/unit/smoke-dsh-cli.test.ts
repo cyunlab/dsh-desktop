@@ -156,4 +156,12 @@ describe('published dsh CLI smoke cleanup', () => {
     expect(JSON.parse(Buffer.from(argumentsList[encodedArgumentsIndex + 1], 'base64').toString('utf8'))).toEqual(command.args)
     expect(argumentsList[workingDirectoryIndex + 1]).toBe('C:\\probe cwd')
   })
+
+  it('decodes the Windows controller argv as a flat string array', async () => {
+    const source = await readFile(new URL('../../scripts/windows-job-controller.ps1', import.meta.url), 'utf8')
+    const decoder = source.slice(source.indexOf('function ConvertFrom-Base64Arguments'), source.indexOf('# 拼出 CreateProcessW'))
+    expect(decoder).toContain('$parsed = @($json | ConvertFrom-Json)')
+    expect(decoder).toContain('return $parsed')
+    expect(decoder).not.toContain('return ,$arguments')
+  })
 })

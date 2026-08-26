@@ -71,7 +71,7 @@ jobs:
           - runner: ubuntu-22.04
             platform: linux
             arch: x64
-            artifact_path: src-tauri/target/release/bundle/appimage/*.AppImage
+            artifact_path: src-tauri/target/release/bundle/deb/*.deb
             artifact: dsh-desktop-linux-x64
     runs-on: ${{ matrix.runner }}
     steps:
@@ -103,11 +103,6 @@ jobs:
       - name: Build native Tauri package with official Node and published CLI
         if: ${{ !(matrix.platform == 'mac' && matrix.arch == 'x64') }}
         run: pnpm package -- --verbose
-        env:
-          # Keep linuxdeploy from invoking its bundled strip on modern ELF binaries.
-          NO_STRIP: ${{ runner.os == 'Linux' && 'true' || '' }}
-          # Run AppImage tools without relying on FUSE being available in the hosted runner.
-          APPIMAGE_EXTRACT_AND_RUN: ${{ runner.os == 'Linux' && '1' || '' }}
       - name: Build Intel macOS package with one bounded DMG retry
         if: ${{ matrix.platform == 'mac' && matrix.arch == 'x64' }}
         shell: bash

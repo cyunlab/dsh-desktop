@@ -48,9 +48,9 @@ describe('native build workflow contract', () => {
     expect(workflow).toContain('patchelf')
   })
 
-  it('disables linuxdeploy stripping for the Linux AppImage build', () => {
-    expect(workflow).toMatch(/Build native Tauri package with official Node and published CLI[\s\S]*NO_STRIP: \$\{\{ runner\.os == 'Linux' && 'true' \|\| '' \}\}/)
-    expect(workflow).toContain("APPIMAGE_EXTRACT_AND_RUN: ${{ runner.os == 'Linux' && '1' || '' }}")
+  it('builds a Debian package without the unreliable linuxdeploy path', () => {
+    expect(workflow).not.toContain('NO_STRIP')
+    expect(workflow).not.toContain('APPIMAGE_EXTRACT_AND_RUN')
   })
 
   it('bounds transient Intel DMG failures to one verbose retry', () => {
@@ -66,7 +66,7 @@ describe('native build workflow contract', () => {
     ['windows-2025', 'win', 'x64', 'nsis/*.exe'],
     ['macos-15', 'mac', 'arm64', 'dmg/*.dmg'],
     ['macos-15-intel', 'mac', 'x64', 'dmg/*.dmg'],
-    ['ubuntu-22.04', 'linux', 'x64', 'appimage/*.AppImage']
+    ['ubuntu-22.04', 'linux', 'x64', 'deb/*.deb']
   ])('builds %s natively', (runner, platform, arch, artifactPath) => {
     expect(workflow).toContain(`runner: ${runner}`)
     expect(workflow).toContain(`platform: ${platform}`)

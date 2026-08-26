@@ -30,6 +30,7 @@ describe('Tauri resource layout', () => {
       'icons/icon.icns',
       'icons/icon.ico'
     ])
+    expect(config.bundle.targets).toEqual(['nsis', 'dmg', 'deb'])
   })
 
   /** 验证 dev hook 会准备完整资源并等待结束，避免 Cargo 在 dist 重建期间扫描资源。 */
