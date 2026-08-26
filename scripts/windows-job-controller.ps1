@@ -328,13 +328,19 @@ function ConvertFrom-Base64Arguments {
         throw 'argv JSON must be an array'
     }
 
-    $parsed = @($json | ConvertFrom-Json)
-    foreach ($argument in $parsed) {
+    $decoded = $json | ConvertFrom-Json
+    if ($decoded -isnot [System.Array]) {
+        throw 'argv JSON must be an array'
+    }
+
+    $parsed = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($argument in $decoded) {
         if ($null -eq $argument -or $argument -isnot [string]) {
             throw 'argv JSON must contain only strings'
         }
+        $parsed.Add([string] $argument)
     }
-    return $parsed
+    return $parsed.ToArray()
 }
 
 # 拼出 CreateProcessW 所需且可写的完整命令行。
