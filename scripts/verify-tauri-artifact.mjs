@@ -9,6 +9,22 @@ import { probeDirectDshWeb } from './smoke-dsh-cli.mjs'
 
 const execFileAsync = promisify(execFile)
 const projectRoot = path.resolve(import.meta.dirname, '..')
+const TRANSIENT_CLEANUP_ERRORS = new Set(['EBUSY', 'ENOTEMPTY', 'EPERM'])
+
+/** 删除安装包检查目录，并重试 macOS 卸载后的短暂文件系统占用。 */
+export async function removeInspectionRoot(directory, remover = rm, options = {}) {
+  const maxRetries = options.maxRetries ?? 5
+  const retryDelayMilliseconds = options.retryDelayMilliseconds ?? 200
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await remover(directory, { recursive: true, force: true })
+      return
+    } catch (error) {
+      if (!TRANSIENT_CLEANUP_ERRORS.has(error?.code) || attempt >= maxRetries) throw error
+      await new Promise(resolve => setTimeout(resolve, retryDelayMilliseconds * (attempt + 1)))
+    }
+  }
+}
 
 /** 根据 CI 矩阵平台返回发布包、资源目录和架构约束。 */
 function artifactContract(platformName, runtimeArch = hostArch()) {
@@ -280,7 +296,7 @@ async function verifyInspectableContainer(artifact, contract) {
     await verifyExtractedBundleContents(contentRoot, contract.platformName, contract.architecture === 'aarch64' ? 'arm64' : 'x64')
     await probeBundledRuntime(contentRoot, contract.platformName, contract.architecture === 'aarch64' ? 'arm64' : 'x64')
   } finally {
-    await rm(inspectionRoot, { recursive: true, force: true })
+    await removeInspectionRoot(inspectionRoot)
   }
 }
 

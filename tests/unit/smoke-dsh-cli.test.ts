@@ -2,7 +2,7 @@ import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
-import { ownProcessTree, processTreeHasExited, readPositiveMilliseconds, stopCliProcess, terminateProcessTree, waitForListenerClosed, windowsJobControllerArguments } from '../../scripts/smoke-dsh-cli.mjs'
+import { formatWindowsControllerExitError, ownProcessTree, processTreeHasExited, readPositiveMilliseconds, stopCliProcess, terminateProcessTree, waitForListenerClosed, windowsJobControllerArguments } from '../../scripts/smoke-dsh-cli.mjs'
 
 describe('published dsh CLI smoke cleanup', () => {
   it('accepts a configurable Windows controller startup deadline', () => {
@@ -10,6 +10,12 @@ describe('published dsh CLI smoke cleanup', () => {
     expect(readPositiveMilliseconds('90000', 60_000, 'TEST_TIMEOUT')).toBe(90_000)
     expect(() => readPositiveMilliseconds('0', 60_000, 'TEST_TIMEOUT')).toThrow('TEST_TIMEOUT must be a positive integer')
     expect(() => readPositiveMilliseconds('slow', 60_000, 'TEST_TIMEOUT')).toThrow('TEST_TIMEOUT must be a positive integer')
+  })
+
+  it('preserves bounded Windows controller stderr in startup failures', () => {
+    expect(formatWindowsControllerExitError(1, null, 'AssignProcessToJobObject failed\r\n'))
+      .toBe('Windows Job controller exited with 1: AssignProcessToJobObject failed')
+    expect(formatWindowsControllerExitError(null, 'SIGKILL', '')).toBe('Windows Job controller exited with SIGKILL')
   })
 
   it('waits until the Harness listener actually stops accepting connections', async () => {

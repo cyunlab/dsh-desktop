@@ -40,7 +40,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: windows-2022
+          - runner: windows-2025
             platform: win
             arch: x64
             artifact_path: src-tauri/target/release/bundle/nsis/*.exe
@@ -55,7 +55,7 @@ jobs:
             arch: x64
             artifact_path: src-tauri/target/release/bundle/dmg/*.dmg
             artifact: dsh-desktop-macos-x64
-          - runner: ubuntu-24.04
+          - runner: ubuntu-22.04
             platform: linux
             arch: x64
             artifact_path: src-tauri/target/release/bundle/appimage/*.AppImage
@@ -90,7 +90,7 @@ jobs:
         if: ${{ !(matrix.platform == 'mac' && matrix.arch == 'x64') }}
         run: pnpm package -- --verbose
         env:
-          # Ubuntu 24.04 libraries use DT_RELR, unsupported by linuxdeploy's bundled strip.
+          # Keep linuxdeploy from invoking its bundled strip on modern ELF binaries.
           NO_STRIP: ${{ runner.os == 'Linux' && 'true' || '' }}
           # Run AppImage tools without relying on FUSE being available in the hosted runner.
           APPIMAGE_EXTRACT_AND_RUN: ${{ runner.os == 'Linux' && '1' || '' }}

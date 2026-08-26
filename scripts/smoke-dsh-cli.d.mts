@@ -7,6 +7,9 @@ export const DIRECT_DSH_WEB_ARGS: readonly ['web', '--host', '127.0.0.1', '--por
 /** 从环境变量读取正整数毫秒值。 */
 export function readPositiveMilliseconds(value: string | undefined, fallback: number, variableName: string): number
 
+/** 将 controller 退出状态与有界 stderr 合并为可诊断错误。 */
+export function formatWindowsControllerExitError(code: number | null, signal: NodeJS.Signals | null, stderr: string): string
+
 export interface ProcessTreeOwnership {
   readonly rootPid?: number
   readonly platformName: NodeJS.Platform

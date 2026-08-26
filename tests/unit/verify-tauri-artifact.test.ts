@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { inspectMountedDmg, probeBundledRuntime, verifyExtractedBundleContents, verifyTauriArtifact } from '../../scripts/verify-tauri-artifact.mjs'
+import { inspectMountedDmg, probeBundledRuntime, removeInspectionRoot, verifyExtractedBundleContents, verifyTauriArtifact } from '../../scripts/verify-tauri-artifact.mjs'
 import { requiredRuntimeAssets, runtimeTarget } from '../../scripts/runtime-closure.mjs'
 import { probeDirectDshWeb, waitForListenerClosed } from '../../scripts/smoke-dsh-cli.mjs'
 
@@ -413,5 +413,14 @@ describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TI
     } finally {
       await rm(root, { recursive: true, force: true })
     }
+  })
+
+  it('retries transient macOS mount-directory cleanup failures', async () => {
+    let attempts = 0
+    await expect(removeInspectionRoot('/tmp/fixture', async () => {
+      attempts += 1
+      if (attempts < 3) throw Object.assign(new Error('busy'), { code: 'EBUSY' })
+    }, { retryDelayMilliseconds: 1 })).resolves.toBeUndefined()
+    expect(attempts).toBe(3)
   })
 })

@@ -11,6 +11,7 @@ const root = path.resolve(import.meta.dirname, '..')
 const MAX_HTML_BYTES = 64 * 1024
 const WINDOWS_COMMAND_TIMEOUT_MS = 2_000
 const DEFAULT_WINDOWS_CONTROLLER_START_TIMEOUT_MS = 60_000
+const MAX_WINDOWS_CONTROLLER_ERROR_BYTES = 4 * 1024
 const WINDOWS_JOB_CONTROLLER = path.join(root, 'scripts', 'windows-job-controller.ps1')
 export const FIXED_HOST_ORIGIN = 'http://127.0.0.1:3080/'
 export const DIRECT_DSH_WEB_ARGS = Object.freeze(['web', '--host', '127.0.0.1', '--port', '3080'])
@@ -23,6 +24,13 @@ export function readPositiveMilliseconds(value, fallback, variableName) {
     throw new Error(`${variableName} must be a positive integer`)
   }
   return milliseconds
+}
+
+/** 将 controller 退出状态与有界 stderr 合并为可诊断错误。 */
+export function formatWindowsControllerExitError(code, signal, stderr) {
+  const status = code ?? signal ?? 'unknown'
+  const detail = stderr.trim().replace(/[\r\n\t]+/g, ' ').slice(-MAX_WINDOWS_CONTROLLER_ERROR_BYTES)
+  return `Windows Job controller exited with ${status}${detail ? `: ${detail}` : ''}`
 }
 
 /** 从命令行读取可选资源根与 runtime closure 根。 */
@@ -115,6 +123,7 @@ export function windowsJobControllerArguments(command, workDirectory) {
 /** 将 Windows Job controller stdout 封装成带 request id 与 deadline 的行协议。 */
 function createWindowsControllerTransport(child) {
   let buffer = ''
+  let stderr = ''
   let nextRequestId = 1
   let readySettled = false
   let resolveReady
@@ -157,8 +166,12 @@ function createWindowsControllerTransport(child) {
       if (line) consumeLine(line)
     }
   })
+  child.stderr.setEncoding('utf8')
+  child.stderr.on('data', chunk => {
+    stderr = `${stderr}${chunk}`.slice(-MAX_WINDOWS_CONTROLLER_ERROR_BYTES)
+  })
   child.once('error', error => rejectAll(new Error(`Windows Job controller spawn failed: ${error.message}`)))
-  child.once('exit', (code, signal) => rejectAll(new Error(`Windows Job controller exited with ${code ?? signal ?? 'unknown'}`)))
+  child.once('exit', (code, signal) => rejectAll(new Error(formatWindowsControllerExitError(code, signal, stderr))))
   return Object.freeze({
     /** 等待 suspended root 已成功加入 Job 后才允许 verifier 继续。 */
     async ready(timeoutMilliseconds) {
