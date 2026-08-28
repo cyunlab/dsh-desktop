@@ -1,4 +1,6 @@
-use super::staging::{InstallKind, StageCandidate, StagingRepository, UpdateVerifier};
+use super::staging::{
+    atomic_replace_file, InstallKind, StageCandidate, StagingRepository, UpdateVerifier,
+};
 use super::{
     Clock, DownloadProgress, PreferenceError, PreferenceStore, StableRelease, UpdateController,
     UpdateEffect, UpdateInput, UpdateSnapshot, UpdateState,
@@ -16,7 +18,32 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 pub const UPDATE_SNAPSHOT_EVENT: &str = "app-update:snapshot";
-const UPDATE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const MANIFEST_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 大包下载只限制连接与无读取进展时间，不限制整个 body 总时长。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PackageClientPolicy {
+    connect_timeout: Duration,
+    read_idle_timeout: Duration,
+}
+
+impl PackageClientPolicy {
+    /// 返回适合 57–231MB 更新包的默认网络策略。
+    fn production() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(30),
+            read_idle_timeout: Duration::from_secs(60),
+        }
+    }
+
+    /// 构建不含 total timeout 的 reqwest client。
+    fn build_client(self) -> Result<reqwest::Client, reqwest::Error> {
+        reqwest::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .read_timeout(self.read_idle_timeout)
+            .build()
+    }
+}
 use std::path::Path;
 
 /// 平台安装完成后说明是否已由 installer 接管重新启动。
@@ -566,8 +593,11 @@ impl PreferenceStore for FilePreferenceStore {
         })
         .map_err(|_| PreferenceError("update preference is unavailable".into()))?;
         fs::write(&temporary, bytes)
-            .and_then(|_| fs::rename(&temporary, &self.path))
-            .map_err(|_| PreferenceError("update preference is unavailable".into()))?;
+            .and_then(|_| atomic_replace_file(&temporary, &self.path))
+            .map_err(|_| {
+                let _ = fs::remove_file(&temporary);
+                PreferenceError("update preference is unavailable".into())
+            })?;
         self.automatic_download = Some(enabled);
         self.warning = None;
         Ok(())
@@ -844,7 +874,7 @@ impl TauriUpdateRuntime {
         };
         let updater = match app
             .updater_builder()
-            .timeout(UPDATE_HTTP_TIMEOUT)
+            .timeout(MANIFEST_HTTP_TIMEOUT)
             .endpoints(vec![endpoint])
             .map(|builder| builder.pubkey(&config.public_key))
             .and_then(|builder| builder.build())
@@ -907,10 +937,7 @@ impl TauriUpdateRuntime {
             return;
         }
         self.dispatch(app, UpdateInput::DownloadStarted);
-        let client = match reqwest::Client::builder()
-            .timeout(UPDATE_HTTP_TIMEOUT)
-            .build()
-        {
+        let client = match PackageClientPolicy::production().build_client() {
             Ok(client) => client,
             Err(_) => {
                 self.dispatch(
@@ -1265,10 +1292,18 @@ mod tests {
         );
     }
 
-    /// 检查和下载网络边界共享三十秒有界超时策略。
+    /// Manifest 有总时限，大包下载只有连接和读取空闲时限。
     #[test]
-    fn update_http_timeout_is_bounded_to_thirty_seconds() {
-        assert_eq!(UPDATE_HTTP_TIMEOUT, Duration::from_secs(30));
+    fn package_download_policy_has_no_total_timeout() {
+        assert_eq!(MANIFEST_HTTP_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(
+            PackageClientPolicy::production(),
+            PackageClientPolicy {
+                connect_timeout: Duration::from_secs(30),
+                read_idle_timeout: Duration::from_secs(60),
+            }
+        );
+        PackageClientPolicy::production().build_client().unwrap();
     }
 
     /// 重启安装必须先确认 cleanup，再安装并 relaunch。
@@ -1387,6 +1422,26 @@ mod tests {
         fs::write(&path, br#"{"automatic_download":true}"#).unwrap();
         let controller = UpdateController::new("2.0.15", SystemClock::new(), store).unwrap();
         assert!(!controller.snapshot().automatic_download);
+    }
+
+    /// 自动下载偏好可以原子覆盖已有文件，且失败不会残留临时文件。
+    #[test]
+    fn preference_save_replaces_existing_file_and_cleans_failed_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("updater-preference.json");
+        let mut store = FilePreferenceStore::new(path.clone());
+        store.save_automatic_download(false).unwrap();
+        store.save_automatic_download(true).unwrap();
+        assert!(
+            serde_json::from_slice::<StoredPreference>(&fs::read(&path).unwrap())
+                .unwrap()
+                .automatic_download
+        );
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(store.save_automatic_download(false).is_err());
+        assert!(!path.with_extension("json.tmp").exists());
     }
 
     /// 并发输入的发布顺序必须与 controller 单调 sequence 完全一致。
