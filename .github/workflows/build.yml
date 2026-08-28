@@ -101,12 +101,56 @@ jobs:
       - name: Install stable Rust toolchain
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Import Developer ID certificate and notarization key
+        if: matrix.platform == 'mac'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/dsh-desktop-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          certificate="$RUNNER_TEMP/developer-id.p12"
+          api_key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+
+          printf '%s' "$APPLE_CERTIFICATE" | openssl base64 -d -A -out "$certificate"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" | openssl base64 -d -A -out "$api_key"
+          chmod 600 "$certificate" "$api_key"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security find-identity -v -p codesigning "$keychain" | grep -F "$APPLE_SIGNING_IDENTITY"
+          echo "APPLE_API_KEY_PATH=$api_key" >> "$GITHUB_ENV"
       - name: Build native Tauri package with official Node and published CLI
         if: ${{ !(matrix.platform == 'mac' && matrix.arch == 'x64') }}
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ matrix.platform == 'mac' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_API_ISSUER: ${{ matrix.platform == 'mac' && secrets.APPLE_API_ISSUER || '' }}
+          APPLE_API_KEY: ${{ matrix.platform == 'mac' && secrets.APPLE_API_KEY || '' }}
         run: pnpm package -- --verbose
       - name: Build Intel macOS package without Finder DMG automation
         if: ${{ matrix.platform == 'mac' && matrix.arch == 'x64' }}
         shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: |
           pnpm tauri:build --bundles app --verbose
           version="$(node -p "require('./package.json').version")"
@@ -117,6 +161,32 @@ jobs:
           mkdir -p "$dmg_directory"
           hdiutil create -volname "DeepSeek Harness Desktop" \
             -srcfolder "$app_path" -ov -format UDZO "$dmg_path"
+      - name: Sign, notarize, and staple macOS package
+        if: matrix.platform == 'mac'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(src-tauri/target/release/bundle/dmg/*.dmg)
+          if (( ${#dmgs[@]} != 1 )); then
+            echo "Expected exactly one macOS DMG, found ${#dmgs[@]}." >&2
+            exit 1
+          fi
+          dmg="${dmgs[0]}"
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$dmg"
+          codesign --verify --strict --verbose=2 "$dmg"
+          xcrun notarytool submit "$dmg" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --key "$APPLE_API_KEY_PATH" \
+            --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg"
       - name: Smoke test official Node plus published dsh web
         run: pnpm smoke:dsh-cli
         env:

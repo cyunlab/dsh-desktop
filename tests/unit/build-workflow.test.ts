@@ -62,6 +62,20 @@ describe('native build workflow contract', () => {
     expect(workflow).not.toContain('pnpm package -- --verbose || pnpm package -- --verbose')
   })
 
+  /** 确保两个 macOS 架构都经过 Developer ID 签名、Apple 公证和装订。 */
+  it('signs and notarizes every macOS release artifact', () => {
+    expect(workflow).toContain("if: matrix.platform == 'mac'")
+    expect(workflow).toContain('APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}')
+    expect(workflow).toContain('APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}')
+    expect(workflow).toContain('APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}')
+    expect(workflow).toContain('APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}')
+    expect(workflow).toContain('security import "$certificate"')
+    expect(workflow).toContain('codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$dmg"')
+    expect(workflow).toContain('xcrun notarytool submit "$dmg"')
+    expect(workflow).toContain('xcrun stapler validate "$dmg"')
+    expect(workflow).toContain('spctl --assess --type open')
+  })
+
   it('allows the Windows Job controller enough time to initialize', () => {
     expect(workflow).toContain("DSH_WINDOWS_CONTROLLER_START_TIMEOUT_MS: ${{ runner.os == 'Windows' && '60000' || '' }}")
   })
