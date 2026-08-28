@@ -203,6 +203,7 @@ function processExists(pid: number): boolean {
 }
 
 describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TIMEOUT_MS }, () => {
+  /** 验证 Linux 发布验收使用 x86_64 AppImage 容器与运行时闭包。 */
   it('accepts one x86_64 AppImage as the Linux release artifact', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'dsh-appimage-contract-'))
     const artifactDirectory = path.join(root, 'src-tauri', 'target', 'release', 'bundle', 'appimage')
