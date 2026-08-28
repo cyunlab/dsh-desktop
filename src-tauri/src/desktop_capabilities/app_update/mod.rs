@@ -124,9 +124,6 @@ pub enum UpdateEffect {
     StartDownload {
         release: StableRelease,
     },
-    DiscardOlderStaged {
-        replacement_version: String,
-    },
     ScheduleRetry {
         operation: UpdateOperation,
         after: Duration,
@@ -142,6 +139,7 @@ pub enum UpdateInput {
     ManualCheck,
     CheckSucceeded { release: Option<StableRelease> },
     CheckFailed { message: String, retryable: bool },
+    StagingDiscardFailed,
     SetAutomaticDownload(bool),
     DownloadStarted,
     DownloadAdvanced(DownloadProgress),
@@ -239,6 +237,7 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
             UpdateInput::PeriodicCheckDue if self.ready && !self.operation_in_flight() => {
                 self.start_check(true, &mut effects)
             }
+            UpdateInput::PeriodicCheckDue if self.ready => self.schedule_next_check(&mut effects),
             UpdateInput::PeriodicCheckDue => {}
             UpdateInput::ManualCheck if !self.operation_in_flight() => {
                 self.start_check(false, &mut effects)
@@ -249,6 +248,17 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
             }
             UpdateInput::CheckFailed { message, retryable } => {
                 self.accept_failure(UpdateOperation::Check, message, retryable, &mut effects);
+            }
+            UpdateInput::StagingDiscardFailed => {
+                self.operation_active = false;
+                self.staged_version = None;
+                self.current_release = None;
+                self.pending_retry = None;
+                self.snapshot.state = UpdateState::Failed {
+                    operation: UpdateOperation::Check,
+                    retryable: false,
+                    message: "update storage failed".into(),
+                };
             }
             UpdateInput::SetAutomaticDownload(enabled) => {
                 self.preferences.save_automatic_download(enabled)?;
@@ -327,9 +337,6 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
         }
         if self.staged_version.is_some() {
             self.staged_version = None;
-            effects.push(UpdateEffect::DiscardOlderStaged {
-                replacement_version: release.version.clone(),
-            });
         }
         self.snapshot.state = UpdateState::Available {
             version: release.version.clone(),
@@ -346,6 +353,14 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
     /// 判断真实检查或下载操作是否已经占用单一更新操作槽位。
     fn operation_in_flight(&self) -> bool {
         self.operation_active
+    }
+
+    /// 忙碌时只续订六小时 timer，避免消费唯一周期信号后永久停止检查。
+    fn schedule_next_check(&mut self, effects: &mut Vec<UpdateEffect>) {
+        self.snapshot.next_check_at = Some(self.clock.now() + CHECK_INTERVAL);
+        effects.push(UpdateEffect::ScheduleCheck {
+            after: CHECK_INTERVAL,
+        });
     }
 
     /// 将已接受的 Stable 发布转换为下载中状态。

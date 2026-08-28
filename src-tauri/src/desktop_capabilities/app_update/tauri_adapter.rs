@@ -16,6 +16,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 pub const UPDATE_SNAPSHOT_EVENT: &str = "app-update:snapshot";
+const UPDATE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 use std::path::Path;
 
 /// 平台安装完成后说明是否已由 installer 接管重新启动。
@@ -237,20 +238,31 @@ impl RenameBoundary for FileSystemRename {
     }
 }
 
-/// 仅移动一次当前应用，并在候选替换失败时恢复原应用。
+/// 表示替换失败是否仍安全恢复了旧应用。
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplaceTransactionError {
+    RolledBack,
+    RollbackFailed,
+}
+
+/// 仅移动一次当前应用，并在候选替换或后处理失败时恢复原应用。
 #[cfg(any(target_os = "linux", test))]
 fn replace_with_rollback(
     boundary: &mut impl RenameBoundary,
     destination: &Path,
     candidate: &Path,
     backup: &Path,
-) -> Result<(), String> {
+    post_replace: impl FnOnce() -> Result<(), ()>,
+) -> Result<(), ReplaceTransactionError> {
     boundary
         .rename(destination, backup)
-        .map_err(|_| "update replacement failed".to_string())?;
-    if boundary.rename(candidate, destination).is_err() {
-        let _ = boundary.rename(backup, destination);
-        return Err("update replacement failed".into());
+        .map_err(|_| ReplaceTransactionError::RolledBack)?;
+    if boundary.rename(candidate, destination).is_err() || post_replace().is_err() {
+        return match boundary.rename(backup, destination) {
+            Ok(()) => Err(ReplaceTransactionError::RolledBack),
+            Err(_) => Err(ReplaceTransactionError::RollbackFailed),
+        };
     }
     Ok(())
 }
@@ -308,12 +320,25 @@ fn install_linux_appimage(package: &Path) -> Result<(), String> {
         .permissions();
     fs::set_permissions(&candidate, permissions).map_err(|_| "update extraction failed")?;
     let backup = temporary.path().join("current.AppImage");
-    replace_with_rollback(&mut FileSystemRename, &destination, &candidate, &backup)?;
-    let mut executable = fs::metadata(&destination)
-        .map_err(|_| "update replacement failed")?
-        .permissions();
-    executable.set_mode(executable.mode() | 0o700);
-    fs::set_permissions(destination, executable).map_err(|_| "update replacement failed")
+    let transaction = replace_with_rollback(
+        &mut FileSystemRename,
+        &destination,
+        &candidate,
+        &backup,
+        || {
+            let mut executable = fs::metadata(&destination).map_err(|_| ())?.permissions();
+            executable.set_mode(executable.mode() | 0o700);
+            fs::set_permissions(&destination, executable).map_err(|_| ())
+        },
+    );
+    match transaction {
+        Ok(()) => Ok(()),
+        Err(ReplaceTransactionError::RolledBack) => Err("update replacement failed".into()),
+        Err(ReplaceTransactionError::RollbackFailed) => {
+            let _preserved_directory = temporary.keep();
+            Err("update rollback failed; backup preserved".into())
+        }
+    }
 }
 
 /// 在 Windows 上从 updater ZIP 或原始 EXE 启动 current-user NSIS installer。
@@ -486,25 +511,45 @@ struct StoredPreference {
 /// 在应用配置目录原子持久化自动下载偏好。
 pub struct FilePreferenceStore {
     path: PathBuf,
+    automatic_download: Option<bool>,
+    warning: Option<PreferenceLoadWarning>,
+}
+
+/// 记录偏好为何采用默认值，不携带文件路径或内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreferenceLoadWarning {
+    Invalid,
+    Unavailable,
 }
 
 impl FilePreferenceStore {
     /// 创建仅拥有 updater 偏好文件的存储边界。
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        let (automatic_download, warning) = match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<StoredPreference>(&bytes) {
+                Ok(value) => (Some(value.automatic_download), None),
+                Err(_) => (None, Some(PreferenceLoadWarning::Invalid)),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(_) => (None, Some(PreferenceLoadWarning::Unavailable)),
+        };
+        Self {
+            path,
+            automatic_download,
+            warning,
+        }
+    }
+
+    /// 返回单次读取产生的安全默认原因。
+    fn warning(&self) -> Option<PreferenceLoadWarning> {
+        self.warning
     }
 }
 
 impl PreferenceStore for FilePreferenceStore {
     /// 缺失、损坏或不可读文件均安全回退默认值，避免阻断 Host Ready。
     fn load_automatic_download(&self) -> Result<Option<bool>, PreferenceError> {
-        match fs::read(&self.path) {
-            Ok(bytes) => serde_json::from_slice::<StoredPreference>(&bytes)
-                .map(|value| Some(value.automatic_download))
-                .or(Ok(None)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(_) => Ok(None),
-        }
+        Ok(self.automatic_download)
     }
 
     /// 通过同目录临时文件替换偏好，避免半写入设置。
@@ -522,15 +567,10 @@ impl PreferenceStore for FilePreferenceStore {
         .map_err(|_| PreferenceError("update preference is unavailable".into()))?;
         fs::write(&temporary, bytes)
             .and_then(|_| fs::rename(&temporary, &self.path))
-            .map_err(|_| PreferenceError("update preference is unavailable".into()))
-    }
-}
-
-/// 判断偏好文件是否存在读取/格式异常，需要记录安全默认诊断。
-fn preference_needs_default(path: &Path) -> bool {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice::<StoredPreference>(&bytes).is_err(),
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            .map_err(|_| PreferenceError("update preference is unavailable".into()))?;
+        self.automatic_download = Some(enabled);
+        self.warning = None;
+        Ok(())
     }
 }
 
@@ -559,6 +599,19 @@ fn transition_and_publish<C: Clock, P: PreferenceStore>(
     Some(output.effects)
 }
 
+/// 将候选发布提交给领域前先完成旧 staging 清理，存储失败则关闭安装资格。
+fn prepare_checked_release<V: UpdateVerifier>(
+    repository: Option<&mut StagingRepository<V>>,
+    release: StableRelease,
+) -> UpdateInput {
+    match repository.map(|repository| repository.discard_if_older_than(&release.version)) {
+        Some(Ok(_)) => UpdateInput::CheckSucceeded {
+            release: Some(release),
+        },
+        _ => UpdateInput::StagingDiscardFailed,
+    }
+}
+
 impl TauriUpdateRuntime {
     /// 从应用路径与构建信任根创建 fail-closed updater runtime。
     pub fn new(app: &AppHandle) -> Result<Arc<Self>, String> {
@@ -575,11 +628,12 @@ impl TauriUpdateRuntime {
             .map_err(|_| "update cache directory unavailable")?;
         let log_path = config_dir.join("logs").join("updater.jsonl");
         let preference_path = config_dir.join("updater-preference.json");
-        let preference_warning = preference_needs_default(&preference_path);
+        let preferences = FilePreferenceStore::new(preference_path);
+        let preference_warning = preferences.warning();
         let controller = UpdateController::new(
             &app.package_info().version.to_string(),
             SystemClock::new(),
-            FilePreferenceStore::new(preference_path),
+            preferences,
         )
         .map_err(|_| "update controller unavailable")?;
         let mut staging = config.as_ref().ok().and_then(|config| {
@@ -606,8 +660,8 @@ impl TauriUpdateRuntime {
             log_path,
             last_http_status: Mutex::new(None),
         });
-        if preference_warning {
-            runtime.record_preference_warning();
+        if let Some(warning) = preference_warning {
+            runtime.record_preference_warning(warning);
         }
         Ok(runtime)
     }
@@ -694,9 +748,12 @@ impl TauriUpdateRuntime {
     }
 
     /// 记录偏好损坏或不可读后的安全默认，不阻断 Desktop Ready。
-    fn record_preference_warning(&self) {
+    fn record_preference_warning(&self, warning: PreferenceLoadWarning) {
         let record = SafeUpdateLog {
-            event: "preference-defaulted",
+            event: match warning {
+                PreferenceLoadWarning::Invalid => "preference-invalid-defaulted",
+                PreferenceLoadWarning::Unavailable => "preference-unavailable-defaulted",
+            },
             version: None,
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             http_status: None,
@@ -753,15 +810,6 @@ impl TauriUpdateRuntime {
                     runtime.download_pending(&app, release).await;
                 });
             }
-            UpdateEffect::DiscardOlderStaged {
-                replacement_version,
-            } => {
-                if let Ok(mut staging) = self.staging.lock() {
-                    if let Some(repository) = staging.as_mut() {
-                        let _ = repository.discard_if_older_than(&replacement_version);
-                    }
-                }
-            }
         }
     }
 
@@ -796,6 +844,7 @@ impl TauriUpdateRuntime {
         };
         let updater = match app
             .updater_builder()
+            .timeout(UPDATE_HTTP_TIMEOUT)
             .endpoints(vec![endpoint])
             .map(|builder| builder.pubkey(&config.public_key))
             .and_then(|builder| builder.build())
@@ -821,12 +870,13 @@ impl TauriUpdateRuntime {
                 if let Ok(mut pending) = self.pending.lock() {
                     *pending = Some(update);
                 }
-                self.dispatch(
-                    app,
-                    UpdateInput::CheckSucceeded {
-                        release: Some(release),
-                    },
-                );
+                let input = self
+                    .staging
+                    .lock()
+                    .ok()
+                    .map(|mut staging| prepare_checked_release(staging.as_mut(), release))
+                    .unwrap_or(UpdateInput::StagingDiscardFailed);
+                self.dispatch(app, input);
             }
             Ok(Some(_)) => self.dispatch(
                 app,
@@ -857,7 +907,23 @@ impl TauriUpdateRuntime {
             return;
         }
         self.dispatch(app, UpdateInput::DownloadStarted);
-        let response = match reqwest::Client::new()
+        let client = match reqwest::Client::builder()
+            .timeout(UPDATE_HTTP_TIMEOUT)
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => {
+                self.dispatch(
+                    app,
+                    UpdateInput::DownloadFailed {
+                        message: "update download failed".into(),
+                        retryable: false,
+                    },
+                );
+                return;
+            }
+        };
+        let response = match client
             .get(update.download_url.clone())
             .headers(update.headers.clone())
             .send()
@@ -989,11 +1055,13 @@ impl TauriUpdateRuntime {
 
     /// 判断是否存在已验证、等待正常退出或显式重启安装的包。
     pub fn has_staged(&self) -> bool {
-        self.staging
+        let repository_has_staged = self
+            .staging
             .lock()
             .ok()
             .and_then(|repository| repository.as_ref().and_then(StagingRepository::snapshot))
-            .is_some()
+            .is_some();
+        staged_install_allowed(&self.snapshot(), repository_has_staged)
     }
 
     /// 安装前复验唯一 staging package，并通过持久化可信计划离线安装。
@@ -1002,6 +1070,9 @@ impl TauriUpdateRuntime {
         app: &AppHandle,
         relaunch: bool,
     ) -> Result<OfflineInstallOutcome, String> {
+        if !self.has_staged() {
+            return Err("no trusted staged update".into());
+        }
         let mut repositories = self
             .staging
             .lock()
@@ -1017,6 +1088,11 @@ impl TauriUpdateRuntime {
 /// 将下载 effect 绑定到产生它的可信 pending Update 版本，拒绝过期配对。
 fn pending_version_matches(pending_version: &str, release: &StableRelease) -> bool {
     pending_version == release.version
+}
+
+/// 只有领域与磁盘同时确认可信 Staged 时才允许退出安装。
+fn staged_install_allowed(snapshot: &UpdateSnapshot, repository_has_staged: bool) -> bool {
+    matches!(snapshot.state, UpdateState::Staged { .. }) && repository_has_staged
 }
 
 /// 只对超时、限流和服务端失败安排有界自动重试。
@@ -1097,15 +1173,16 @@ mod tests {
     use std::io::Write;
 
     /// 在第二次移动失败时记录可观察的回滚路径。
-    struct FailingSecondRename {
+    struct ScriptedRename {
         calls: Vec<(PathBuf, PathBuf)>,
+        fail_on: Vec<usize>,
     }
 
-    impl RenameBoundary for FailingSecondRename {
-        /// 第二次调用模拟候选替换失败，其余调用成功。
+    impl RenameBoundary for ScriptedRename {
+        /// 按调用序号模拟文件系统失败，其余调用成功。
         fn rename(&mut self, source: &Path, destination: &Path) -> std::io::Result<()> {
             self.calls.push((source.into(), destination.into()));
-            if self.calls.len() == 2 {
+            if self.fail_on.contains(&self.calls.len()) {
                 Err(std::io::Error::other("injected replacement failure"))
             } else {
                 Ok(())
@@ -1188,6 +1265,12 @@ mod tests {
         );
     }
 
+    /// 检查和下载网络边界共享三十秒有界超时策略。
+    #[test]
+    fn update_http_timeout_is_bounded_to_thirty_seconds() {
+        assert_eq!(UPDATE_HTTP_TIMEOUT, Duration::from_secs(30));
+    }
+
     /// 重启安装必须先确认 cleanup，再安装并 relaunch。
     #[test]
     fn restart_installs_only_after_cleanup_then_relaunches() {
@@ -1211,14 +1294,20 @@ mod tests {
     /// AppImage 候选替换失败时只移动一次当前应用并恢复备份。
     #[test]
     fn appimage_replacement_failure_rolls_back_original() {
-        let mut boundary = FailingSecondRename { calls: Vec::new() };
-        assert!(replace_with_rollback(
-            &mut boundary,
-            Path::new("current.AppImage"),
-            Path::new("candidate.AppImage"),
-            Path::new("backup.AppImage"),
-        )
-        .is_err());
+        let mut boundary = ScriptedRename {
+            calls: Vec::new(),
+            fail_on: vec![2],
+        };
+        assert_eq!(
+            replace_with_rollback(
+                &mut boundary,
+                Path::new("current.AppImage"),
+                Path::new("candidate.AppImage"),
+                Path::new("backup.AppImage"),
+                || Ok(()),
+            ),
+            Err(ReplaceTransactionError::RolledBack)
+        );
         assert_eq!(
             boundary.calls,
             [
@@ -1238,6 +1327,45 @@ mod tests {
         );
     }
 
+    /// 候选替换与回滚同时失败时必须报告 backup 仍需持久保留。
+    #[test]
+    fn appimage_rollback_failure_is_distinguished() {
+        let mut boundary = ScriptedRename {
+            calls: Vec::new(),
+            fail_on: vec![2, 3],
+        };
+        assert_eq!(
+            replace_with_rollback(
+                &mut boundary,
+                Path::new("current.AppImage"),
+                Path::new("candidate.AppImage"),
+                Path::new("backup.AppImage"),
+                || Ok(()),
+            ),
+            Err(ReplaceTransactionError::RollbackFailed)
+        );
+    }
+
+    /// 候选落位后的权限处理失败也必须恢复旧 AppImage。
+    #[test]
+    fn appimage_post_replace_failure_rolls_back_original() {
+        let mut boundary = ScriptedRename {
+            calls: Vec::new(),
+            fail_on: Vec::new(),
+        };
+        assert_eq!(
+            replace_with_rollback(
+                &mut boundary,
+                Path::new("current.AppImage"),
+                Path::new("candidate.AppImage"),
+                Path::new("backup.AppImage"),
+                || Err(()),
+            ),
+            Err(ReplaceTransactionError::RolledBack)
+        );
+        assert_eq!(boundary.calls.len(), 3);
+    }
+
     /// 损坏偏好不会阻断 controller 初始化，并安全回退自动下载开启。
     #[test]
     fn corrupt_preference_is_non_blocking_and_defaults_enabled() {
@@ -1247,6 +1375,18 @@ mod tests {
         let controller =
             UpdateController::new("2.0.15", SystemClock::new(), FilePreferenceStore::new(path));
         assert!(controller.unwrap().snapshot().automatic_download);
+    }
+
+    /// 偏好构造后采用的值不会因 controller 初始化前文件变化而二次读取。
+    #[test]
+    fn preference_value_is_adopted_from_a_single_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("updater-preference.json");
+        fs::write(&path, br#"{"automatic_download":false}"#).unwrap();
+        let store = FilePreferenceStore::new(path.clone());
+        fs::write(&path, br#"{"automatic_download":true}"#).unwrap();
+        let controller = UpdateController::new("2.0.15", SystemClock::new(), store).unwrap();
+        assert!(!controller.snapshot().automatic_download);
     }
 
     /// 并发输入的发布顺序必须与 controller 单调 sequence 完全一致。
@@ -1296,6 +1436,62 @@ mod tests {
                 release_notes: String::new(),
             }
         ));
+    }
+
+    /// 清理旧 staging 失败时领域进入失败态，正常退出不得安装磁盘残留。
+    #[test]
+    fn discard_failure_suppresses_normal_exit_installation() {
+        let cache = tempfile::tempdir().unwrap();
+        let key_text = "untrusted comment: minisign public key E7620F1842B4E81F\nRWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+        let signature_text = "untrusted comment: signature from minisign secret key\nRWQf6LRCGA9i59SLOFxz6NxvASXDJeRtuZykwQepbDEGt87ig1BNpWaVWuNrm73YiIiJbq71Wi+dP9eKL8OC351vwIasSSbXxwA=\ntrusted comment: timestamp:1555779966\tfile:test\nQtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfNQUaOAA==";
+        let key = base64::engine::general_purpose::STANDARD.encode(key_text);
+        let signature = base64::engine::general_purpose::STANDARD.encode(signature_text);
+        let mut repository =
+            StagingRepository::open(cache.path(), TauriMinisignVerifier::new(&key).unwrap())
+                .unwrap();
+        repository
+            .stage(
+                StageCandidate::with_install_plan(
+                    "2.1.0",
+                    &signature,
+                    &tauri_plugin_updater::target().unwrap(),
+                    InstallKind::current(),
+                )
+                .unwrap(),
+                b"test".as_slice(),
+            )
+            .unwrap();
+        let metadata = cache.path().join("desktop-update/staged.json");
+        fs::remove_file(&metadata).unwrap();
+        fs::create_dir(&metadata).unwrap();
+        let input = prepare_checked_release(
+            Some(&mut repository),
+            StableRelease {
+                version: "2.2.0".into(),
+                release_notes: String::new(),
+            },
+        );
+        assert_eq!(input, UpdateInput::StagingDiscardFailed);
+        let mut controller = UpdateController::new(
+            "2.0.15",
+            SystemClock::new(),
+            FilePreferenceStore::new(cache.path().join("preference.json")),
+        )
+        .unwrap();
+        controller
+            .handle(UpdateInput::RecoverStaged {
+                version: "2.1.0".into(),
+            })
+            .unwrap();
+        let failed = controller.handle(input).unwrap().snapshot;
+        assert!(matches!(
+            failed.state,
+            UpdateState::Failed {
+                retryable: false,
+                ..
+            }
+        ));
+        assert!(!staged_install_allowed(&failed, true));
     }
 
     /// 结构化更新日志不会泄露 updater 签名或用户路径。
