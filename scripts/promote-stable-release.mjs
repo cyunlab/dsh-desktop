@@ -45,7 +45,43 @@ async function readTargetArtifact(directory, target) {
   ])
   const signature = signatureBody.toString('utf8')
   if (!signature) throw new Error(`updater signature is empty for ${target}`)
-  return { filename, body, signature, signatureBody }
+  return {
+    filename,
+    artifactPath: path.join(targetDirectory, filename),
+    signaturePath: path.join(targetDirectory, signatureName),
+    body,
+    signature,
+    signatureBody
+  }
+}
+
+/** 以无 shell 子进程运行 minisign 并要求签名验证成功。 */
+export function runMinisignCommand(args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('minisign', args, {
+      env: options.env ?? { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot },
+      shell: false,
+      stdio: ['ignore', 'ignore', 'pipe'],
+      windowsHide: true
+    })
+    let stderr = ''
+    child.stderr.on('data', chunk => { stderr += chunk })
+    child.once('error', reject)
+    child.once('exit', code => {
+      if (code !== 0) reject(new Error(`minisign verification failed (${code}): ${stderr.trim()}`))
+      else resolve()
+    })
+  })
+}
+
+/** 使用嵌入发布环境的公钥验证单个 Tauri updater 签名。 */
+export async function verifyTauriSignature(artifactPath, signaturePath, publicKey, runMinisign = runMinisignCommand) {
+  const normalizedPublicKey = String(publicKey ?? '').trim()
+  if (!normalizedPublicKey) throw new Error('TAURI_SIGNING_PUBLIC_KEY is required')
+  await runMinisign(
+    ['-Vm', artifactPath, '-x', signaturePath, '-P', normalizedPublicKey],
+    { shell: false, env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot } }
+  )
 }
 
 /** 以无 shell 子进程运行 ossutil，并仅收集命令结果。 */
@@ -104,32 +140,48 @@ export function createOssutilStorage(options) {
     if (!key.startsWith(`${prefix}/`)) throw new Error(`OSS object is outside the configured application prefix: ${key}`)
     return `oss://${options.bucket}/${key}`
   }
-  return {
-    /** 上传单个 immutable 对象或 Stable manifest。 */
-    async putObject(key, body, metadata) {
-      const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'dsh-oss-promotion-'))
-      const source = path.join(temporaryDirectory, 'object')
-      try {
-        await writeFile(source, body, { mode: 0o600 })
-        const objectMetadata = [`Cache-Control:${metadata.cacheControl}`]
-        if (metadata.contentType) objectMetadata.push(`Content-Type:${metadata.contentType}`)
-        const args = ['cp', source, objectUri(key), '--force', '--meta', objectMetadata.join('#')]
-        await withOssutilConfig(configFile => runOssutil(
-          [...args, '--config-file', configFile],
-          { env: commandEnvironment }
-        ))
-      } finally {
-        await rm(temporaryDirectory, { recursive: true, force: true })
-      }
-    },
-    /** 下载远端对象并进行逐字节校验。 */
-    async verifyObject(key, body) {
-      const result = await withOssutilConfig(configFile => runOssutil(
-        ['cat', objectUri(key), '--config-file', configFile],
+  /** 读取 OSS 对象的原始字节。 */
+  async function readObject(key) {
+    return withOssutilConfig(configFile => runOssutil(
+      ['cat', objectUri(key), '--config-file', configFile],
+      { env: commandEnvironment }
+    )).then(result => Buffer.from(result.stdout))
+  }
+  /** 将内容写入临时文件后调用 ossutil cp。 */
+  async function copyObject(key, body, metadata, allowOverwrite) {
+    const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'dsh-oss-promotion-'))
+    const source = path.join(temporaryDirectory, 'object')
+    try {
+      await writeFile(source, body, { mode: 0o600 })
+      const objectMetadata = [`Cache-Control:${metadata.cacheControl}`]
+      if (metadata.contentType) objectMetadata.push(`Content-Type:${metadata.contentType}`)
+      const args = ['cp', source, objectUri(key)]
+      if (allowOverwrite) args.push('--force')
+      args.push('--meta', objectMetadata.join('#'))
+      await withOssutilConfig(configFile => runOssutil(
+        [...args, '--config-file', configFile],
         { env: commandEnvironment }
       ))
-      if (!Buffer.from(result.stdout).equals(body)) throw new Error(`remote OSS object differs from uploaded bytes: ${key}`)
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true })
     }
+  }
+  return {
+    /** 确保 immutable 对象只写一次，并仅复用逐字节相同的已有对象。 */
+    async ensureObject(key, body, metadata) {
+      try {
+        const existing = await readObject(key)
+        if (!existing.equals(body)) throw new Error(`immutable OSS object already exists with different bytes: ${key}`)
+        return 'reused'
+      } catch (error) {
+        if (!/NoSuchKey|StatusCode[=: ]+404|\b404\b|object does not exist|not found/i.test(String(error?.message ?? error))) throw error
+      }
+      await copyObject(key, body, metadata, false)
+      return 'uploaded'
+    },
+    /** 覆盖 Stable manifest，并依赖 bucket versioning 保留历史版本。 */
+    async replaceObject(key, body, metadata) { await copyObject(key, body, metadata, true) },
+    readObject
   }
 }
 
@@ -166,6 +218,7 @@ export async function runPromotionCli(environment = process.env, dependencies = 
   if (!environment.OSS_BUCKET || !environment.OSS_REGION || !environment.UPDATE_BASE_URL) {
     throw new Error('OSS_BUCKET, OSS_REGION, and UPDATE_BASE_URL are required')
   }
+  if (!environment.TAURI_SIGNING_PUBLIC_KEY) throw new Error('TAURI_SIGNING_PUBLIC_KEY is required')
   const values = parseArguments(args)
   const prefix = values.prefix ?? 'dsh-desktop'
   const release = values.tag && values.notes && values['published-at']
@@ -173,6 +226,13 @@ export async function runPromotionCli(environment = process.env, dependencies = 
     : await readPublishedRelease(environment.GITHUB_EVENT_PATH, environment.GITHUB_REPOSITORY)
   const createStorage = dependencies.createStorage ?? createOssutilStorage
   const promote = dependencies.promote ?? promoteStableRelease
+  const verifySignature = dependencies.verifySignature
+    ?? ((artifactPath, signaturePath) => verifyTauriSignature(
+      artifactPath,
+      signaturePath,
+      environment.TAURI_SIGNING_PUBLIC_KEY,
+      dependencies.runMinisign
+    ))
   const storage = createStorage({ bucket: environment.OSS_BUCKET, region: environment.OSS_REGION, prefix, credentials })
   return promote({
     tag: release.tag_name,
@@ -181,11 +241,11 @@ export async function runPromotionCli(environment = process.env, dependencies = 
     artifactsDirectory: values.assets ?? environment.PROMOTION_ARTIFACTS_DIR ?? 'artifacts',
     downloadOrigin: environment.UPDATE_BASE_URL,
     prefix
-  }, storage)
+  }, storage, { verifySignature })
 }
 
 /** 提升一个完整的四目标更新发布，并返回写入 Stable channel 的 manifest。 */
-export async function promoteStableRelease(options, storage) {
+export async function promoteStableRelease(options, storage, dependencies = {}) {
   const version = releaseVersion(options.tag)
   const prefix = normalizePrefix(options.prefix)
   const origin = new URL(options.downloadOrigin)
@@ -195,8 +255,10 @@ export async function promoteStableRelease(options, storage) {
   if (!options.publishedAt || Number.isNaN(publishedAt.valueOf())) throw new Error('published release timestamp is required')
   const platforms = {}
   const objects = []
+  const artifacts = []
   for (const target of TARGETS) {
     const artifact = await readTargetArtifact(options.artifactsDirectory, target)
+    artifacts.push(artifact)
     const key = `${prefix}/releases/${version}/${target}/${artifact.filename}`
     objects.push(
       { key, body: artifact.body, contentType: 'application/octet-stream' },
@@ -213,14 +275,21 @@ export async function promoteStableRelease(options, storage) {
     pub_date: options.publishedAt,
     platforms
   }
+  if (!dependencies.verifySignature) throw new Error('a Tauri signature verifier is required')
+  for (const artifact of artifacts) {
+    await dependencies.verifySignature(artifact.artifactPath, artifact.signaturePath)
+  }
   for (const object of objects) {
-    await storage.putObject(object.key, object.body, {
+    await storage.ensureObject(object.key, object.body, {
       cacheControl: 'public, max-age=31536000, immutable',
       contentType: object.contentType
     })
   }
-  for (const object of objects) await storage.verifyObject(object.key, object.body)
-  await storage.putObject(
+  for (const object of objects) {
+    const remote = await storage.readObject(object.key)
+    if (!remote.equals(object.body)) throw new Error(`remote OSS object differs from uploaded bytes: ${object.key}`)
+  }
+  await storage.replaceObject(
     `${prefix}/channels/stable/latest.json`,
     Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`),
     { cacheControl: 'no-cache', contentType: 'application/json; charset=utf-8' }
