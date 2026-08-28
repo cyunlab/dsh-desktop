@@ -37,6 +37,7 @@ Set these Environment variables exactly as shown:
 | `OSS_BUCKET` | Name of the shared public-release bucket; use only the bucket name, with no scheme or path |
 | `OSS_REGION` | `cn-shenzhen` |
 | `UPDATE_BASE_URL` | `https://updates.cyunlab.com` with no trailing slash |
+| `TAURI_SIGNING_PUBLIC_KEY` | Entire minisign public-key content used by promotion; it must exactly match the public key embedded in Desktop |
 
 Set these Environment secrets exactly as shown:
 
@@ -53,10 +54,11 @@ Before enabling promotion, confirm that Environment variables are not secrets an
 
 1. Create or select a bucket in `cn-shenzhen`. The bucket may serve multiple public applications, but reserve the complete `dsh-desktop/` namespace for this repository.
 2. Enable **OSS Versioning** before the first promotion. Do not configure lifecycle rules that delete or expire `dsh-desktop/releases/` objects or historical versions of `dsh-desktop/channels/stable/latest.json`.
-3. Keep writes private. Grant anonymous users read-only access only to `dsh-desktop/releases/*` and `dsh-desktop/channels/stable/latest.json`; never grant public write. A bucket-level `public-read` ACL is broader than required, so prefer a prefix-scoped bucket policy.
-4. Bind the ICP-filed domain `updates.cyunlab.com` to the bucket and add its DNS CNAME to the OSS public endpoint for `cn-shenzhen`. Upload and bind a valid TLS certificate in OSS. CDN is not required for the first release.
-5. Test anonymous HTTPS `GET` and `HEAD` for a disposable object under `dsh-desktop/releases/`, then remove only that disposable object. Confirm anonymous listing of the bucket is denied and anonymous writes are denied.
-6. CORS is not required by the native Tauri updater because it does not use browser cross-origin fetch. Leave the bucket CORS rules empty initially. If a future browser surface reads this origin directly, add a rule only for the exact approved web origin with `GET` and `HEAD`; do not use `*`, and do not enable write methods.
+3. Enable a prevent-overwrite rule for `dsh-desktop/releases/`. Promotion also issues conditional writes that refuse overwrite and compares any existing object's bytes before reuse. The Stable manifest is the only overwrite exception because promotion and recovery intentionally create new Versioning-backed versions of `dsh-desktop/channels/stable/latest.json`.
+4. Keep writes private. Grant anonymous users read-only access only to `dsh-desktop/releases/*` and `dsh-desktop/channels/stable/latest.json`; never grant public write. A bucket-level `public-read` ACL is broader than required, so prefer a prefix-scoped bucket policy.
+5. Bind the ICP-filed domain `updates.cyunlab.com` to the bucket and add its DNS CNAME to the OSS public endpoint for `cn-shenzhen`. Upload and bind a valid TLS certificate in OSS. CDN is not required for the first release.
+6. Test anonymous HTTPS `GET` and `HEAD` for a disposable object under `dsh-desktop/releases/`, then remove only that disposable object. Confirm anonymous listing of the bucket is denied and anonymous writes are denied.
+7. CORS is not required by the native Tauri updater because it does not use browser cross-origin fetch. Leave the bucket CORS rules empty initially. If a future browser surface reads this origin directly, add a rule only for the exact approved web origin with `GET` and `HEAD`; do not use `*`, and do not enable write methods.
 
 The public-read bucket policy should express this shape after placeholders are replaced in the Alibaba Cloud console:
 
@@ -127,7 +129,7 @@ Do not grant `oss:*`, bucket administration, object deletion, lifecycle administ
 Tauri updater signatures and operating-system publisher signatures are separate trust systems. The updater signature is mandatory even while Windows NSIS artifacts remain unsigned by Authenticode.
 
 1. On an offline or tightly controlled administrator machine, use the pinned repository Tauri CLI to generate a password-protected updater key pair. Do not generate it on a shared shell, paste it into chat, or save it inside this repository.
-2. Store the public key in the Desktop updater configuration. Public-key contents may be committed; a file path is not accepted by Tauri's updater configuration.
+2. Store the public key in the Desktop updater configuration and copy the exact same content to the public `TAURI_SIGNING_PUBLIC_KEY` Environment variable. Public-key contents may be committed; a file path is not accepted by Tauri's updater configuration. Promotion must fail if the Environment value differs from the public key embedded in Desktop.
 3. Store the complete private-key content in `TAURI_SIGNING_PRIVATE_KEY` and its password in `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` in the GitHub `production` Environment. Tauri build reads these environment variables and emits each updater package plus its `.sig` file.
 4. Create at least one offline encrypted backup of the private key and password. Store the backup and its recovery material separately, under access control and audit appropriate to a release root of trust. Record responsible maintainers and test restoration on a disposable isolated copy without exposing the production key.
 5. Never upload the private key or password to GitHub Release assets, Actions artifacts/caches, OSS, logs, issue comments, or support bundles. Signature files and the public key are safe to distribute.
@@ -153,9 +155,10 @@ Release procedure:
 2. Confirm every updater package has a matching non-empty signature and that existing macOS signing/notarization checks remain green.
 3. Confirm the workflow created a GitHub **Draft Release**. A Draft does not promote and must not change `dsh-desktop/channels/stable/latest.json`.
 4. Review the Draft asset set and release body. The body is the sole source of Stable release notes; correct it before publication.
-5. Publish the GitHub Release. Publication enters the protected `production` Environment, obtains short-lived STS credentials through OIDC, uploads immutable objects, and checks their availability and signatures.
-6. Automation writes `dsh-desktop/channels/stable/latest.json` only after all four targets pass. If any upload or validation fails, the job must fail and the previous manifest must remain current.
-7. Independently fetch the manifest and all target URLs through `https://updates.cyunlab.com`. Verify HTTPS, version, release notes, RFC 3339 publication timestamp, literal signatures, cache headers, and a real update path on every target before recording production readiness.
+5. Publish the GitHub Release. Before any OSS write, promotion uses minisign and `TAURI_SIGNING_PUBLIC_KEY` to cryptographically verify all four updater packages against their literal signature files. This public key must exactly match the public key embedded in Desktop. A missing package, missing signature, invalid signature, or public-key mismatch stops the job before it can write OSS.
+6. Publication obtains short-lived STS credentials through OIDC and uploads immutable objects only after the local verification gate has passed. It forbids overwrite, then checks remote availability and bytes. A rerun of the same semantic version may reuse an existing release object only when it is byte-for-byte identical to the expected object; any difference fails promotion and requires a higher semantic version.
+7. Automation writes `dsh-desktop/channels/stable/latest.json` only after all four targets pass. If any upload or validation fails, the job must fail and the previous manifest must remain current.
+8. Independently fetch the manifest and all target URLs through `https://updates.cyunlab.com`. Verify HTTPS, version, release notes, RFC 3339 publication timestamp, literal signatures, cache headers, and a real update path on every target before recording production readiness.
 
 Never manually edit Stable to point at a partly uploaded release. Never reuse a version path or overwrite an immutable package.
 
@@ -163,7 +166,7 @@ Never manually edit Stable to point at a partly uploaded release. Never reuse a 
 
 ### Failure before the manifest write
 
-Leave the previous Stable manifest untouched. Diagnose and rerun the same immutable publication only if every already-uploaded object exactly matches the expected digest and signature. If contents differ, publish a higher semantic version; do not overwrite a released object path.
+Leave the previous Stable manifest untouched. Diagnose and rerun the same immutable publication only if every already-uploaded object is byte-for-byte identical to the expected object and its signature verifies. If any byte differs, publish a higher semantic version; do not overwrite a released object path.
 
 ### Bad release after promotion
 
@@ -178,14 +181,15 @@ Disable the `production` Environment or publishing role first. Revoke or tighten
 
 ## Go-live checklist
 
-- [ ] Bucket exists in `cn-shenzhen`; Versioning is enabled and no deletion lifecycle affects `dsh-desktop/`.
+- [ ] Bucket exists in `cn-shenzhen`; Versioning is enabled, the `dsh-desktop/releases/` prevent-overwrite rule is active, and no deletion lifecycle affects `dsh-desktop/`.
 - [ ] Anonymous `GET`/`HEAD` works only for public release objects; anonymous list/write fails.
 - [ ] `updates.cyunlab.com` CNAME and TLS certificate are valid; HTTP is not used by Desktop.
 - [ ] CORS is empty unless an exact browser origin has a documented need for read-only `GET`/`HEAD`.
 - [ ] RAM trust matches the observed `iss`, `aud`, and exact `production` Environment `sub` claim.
 - [ ] RAM permissions cannot read, write, list, delete, or administer outside the required `dsh-desktop/` scope.
-- [ ] All five Environment variables and both Environment secrets use the exact names in this runbook.
-- [ ] The updater public key matches the protected private key; offline encrypted restore has been tested.
+- [ ] All six Environment variables and both Environment secrets use the exact names in this runbook.
+- [ ] `TAURI_SIGNING_PUBLIC_KEY` matches both the protected private key and the public key embedded in Desktop; offline encrypted restore has been tested.
+- [ ] Promotion verifies all four updater packages with minisign before writing OSS.
 - [ ] Draft creation leaves Stable unchanged; publication failure also leaves Stable unchanged.
 - [ ] A successful published-release smoke has passed on all four targets and its evidence is recorded.
 

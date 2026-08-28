@@ -27,6 +27,7 @@ describe('automatic update release operations guide', () => {
       'OSS_BUCKET',
       'OSS_REGION',
       'UPDATE_BASE_URL',
+      'TAURI_SIGNING_PUBLIC_KEY',
       'TAURI_SIGNING_PRIVATE_KEY',
       'TAURI_SIGNING_PRIVATE_KEY_PASSWORD'
     ]
@@ -34,6 +35,24 @@ describe('automatic update release operations guide', () => {
     for (const name of requiredNames) {
       expect(guide).toContain(`\`${name}\``)
     }
+  })
+
+  // 验证 promotion 在写入 OSS 前使用与 Desktop 相同的公钥验证全部平台包。
+  it('requires pre-write signature verification with the embedded public key', () => {
+    const guide = readFileSync(operationsGuideUrl, 'utf8')
+
+    expect(guide).toMatch(/before any OSS write/i)
+    expect(guide).toContain('all four updater packages')
+    expect(guide).toContain('must exactly match the public key embedded in Desktop')
+  })
+
+  // 验证版本化发布对象不可覆盖，重跑只能复用逐字节相同的对象。
+  it('requires release-prefix overwrite prevention and byte-identical retries', () => {
+    const guide = readFileSync(operationsGuideUrl, 'utf8')
+
+    expect(guide).toContain('prevent-overwrite rule for `dsh-desktop/releases/`')
+    expect(guide).toContain('The Stable manifest is the only overwrite exception')
+    expect(guide).toContain('byte-for-byte identical')
   })
 
   // 验证构建任务只能读取签名密钥，而云身份仅授予 promotion 任务。
