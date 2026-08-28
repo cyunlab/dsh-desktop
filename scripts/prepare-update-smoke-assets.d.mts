@@ -7,7 +7,7 @@ export interface PrepareUpdateSmokeAssetOptions {
 }
 
 /** 从 manifest 下载并验证一个 target 的 content-addressed updater。 */
-export function prepareUpdateSmokeAsset(options: PrepareUpdateSmokeAssetOptions, dependencies?: { readonly fetcher?: typeof fetch }): Promise<{
+export function prepareUpdateSmokeAsset(options: PrepareUpdateSmokeAssetOptions, dependencies?: { readonly fetcher?: (url: string, init?: RequestInit) => Promise<Response> }): Promise<{
   readonly artifactPath: string
   readonly signaturePath: string
   readonly manifestPath: string

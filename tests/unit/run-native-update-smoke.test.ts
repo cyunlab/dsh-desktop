@@ -27,7 +27,7 @@ async function inputs() {
     writeFile(stableManifest, '{"version":"2.0.15"}\n')
   ])
   return {
-    target: 'windows-x86_64',
+    target: 'windows-x86_64' as const,
     candidateTag: 'v2.1.0',
     candidateCommit: '1'.repeat(40),
     candidateManifest: manifest,
@@ -40,7 +40,7 @@ async function inputs() {
     baselineSignature,
     baselineStableManifest: stableManifest,
     baselineArtifactUrl: 'https://updates.cyunlab.com/dsh-desktop/releases/2.0.15/windows-x86_64/baseline.exe',
-    baselineProvenance: 'published-release',
+    baselineProvenance: 'published-release' as const,
     outputDirectory: directory
   }
 }
@@ -94,7 +94,7 @@ describe('native update smoke harness public seam', () => {
 
   /** 测试 adapter 即使声明 source rebuild 也必须保持 local fixture。 */
   it('never upgrades a test adapter to source-rebuild or real-native evidence', async () => {
-    const options = { ...await inputs(), baselineProvenance: 'source-rebuild' }
+    const options = { ...await inputs(), baselineProvenance: 'source-rebuild' as const }
     const observation = {
       runner: { os: 'windows', arch: 'x86_64' },
       started_at: '2026-08-28T08:00:00.000Z',
