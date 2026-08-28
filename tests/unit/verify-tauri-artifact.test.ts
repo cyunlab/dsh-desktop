@@ -256,6 +256,7 @@ describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TI
     ['CLI entry', path.join('@deepseek-ai', 'dsh', 'lib', 'bin.js')],
     ['CLI configuration', path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'standard', 'preset.yml')],
     ['frontend', path.join('@deepseek-ai', 'dsh-web-frontend', 'dist', 'index.html')],
+    ['Desktop capability bridge', path.join('@cyunlab', 'dsh-desktop-capabilities', 'lib', 'index.js')],
     ['Desktop update client', path.join('@cyunlab', 'dsh-desktop-update-client', 'lib', 'client.js')],
     ['native dependency', path.join('node-pty', 'prebuilds', 'win32-x64', 'pty.node')],
     ['helper', path.join('node-pty', 'build', 'Release', 'conpty', 'OpenConsole.exe')]

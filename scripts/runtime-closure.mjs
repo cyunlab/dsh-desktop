@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url'
 const projectRoot = path.resolve(import.meta.dirname, '..')
 const desktopPackageManifest = JSON.parse(await readFile(path.join(projectRoot, 'package.json'), 'utf8'))
 const PINNED_DSH_VERSION = desktopPackageManifest.dependencies?.['@deepseek-ai/dsh']
-const RUNTIME_CLOSURE_VERSION = 7
+const RUNTIME_CLOSURE_VERSION = 8
 const DSH_CLI_CONFIGURATION_FILES = [
   'config/agent-presets/code/agent.cordis.yml',
   'config/agent-presets/code/preset.yml',
@@ -50,6 +50,8 @@ export function requiredRuntimeAssets(target) {
     ...DSH_CLI_CONFIGURATION_FILES.map(relative => file('@deepseek-ai/dsh', relative, 'published CLI configuration')),
     file('@deepseek-ai/dsh-base', 'cordis.patch.yml', 'Harness bundle configuration'),
     file('@deepseek-ai/dsh-web-app', 'cordis.patch.yml', 'Harness bundle configuration'),
+    file('@cyunlab/dsh-desktop-capabilities', 'lib/index.js', 'Desktop capability bridge'),
+    file('@cyunlab/dsh-desktop-capabilities', 'lib/types/index.d.ts', 'Desktop capability types'),
     file('@cyunlab/dsh-desktop-update-client', 'cordis.patch.yml', 'Desktop composition patch'),
     file('@cyunlab/dsh-desktop-update-client', 'lib/index.js', 'Desktop client Host entry'),
     file('@cyunlab/dsh-desktop-update-client', 'lib/client.js', 'Desktop client bundle'),
@@ -543,12 +545,7 @@ async function ensureRuntimeCache(root, target, hash) {
 /** 将 pnpm workspace 链接替换为闭包内部的普通目录，避免安装包依赖构建路径。 */
 async function materializePrivateWorkspacePackages(cacheRoot, cacheNodeModules) {
   const packageFiles = {
-    'desktop-capabilities': [
-      'package.json',
-      'src/index.ts',
-      'src/capability-facade.ts',
-      'src/tauri-adapter.ts'
-    ],
+    'desktop-capabilities': ['package.json', 'lib'],
     'desktop-update-client': ['package.json', 'cordis.patch.yml', 'lib']
   }
   for (const [directoryName, entries] of Object.entries(packageFiles)) {

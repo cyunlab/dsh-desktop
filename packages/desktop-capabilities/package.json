@@ -4,10 +4,22 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts",
-    "./testing": "./src/testing.ts"
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./testing": {
+      "types": "./lib/types/testing.d.ts",
+      "default": "./lib/testing.js"
+    }
   },
+  "files": [
+    "lib/index.js",
+    "lib/testing.js",
+    "lib/types/**/*.d.ts"
+  ],
   "scripts": {
+    "build": "node scripts/build.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
@@ -15,6 +27,7 @@
     "@tauri-apps/api": "2.11.1"
   },
   "devDependencies": {
+    "esbuild": "0.27.3",
     "typescript": "5.9.3",
     "vitest": "4.0.18"
   }

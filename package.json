@@ -9,7 +9,7 @@
     "node": ">=24 <25"
   },
   "scripts": {
-    "build": "pnpm --filter @cyunlab/dsh-desktop-update-client build && node scripts/build.mjs",
+    "build": "pnpm --filter @cyunlab/dsh-desktop-capabilities build && pnpm --filter @cyunlab/dsh-desktop-update-client build && node scripts/build.mjs",
     "icons:generate": "node scripts/generate-desktop-icons.mjs",
     "package": "pnpm tauri:build",
     "package:dir": "pnpm tauri:build",

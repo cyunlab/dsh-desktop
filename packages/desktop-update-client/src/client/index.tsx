@@ -25,9 +25,14 @@ export interface UpdateIndicatorProps extends SidebarFooterActionOwnerProps {
 }
 
 interface UpdateClientContext {
+  /** 注册随 Cordis fiber 释放的副作用。 */
   effect(factory: () => void | (() => void), label?: string): void
-  locale: { register(namespace: string, dictionaries: { zh: typeof zh; en: typeof en }): () => void }
+  locale: {
+    /** 注册更新插件的本地化字典。 */
+    register(namespace: string, dictionaries: { zh: typeof zh; en: typeof en }): () => void
+  }
   slots: {
+    /** 向正式侧边栏 footer action slot 注册一个稳定条目。 */
     register(
       options: { name: 'sidebar.footer.action'; id: string; order: number; locale: typeof UPDATE_LOCALE_NAMESPACE },
       component: (props: SidebarFooterActionOwnerProps & { t: NonNullable<UpdateIndicatorProps['t']> }) => ReactElement | null,
@@ -36,8 +41,11 @@ interface UpdateClientContext {
 }
 
 export interface UpdateSnapshotSource {
+  /** 返回最新完整领域快照。 */
   getSnapshot(): AppUpdateSnapshot
+  /** 订阅快照变更。 */
   subscribe(listener: () => void): () => void
+  /** 释放领域观察与所有 React 订阅。 */
   dispose(): void
 }
 
