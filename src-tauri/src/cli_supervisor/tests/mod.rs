@@ -116,6 +116,9 @@ fn constructs_exact_dsh_web_command() {
     let plan = CliCommandPlan {
         node_executable: PathBuf::from("/desktop/node/bin/node"),
         cli_entry: PathBuf::from("/desktop/runtime/@deepseek-ai/dsh/lib/bin.js"),
+        desktop_patch: PathBuf::from(
+            "/desktop/runtime/@cyunlab/dsh-desktop-update-client/cordis.patch.yml",
+        ),
         harness_home: PathBuf::from("/desktop/data/harness-home"),
         working_directory: PathBuf::from("/desktop/data/working-directory"),
         path: std::env::join_paths([
@@ -131,6 +134,8 @@ fn constructs_exact_dsh_web_command() {
         [
             OsStr::new("/desktop/runtime/@deepseek-ai/dsh/lib/bin.js"),
             OsStr::new("web"),
+            OsStr::new("--patch"),
+            OsStr::new("/desktop/runtime/@cyunlab/dsh-desktop-update-client/cordis.patch.yml",),
             OsStr::new("--host"),
             OsStr::new(HOST_ADDRESS),
             OsStr::new("--port"),
@@ -149,9 +154,13 @@ fn constructs_exact_dsh_web_command() {
     assert!(environment
         .iter()
         .any(|(name, value)| *name == OsStr::new("PATH") && *value == Some(plan.path.as_os_str())));
-    assert!(!command
-        .get_args()
-        .any(|value| value == OsStr::new("--patch")));
+    assert_eq!(
+        command
+            .get_args()
+            .filter(|value| *value == OsStr::new("--patch"))
+            .count(),
+        1
+    );
 }
 
 /// 验证打包 Node 目录始终位于继承 PATH 首位。

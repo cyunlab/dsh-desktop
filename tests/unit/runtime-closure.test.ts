@@ -2,7 +2,7 @@ import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFi
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { packagedDshCliCommand, probePackagedDshCli, requiredRuntimeAssets, resolveDshCliEntry, runtimeTarget, verifyRuntimeClosure } from '../../scripts/runtime-closure.mjs'
+import { packagedDshCliCommand, probePackagedDshCli, requiredRuntimeAssets, resolveDshCliEntry, runtimeInputHash, runtimeTarget, verifyRuntimeClosure } from '../../scripts/runtime-closure.mjs'
 
 const desktopManifest = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'))
 const pinnedDshVersion = desktopManifest.dependencies['@deepseek-ai/dsh'] as string
@@ -14,7 +14,9 @@ async function createEntryPackages(root: string): Promise<void> {
     '@deepseek-ai/dsh-base',
     '@deepseek-ai/dsh-cmdline',
     '@deepseek-ai/dsh-launch-environment',
-    '@deepseek-ai/dsh-web-app'
+    '@deepseek-ai/dsh-web-app',
+    '@cyunlab/dsh-desktop-capabilities',
+    '@cyunlab/dsh-desktop-update-client'
   ]) {
     const directory = path.join(root, name)
     await mkdir(directory, { recursive: true })
@@ -82,6 +84,24 @@ async function createCompleteFixture(target = runtimeTarget('win32', 'x64'), dyn
 }
 
 describe('runtime closure contract', () => {
+  /** 私有 workspace 源变化必须使 Runtime closure 缓存失效。 */
+  it('fingerprints private Desktop package sources', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-runtime-input-hash-'))
+    const packageSource = path.join(root, 'packages', 'desktop-update-client', 'src', 'client.ts')
+    try {
+      await mkdir(path.dirname(packageSource), { recursive: true })
+      for (const fileName of ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml']) {
+        await writeFile(path.join(root, fileName), `${fileName}\n`)
+      }
+      await writeFile(packageSource, 'export const version = 1\n')
+      const before = await runtimeInputHash(root, runtimeTarget('win32', 'x64'))
+      await writeFile(packageSource, 'export const version = 2\n')
+      const after = await runtimeInputHash(root, runtimeTarget('win32', 'x64'))
+      expect(after).not.toBe(before)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
   it('uses package-relative paths so the Tauri resource contains no pnpm prefix', () => {
     const assets = requiredRuntimeAssets(runtimeTarget('win32', 'x64'))
     expect(assets.some(asset => asset.path.startsWith('node_modules'))).toBe(false)
@@ -94,6 +114,11 @@ describe('runtime closure contract', () => {
     expect(assets).toContainEqual(expect.objectContaining({
       path: path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'standard', 'agent.cordis.yml')
     }))
+    expect(assets).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: path.join('@cyunlab', 'dsh-desktop-update-client', 'cordis.patch.yml') }),
+      expect.objectContaining({ path: path.join('@cyunlab', 'dsh-desktop-update-client', 'lib', 'client.js') }),
+      expect.objectContaining({ path: path.join('@cyunlab', 'dsh-desktop-update-client', 'lib', 'index.js') })
+    ]))
     expect(assets.filter(asset => asset.category === 'published CLI configuration').map(asset => asset.path)).toEqual([
       path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'code', 'agent.cordis.yml'),
       path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'code', 'preset.yml'),
@@ -106,6 +131,17 @@ describe('runtime closure contract', () => {
       path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'standard', 'agent.cordis.yml'),
       path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'standard', 'preset.yml')
     ])
+  })
+
+  /** Desktop 私有包缺少生成 Client bundle 时，闭包必须 fail closed。 */
+  it('rejects a closure without the Desktop update client output', async () => {
+    const fixture = await createCompleteFixture()
+    try {
+      await rm(path.join(fixture.root, '@cyunlab', 'dsh-desktop-update-client', 'lib', 'client.js'))
+      await expect(verifyRuntimeClosure(fixture.root, fixture.target)).rejects.toThrow('dsh-desktop-update-client')
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true })
+    }
   })
 
   it('resolves the published CLI entry only through package.json#bin.dsh', async () => {

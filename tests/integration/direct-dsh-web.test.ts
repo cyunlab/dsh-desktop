@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { prepareRuntimeClosure, runtimeTarget } from '../../scripts/runtime-closure.mjs'
-import { DIRECT_DSH_WEB_ARGS, probeDirectDshWeb } from '../../scripts/smoke-dsh-cli.mjs'
+import { directDshWebArgs, probeDirectDshWeb } from '../../scripts/smoke-dsh-cli.mjs'
 
 const root = path.resolve(import.meta.dirname, '../..')
 const target = runtimeTarget()
@@ -17,7 +17,7 @@ describe.skipIf(!existsSync(nodeExecutable)).sequential('published dsh web compo
     try {
       const nodeModulesRoot = await prepareRuntimeClosure({ projectRoot: root, outputRoot, target })
       const result = await probeDirectDshWeb({ nodeExecutable, nodeModulesRoot, timeoutMilliseconds: 60_000 })
-      expect(result.command.args.slice(1)).toEqual(DIRECT_DSH_WEB_ARGS)
+      expect(result.command.args.slice(1)).toEqual(directDshWebArgs(nodeModulesRoot))
       expect(result.command.executable).toBe(nodeExecutable)
       expect(result.html.trim()).not.toBe('')
     } finally {

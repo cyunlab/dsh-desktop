@@ -1,9 +1,21 @@
 import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 const workflow = (await readFile(new URL('../../.github/workflows/build.yml', import.meta.url), 'utf8')).replaceAll('\r\n', '\n')
+const projectRoot = path.resolve(import.meta.dirname, '../..')
 
 describe('native build workflow contract', () => {
+  /** 根构建必须先生成 Desktop Client package，再物化 Runtime closure。 */
+  it('builds the private Desktop client before the Runtime closure', async () => {
+    const [manifest, buildScript] = await Promise.all([
+      readFile(path.join(projectRoot, 'package.json'), 'utf8'),
+      readFile(path.join(projectRoot, 'scripts', 'build.mjs'), 'utf8')
+    ])
+    const scripts = JSON.parse(manifest).scripts as Record<string, string>
+    expect(scripts.build).toContain('pnpm --filter @cyunlab/dsh-desktop-update-client build')
+    expect(buildScript).toContain('prepareRuntimeClosure')
+  })
   it('pins every third-party action to a reviewed commit', () => {
     const actions = [...workflow.matchAll(/uses:\s+([^\s#]+@[^\s#]+)(?:\s+#\s+(v\S+))?/g)]
     expect(actions).toHaveLength(7)

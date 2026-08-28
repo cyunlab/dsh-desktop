@@ -1,0 +1,13 @@
+:root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; background: #071018; color: #eef8ff; }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at top, #123149, #071018 60%); }
+main { width: min(34rem, calc(100% - 4rem)); text-align: center; }
+.eyebrow { margin-top: 1.5rem; color: #88a9ba; letter-spacing: .12em; text-transform: uppercase; font-size: .75rem; }
+h1 { margin: .5rem 0; font-size: 2rem; }
+h2 { font-size: 1rem; color: #b8cbd5; }
+#update-current-version, #update-message, #update-progress-label { color: #b8cbd5; }
+#update-progress { width: 100%; }
+#update-release-notes { max-height: 10rem; overflow: auto; padding: 1rem; text-align: left; white-space: pre-wrap; background: #0b1b26; border-radius: .5rem; }
+#actions { margin-top: 1.5rem; display: flex; gap: .75rem; justify-content: center; flex-wrap: wrap; }
+button { border: 1px solid #426275; border-radius: .5rem; padding: .7rem 1rem; color: inherit; background: #102330; cursor: pointer; }
+#update-restart { background: #4dd7c8; color: #071018; border-color: #4dd7c8; }
+[hidden] { display: none; }
