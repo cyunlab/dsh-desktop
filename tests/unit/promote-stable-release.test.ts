@@ -6,6 +6,7 @@ import {
   createOssutilStorage,
   promoteStableRelease,
   runPromotionCli,
+  verifyTauriSignature,
   type OssutilResult,
   type PromotionStorage
 } from '../../scripts/promote-stable-release.mjs'
@@ -39,21 +40,36 @@ function createStorage(): PromotionStorage & {
     events,
     writes,
     /** 记录上传边界的可观察输入。 */
-    async putObject(key, body, metadata) {
-      events.push(`put:${key}`)
+    async ensureObject(key, body, metadata) {
+      events.push(`ensure:${key}`)
+      writes.push({ key, body, cacheControl: metadata.cacheControl })
+      return 'uploaded' as const
+    },
+    /** 记录允许覆盖的 Stable manifest 写入。 */
+    async replaceObject(key, body, metadata) {
+      events.push(`replace:${key}`)
       writes.push({ key, body, cacheControl: metadata.cacheControl })
     },
     /** 记录远端验证边界的调用顺序。 */
-    async verifyObject(key) { events.push(`verify:${key}`) }
+    async readObject(key) {
+      events.push(`read:${key}`)
+      return writes.find(write => write.key === key)?.body ?? Buffer.alloc(0)
+    }
   }
 }
 
+/** 使用通过的密码学验证 seam 执行测试 promotion。 */
+function promoteFixture(options: Parameters<typeof promoteStableRelease>[0], storage: PromotionStorage) {
+  return promoteStableRelease(options, storage, { verifySignature: async () => {} })
+}
+
 describe('Stable update promotion', () => {
+  /** 验证四目标发布内容、metadata 与最终 manifest 顺序。 */
   it('publishes the four updater targets using the GitHub Release body and literal signatures', async () => {
     const directory = await createReleaseDirectory()
     const storage = createStorage()
     try {
-      const manifest = await promoteStableRelease({
+      const manifest = await promoteFixture({
         tag: 'v2.1.0',
         releaseBody: 'Fixed startup and update handling.',
         publishedAt: '2026-08-28T02:30:00Z',
@@ -92,23 +108,25 @@ describe('Stable update promotion', () => {
         cacheControl: 'no-cache'
       })
       expect(JSON.parse(storage.writes.at(-1)!.body.toString('utf8'))).toEqual(manifest)
-      expect(storage.events.at(-1)).toBe('put:dsh-desktop/channels/stable/latest.json')
-      expect(storage.events.slice(8, 16).every(event => event.startsWith('verify:'))).toBe(true)
+      expect(storage.events.at(-1)).toBe('replace:dsh-desktop/channels/stable/latest.json')
+      expect(storage.events.slice(8, 16).every(event => event.startsWith('read:'))).toBe(true)
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
   })
 
+  /** 验证远端复核失败时不修改 Stable manifest。 */
   it('leaves the Stable manifest untouched when remote validation fails', async () => {
     const directory = await createReleaseDirectory()
     const storage = createStorage()
     /** 模拟远端校验在 Linux 对象处失败。 */
-    storage.verifyObject = async key => {
-      storage.events.push(`verify:${key}`)
+    storage.readObject = async key => {
+      storage.events.push(`read:${key}`)
       if (key.includes('linux-x86_64')) throw new Error('remote object mismatch')
+      return storage.writes.find(write => write.key === key)?.body ?? Buffer.alloc(0)
     }
     try {
-      await expect(promoteStableRelease({
+      await expect(promoteFixture({
         tag: 'v2.1.0',
         releaseBody: 'Release notes',
         publishedAt: '2026-08-28T02:30:00Z',
@@ -122,17 +140,19 @@ describe('Stable update promotion', () => {
     }
   })
 
+  /** 验证 immutable 上传失败时不修改 Stable manifest。 */
   it('leaves the Stable manifest untouched when an immutable upload fails', async () => {
     const directory = await createReleaseDirectory()
     const storage = createStorage()
     /** 模拟 immutable 对象上传在 macOS arm64 处失败。 */
-    storage.putObject = async (key, body, metadata) => {
-      storage.events.push(`put:${key}`)
+    storage.ensureObject = async (key, body, metadata) => {
+      storage.events.push(`ensure:${key}`)
       if (key.includes('darwin-aarch64')) throw new Error('OSS upload failed')
       storage.writes.push({ key, body, cacheControl: metadata.cacheControl })
+      return 'uploaded' as const
     }
     try {
-      await expect(promoteStableRelease({
+      await expect(promoteFixture({
         tag: 'v2.1.0',
         releaseBody: 'Release notes',
         publishedAt: '2026-08-28T02:30:00Z',
@@ -146,11 +166,12 @@ describe('Stable update promotion', () => {
     }
   })
 
+  /** 验证任一目标缺签名时 fail closed。 */
   it('fails closed when any target signature is missing', async () => {
     const directory = await createReleaseDirectory()
     await rm(path.join(directory, 'windows-x86_64', 'desktop.nsis.zip.sig'))
     try {
-      await expect(promoteStableRelease({
+      await expect(promoteFixture({
         tag: 'v2.1.0',
         releaseBody: 'Release notes',
         publishedAt: '2026-08-28T02:30:00Z',
@@ -163,11 +184,50 @@ describe('Stable update promotion', () => {
     }
   })
 
+  /** 验证所有密码学签名在任何 OSS 操作前完成。 */
+  it('verifies every updater signature before the first OSS operation', async () => {
+    const directory = await createReleaseDirectory()
+    const storage = createStorage()
+    const verified: string[] = []
+    try {
+      await expect(promoteStableRelease({
+        tag: 'v2.1.0',
+        releaseBody: 'Release notes',
+        publishedAt: '2026-08-28T02:30:00Z',
+        artifactsDirectory: directory,
+        downloadOrigin: 'https://updates.cyunlab.com',
+        prefix: 'dsh-desktop'
+      }, storage, {
+        async verifySignature(artifactPath, signaturePath) {
+          verified.push(`${path.basename(artifactPath)}:${path.basename(signaturePath)}`)
+          if (artifactPath.includes('darwin-aarch64')) throw new Error('invalid updater signature')
+        }
+      })).rejects.toThrow('invalid updater signature')
+      expect(verified).toHaveLength(3)
+      expect(storage.events).toHaveLength(0)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  /** 验证默认 minisign 适配器使用官方校验参数且不经 shell。 */
+  it('verifies a Tauri signature with minisign and the configured public key', async () => {
+    const calls: Array<{ args: string[]; shell: boolean }> = []
+    await verifyTauriSignature('/release/app.exe', '/release/app.exe.sig', 'RWQpublic', async (args, options) => {
+      calls.push({ args, shell: options.shell })
+    })
+    expect(calls).toEqual([{
+      args: ['-Vm', '/release/app.exe', '-x', '/release/app.exe.sig', '-P', 'RWQpublic'],
+      shell: false
+    }])
+  })
+
+  /** 验证非法 release tag 在上传前被拒绝。 */
   it('fails closed before upload when the release tag is not semantic', async () => {
     const directory = await createReleaseDirectory()
     const storage = createStorage()
     try {
-      await expect(promoteStableRelease({
+      await expect(promoteFixture({
         tag: 'latest',
         releaseBody: 'Release notes',
         publishedAt: '2026-08-28T02:30:00Z',
@@ -181,10 +241,11 @@ describe('Stable update promotion', () => {
     }
   })
 
+  /** 验证空 GitHub Release body 被拒绝。 */
   it('fails closed when the published release body is empty', async () => {
     const directory = await createReleaseDirectory()
     try {
-      await expect(promoteStableRelease({
+      await expect(promoteFixture({
         tag: 'v2.1.0',
         releaseBody: '   ',
         publishedAt: '2026-08-28T02:30:00Z',
@@ -197,6 +258,7 @@ describe('Stable update promotion', () => {
     }
   })
 
+  /** 验证 published GitHub Release 与 STS 环境契约。 */
   it('builds the promotion only from a published GitHub Release and short-lived STS credentials', async () => {
     const directory = await createReleaseDirectory()
     const eventFile = path.join(directory, 'event.json')
@@ -219,6 +281,7 @@ describe('Stable update promotion', () => {
         OSS_BUCKET: 'cyunlab-public-releases',
         OSS_REGION: 'cn-shenzhen',
         UPDATE_BASE_URL: 'https://updates.cyunlab.com',
+        TAURI_SIGNING_PUBLIC_KEY: 'RWQpublic',
         PROMOTION_ARTIFACTS_DIR: directory,
         ALIBABA_CLOUD_ACCESS_KEY_ID: 'temporary-id',
         ALIBABA_CLOUD_ACCESS_KEY_SECRET: 'temporary-secret',
@@ -251,17 +314,33 @@ describe('Stable update promotion', () => {
     }
   })
 
+  /** 验证缺少 STS session token 时不读取其他输入。 */
   it('refuses credentials without an STS session token', async () => {
     await expect(runPromotionCli({
       GITHUB_EVENT_PATH: '/not-read-with-invalid-credentials',
       OSS_BUCKET: 'bucket',
       OSS_REGION: 'cn-shenzhen',
       UPDATE_BASE_URL: 'https://updates.cyunlab.com',
+      TAURI_SIGNING_PUBLIC_KEY: 'RWQpublic',
       ALIBABA_CLOUD_ACCESS_KEY_ID: 'long-lived-id',
       ALIBABA_CLOUD_ACCESS_KEY_SECRET: 'long-lived-secret'
     })).rejects.toThrow('short-lived Alibaba Cloud STS credentials are required')
   })
 
+  /** 验证缺少 updater 公钥时在读取 release 输入前 fail closed。 */
+  it('refuses promotion without the Tauri signing public key', async () => {
+    await expect(runPromotionCli({
+      GITHUB_EVENT_PATH: '/not-read-without-public-key',
+      OSS_BUCKET: 'bucket',
+      OSS_REGION: 'cn-shenzhen',
+      UPDATE_BASE_URL: 'https://updates.cyunlab.com',
+      ALIBABA_CLOUD_ACCESS_KEY_ID: 'temporary-id',
+      ALIBABA_CLOUD_ACCESS_KEY_SECRET: 'temporary-secret',
+      ALIBABA_CLOUD_SECURITY_TOKEN: 'temporary-token'
+    })).rejects.toThrow('TAURI_SIGNING_PUBLIC_KEY is required')
+  })
+
+  /** 验证 ossutil v1 临时配置、权限和凭据隔离。 */
   it('uses a short-lived v1 ossutil config without exposing credentials in arguments or environment', async () => {
     const calls: Array<{ args: string[]; env: NodeJS.ProcessEnv; configFile: string; config: string; directoryMode: number; fileMode: number }> = []
     /** 读取调用时仍存在的临时配置及其权限。 */
@@ -281,6 +360,7 @@ describe('Stable update promotion', () => {
         directoryMode: directoryInformation.mode & 0o777,
         fileMode: fileInformation.mode & 0o777
       })
+      if (calls.length === 1 && args[0] === 'cat') throw new Error('NoSuchKey: object does not exist')
       return { stdout: args[0] === 'cat' ? Buffer.from('package bytes') : Buffer.alloc(0), stderr: '' }
     }
     const storage = createOssutilStorage({
@@ -294,22 +374,34 @@ describe('Stable update promotion', () => {
       },
       runOssutil
     })
-    await storage.putObject('dsh-desktop/releases/2.1.0/linux-x86_64/package', Buffer.from('package bytes'), {
+    await storage.ensureObject('dsh-desktop/releases/2.1.0/linux-x86_64/package', Buffer.from('package bytes'), {
       cacheControl: 'public, max-age=31536000, immutable'
     })
-    await storage.verifyObject('dsh-desktop/releases/2.1.0/linux-x86_64/package', Buffer.from('package bytes'))
+    await storage.readObject('dsh-desktop/releases/2.1.0/linux-x86_64/package')
+    await storage.replaceObject('dsh-desktop/channels/stable/latest.json', Buffer.from('{}'), {
+      cacheControl: 'no-cache',
+      contentType: 'application/json'
+    })
 
-    expect(calls[0].args).toContain('oss://cyunlab-public-releases/dsh-desktop/releases/2.1.0/linux-x86_64/package')
-    expect(calls[0].args).toEqual(expect.arrayContaining([
+    expect(calls[1].args).toContain('oss://cyunlab-public-releases/dsh-desktop/releases/2.1.0/linux-x86_64/package')
+    expect(calls[1].args).toEqual(expect.arrayContaining([
       '--meta',
       'Cache-Control:public, max-age=31536000, immutable'
     ]))
-    expect(calls[1].args).toEqual([
+    expect(calls[1].args).not.toContain('--force')
+    expect(calls[2].args).toEqual([
       'cat',
       'oss://cyunlab-public-releases/dsh-desktop/releases/2.1.0/linux-x86_64/package',
       '--config-file',
-      calls[1].configFile
+      calls[2].configFile
     ])
+    expect(calls[3].args).toEqual(expect.arrayContaining([
+      'cp',
+      'oss://cyunlab-public-releases/dsh-desktop/channels/stable/latest.json',
+      '--force',
+      '--meta',
+      'Cache-Control:no-cache#Content-Type:application/json'
+    ]))
     expect(calls[0].config).toBe([
       '[Credentials]',
       'endpoint=oss-cn-shenzhen.aliyuncs.com',
@@ -321,13 +413,42 @@ describe('Stable update promotion', () => {
     expect(calls.every(call => call.directoryMode === 0o700 && call.fileMode === 0o600)).toBe(true)
     expect(calls.every(call => !JSON.stringify(call.args).includes('temporary-'))).toBe(true)
     expect(calls.every(call => !JSON.stringify(call.env).includes('temporary-'))).toBe(true)
-    expect(new Set(calls.map(call => call.configFile)).size).toBe(2)
+    expect(new Set(calls.map(call => call.configFile)).size).toBe(4)
     for (const call of calls) await expect(stat(call.configFile)).rejects.toThrow()
-    await expect(storage.putObject('another-app/releases/2.1.0/package', Buffer.from('wrong scope'), {
+    await expect(storage.ensureObject('another-app/releases/2.1.0/package', Buffer.from('wrong scope'), {
       cacheControl: 'no-cache'
     })).rejects.toThrow('outside the configured application prefix')
   })
 
+  /** 验证 immutable 对象仅可复用相同字节，绝不覆盖不同内容。 */
+  it('reuses an identical immutable object and rejects different existing bytes', async () => {
+    const commands: string[][] = []
+    /** 模拟已存在的 immutable OSS 对象。 */
+    const runOssutil = async (args: string[]): Promise<OssutilResult> => {
+      commands.push(args)
+      return { stdout: Buffer.from('existing bytes'), stderr: '' }
+    }
+    const storage = createOssutilStorage({
+      bucket: 'cyunlab-public-releases',
+      region: 'cn-shenzhen',
+      prefix: 'dsh-desktop',
+      credentials: {
+        accessKeyId: 'temporary-id',
+        accessKeySecret: 'temporary-secret',
+        securityToken: 'temporary-token'
+      },
+      runOssutil
+    })
+    await expect(storage.ensureObject('dsh-desktop/releases/2.1.0/package', Buffer.from('existing bytes'), {
+      cacheControl: 'public, max-age=31536000, immutable'
+    })).resolves.toBe('reused')
+    await expect(storage.ensureObject('dsh-desktop/releases/2.1.0/package', Buffer.from('different bytes'), {
+      cacheControl: 'public, max-age=31536000, immutable'
+    })).rejects.toThrow('immutable OSS object already exists with different bytes')
+    expect(commands.every(args => args[0] === 'cat')).toBe(true)
+  })
+
+  /** 验证 workflow 显式 CLI 参数无需读取 event 文件。 */
   it('accepts the workflow CLI arguments without reading a GitHub event file', async () => {
     const storage = createStorage()
     let receivedOptions: Record<string, unknown> | undefined
@@ -335,6 +456,7 @@ describe('Stable update promotion', () => {
       OSS_BUCKET: 'cyunlab-public-releases',
       OSS_REGION: 'cn-shenzhen',
       UPDATE_BASE_URL: 'https://updates.cyunlab.com',
+      TAURI_SIGNING_PUBLIC_KEY: 'RWQpublic',
       ALIBABA_CLOUD_ACCESS_KEY_ID: 'temporary-id',
       ALIBABA_CLOUD_ACCESS_KEY_SECRET: 'temporary-secret',
       ALIBABA_CLOUD_SECURITY_TOKEN: 'temporary-token'
