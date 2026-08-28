@@ -271,6 +271,10 @@ jobs:
           pattern: update-smoke-evidence-${{ inputs.candidate_tag }}-${{ inputs.candidate_commit }}-*
           path: smoke-evidence
           merge-multiple: true
+      - name: Verify target evidence attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh attestation verify smoke-evidence/* --repo "$GITHUB_REPOSITORY"
       - name: Verify complete real-native evidence
         run: >-
           node scripts/verify-update-smoke-evidence.mjs

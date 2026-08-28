@@ -47,6 +47,7 @@ describe('Stable promotion workflow contract', () => {
     expect(workflow).toContain('--require-real-native')
     expect(workflow).toContain('--max-age-hours 24')
     expect(workflow).toContain('--baseline-manifest-sha256')
+    expect(workflow.match(/gh attestation verify evidence\/\* --repo "\$GITHUB_REPOSITORY"/g)).toHaveLength(2)
     expect(workflow).toMatch(/aggregate-evidence:\n[\s\S]*needs: \[prepare-candidate, native-update-smoke\]/)
     expect(workflow).toMatch(/promote-stable:\n[\s\S]*needs: \[prepare-candidate, aggregate-evidence\]/)
     const aggregate = workflow.indexOf('aggregate-evidence:')
