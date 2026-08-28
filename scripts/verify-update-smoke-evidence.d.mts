@@ -49,10 +49,10 @@ export const REQUIRED_SMOKE_TARGETS: readonly UpdateSmokeTarget[]
 export const REQUIRED_SMOKE_CHECKPOINTS: readonly string[]
 
 /** 验证单目标 evidence，供原生 harness 落盘前调用。 */
-export function verifyUpdateSmokeEvidenceDocument(document: UpdateSmokeEvidence, expectations: UpdateSmokeExpectations): UpdateSmokeTarget
+export function verifyUpdateSmokeEvidenceDocument(document: unknown, expectations: UpdateSmokeExpectations): UpdateSmokeTarget
 
 /** 验证内存中的完整四目标 evidence 集合。 */
-export function verifyUpdateSmokeEvidenceSet(documents: readonly UpdateSmokeEvidence[], expectations: UpdateSmokeExpectations): {
+export function verifyUpdateSmokeEvidenceSet(documents: readonly unknown[], expectations: UpdateSmokeExpectations): {
   readonly schemaVersion: 1
   readonly targets: readonly UpdateSmokeTarget[]
   readonly candidate: Readonly<Pick<UpdateSmokeEvidence['candidate'], 'tag' | 'version' | 'commit' | 'manifest_sha256'>>

@@ -12,16 +12,16 @@ import {
 } from '../../scripts/verify-update-smoke-evidence.mjs'
 
 const roots: string[] = []
-const candidate = Object.freeze({
+const candidate = {
   tag: 'v2.1.0',
   version: '2.1.0',
   commit: '1234567890abcdef1234567890abcdef12345678',
   manifest_sha256: 'a'.repeat(64)
-})
-const baselineExpectation = Object.freeze({
+}
+const baselineExpectation = {
   baselineTag: 'v2.0.15',
   baseline_manifest_sha256: 'f'.repeat(64)
-})
+}
 
 /** 根据目标生成一份完整且与候选版本绑定的原生证据。 */
 function validEvidence(target: string, evidenceKind = 'real-native') {
@@ -30,13 +30,13 @@ function validEvidence(target: string, evidenceKind = 'real-native') {
     'linux-x86_64': { package_kind: 'appimage', install_scope: 'user', authenticode: 'not-applicable', code_signing: 'not-applicable', notarization: 'not-applicable', replacement_path_same: true, executable_bit: true, digest_changed: true },
     'darwin-aarch64': { package_kind: 'app-tar-gz', install_scope: 'user', authenticode: 'not-applicable', signing_credentials_configured: true, code_signing: 'verified', notarization: 'verified' },
     'darwin-x86_64': { package_kind: 'app-tar-gz', install_scope: 'user', authenticode: 'not-applicable', signing_credentials_configured: true, code_signing: 'verified', notarization: 'verified' }
-  }[target]
+  }[target]!
   const runner = {
     'windows-x86_64': { os: 'windows', arch: 'x86_64' },
     'linux-x86_64': { os: 'linux', arch: 'x86_64' },
     'darwin-aarch64': { os: 'macos', arch: 'aarch64' },
     'darwin-x86_64': { os: 'macos', arch: 'x86_64' }
-  }[target]
+  }[target]!
   return {
     schema_version: 1,
     evidence_kind: evidenceKind,
@@ -173,11 +173,11 @@ describe('update smoke evidence verifier public seam', () => {
   /** 每个生命周期、阻断路径与用户设置 checkpoint 都必须唯一且通过。 */
   it('rejects a missing, duplicate, unknown, or failed checkpoint', () => {
     const missing = validSet()
-    missing[0].checkpoints.pop()
+    missing[0]!.checkpoints.pop()
     expect(() => verifyUpdateSmokeEvidenceSet(missing, { ...candidate, now: new Date('2026-08-28T09:00:00.000Z'), maxAgeHours: 24 }))
       .toThrow('checkpoint set does not exactly match')
     const failed = validSet()
-    failed[0].checkpoints[0].status = 'failed'
+    failed[0]!.checkpoints[0]!.status = 'failed'
     expect(() => verifyUpdateSmokeEvidenceSet(failed, { ...candidate, now: new Date('2026-08-28T09:00:00.000Z'), maxAgeHours: 24 }))
       .toThrow('checkpoint did not pass')
   })
@@ -195,11 +195,11 @@ describe('update smoke evidence verifier public seam', () => {
   /** 平台证据必须使用既定原生架构与安装格式。 */
   it('rejects MSI, non-AppImage Linux, and mismatched native runners', () => {
     const windows = validSet()
-    windows[0].platform.package_kind = 'msi'
+    windows[0]!.platform.package_kind = 'msi'
     expect(() => verifyUpdateSmokeEvidenceSet(windows, { ...candidate, now: new Date('2026-08-28T09:00:00.000Z'), maxAgeHours: 24 }))
       .toThrow('platform contract mismatch')
     const mac = validSet()
-    mac[2].runner.arch = 'x86_64'
+    mac[2]!.runner.arch = 'x86_64'
     expect(() => verifyUpdateSmokeEvidenceSet(mac, { ...candidate, now: new Date('2026-08-28T09:00:00.000Z'), maxAgeHours: 24 }))
       .toThrow('runner contract mismatch')
   })
