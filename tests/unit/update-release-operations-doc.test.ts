@@ -37,13 +37,13 @@ describe('automatic update release operations guide', () => {
     }
   })
 
-  // 验证 promotion 在写入 OSS 前使用与 Desktop 相同的公钥验证全部平台包。
+  // 验证 candidate OSS 写入前使用与 Desktop 相同的公钥验证全部平台包。
   it('requires pre-write signature verification with the embedded public key', () => {
     const guide = readFileSync(operationsGuideUrl, 'utf8')
 
-    expect(guide).toMatch(/before any OSS write/i)
-    expect(guide).toContain('all four updater packages')
-    expect(guide).toContain('must exactly match the public key embedded in Desktop')
+    expect(guide).toContain('before uploading them')
+    expect(guide).toContain('Windows `.exe`, Linux `.AppImage`, and two macOS `.app.tar.gz` updater files')
+    expect(guide).toContain('embedded public key must be identical to `TAURI_SIGNING_PUBLIC_KEY`')
   })
 
   // 验证不可变发布对象使用内容寻址键，并避免与 Versioning 互斥的防覆盖设置。
@@ -58,13 +58,13 @@ describe('automatic update release operations guide', () => {
     expect(guide).not.toContain('conditional writes that refuse overwrite')
   })
 
-  // 验证构建任务只能读取签名密钥，而云身份仅授予 promotion 任务。
+  // 验证构建任务没有云身份，OIDC 仅授予两段最小 OSS 写入任务。
   it('separates build signing access from promotion cloud identity', () => {
     const guide = readFileSync(operationsGuideUrl, 'utf8')
 
-    expect(guide).toContain('Build matrix jobs may reference `production` only to read the two `TAURI_SIGNING_*` secrets')
-    expect(guide).toContain('The promotion job is the only job granted `permissions: id-token: write`')
-    expect(guide).toContain('Build jobs must not consume or pass OIDC provider/role variables, request an ID token, or receive Alibaba Cloud credentials')
+    expect(guide).toContain('Exactly two OSS jobs are granted `permissions: id-token: write`')
+    expect(guide).toContain('`prepare-candidate` may write only content-addressed immutable objects')
+    expect(guide).toContain('Build, native smoke, and aggregate evidence jobs must not consume OIDC provider/role variables')
     expect(guide).not.toContain('Only the promotion job may reference this Environment')
   })
 

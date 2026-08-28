@@ -37,10 +37,12 @@ function normalizePrefix(prefix) {
 async function readTargetArtifact(directory, target) {
   const targetDirectory = path.join(directory, target)
   const names = await readdir(targetDirectory)
-  const updaterPackages = names.filter(name => name.startsWith(`dsh-desktop-${target}-updater.`) && !name.endsWith('.sig'))
-  const packages = updaterPackages.length > 0
-    ? updaterPackages
-    : names.filter(name => !name.endsWith('.sig') && !name.toLowerCase().endsWith('.dmg'))
+  const suffix = target === 'windows-x86_64'
+    ? '.exe'
+    : target === 'linux-x86_64'
+      ? '.AppImage'
+      : '.app.tar.gz'
+  const packages = names.filter(name => name === `dsh-desktop-${target}-updater${suffix}`)
   if (packages.length !== 1) throw new Error(`expected exactly one updater package for ${target}`)
   const filename = packages[0]
   const signatureName = `${filename}.sig`
@@ -49,6 +51,16 @@ async function readTargetArtifact(directory, target) {
     readFile(path.join(targetDirectory, filename)),
     readFile(path.join(targetDirectory, signatureName))
   ])
+  if (target === 'windows-x86_64' && !(body[0] === 0x4d && body[1] === 0x5a)) {
+    throw new Error('invalid Windows updater executable')
+  }
+  if (target === 'linux-x86_64' && !(
+    body[0] === 0x7f && body[1] === 0x45 && body[2] === 0x4c && body[3] === 0x46 &&
+    body[8] === 0x41 && body[9] === 0x49 && body[10] === 0x02
+  )) throw new Error('invalid Linux AppImage updater')
+  if (target.startsWith('darwin-') && !(body[0] === 0x1f && body[1] === 0x8b && body[2] === 0x08)) {
+    throw new Error('invalid macOS updater archive')
+  }
   const signature = signatureBody.toString('utf8')
   if (!signature) throw new Error(`updater signature is empty for ${target}`)
   return {
@@ -250,8 +262,8 @@ export async function runPromotionCli(environment = process.env, dependencies = 
   }, storage, { verifySignature })
 }
 
-/** 提升一个完整的四目标更新发布，并返回写入 Stable channel 的 manifest。 */
-export async function promoteStableRelease(options, storage, dependencies = {}) {
+/** 构造完成密码学验证的四目标 manifest 与不可变发布对象。 */
+async function buildReleaseBundle(options, dependencies) {
   const version = releaseVersion(options.tag)
   const prefix = normalizePrefix(options.prefix)
   const origin = new URL(options.downloadOrigin)
@@ -259,6 +271,7 @@ export async function promoteStableRelease(options, storage, dependencies = {}) 
   if (!String(options.releaseBody ?? '').trim()) throw new Error('GitHub Release body is required')
   const publishedAt = new Date(options.publishedAt)
   if (!options.publishedAt || Number.isNaN(publishedAt.valueOf())) throw new Error('published release timestamp is required')
+  if (!dependencies.verifySignature) throw new Error('a Tauri signature verifier is required')
   const platforms = {}
   const objects = []
   const artifacts = []
@@ -277,16 +290,25 @@ export async function promoteStableRelease(options, storage, dependencies = {}) 
       signature: artifact.signature
     }
   }
-  const manifest = {
-    version,
-    notes: options.releaseBody,
-    pub_date: options.publishedAt,
-    platforms
-  }
-  if (!dependencies.verifySignature) throw new Error('a Tauri signature verifier is required')
   for (const artifact of artifacts) {
     await dependencies.verifySignature(artifact.artifactPath, artifact.signaturePath)
   }
+  return {
+    version,
+    prefix,
+    origin,
+    objects,
+    manifest: {
+      version,
+      notes: options.releaseBody,
+      pub_date: options.publishedAt,
+      platforms
+    }
+  }
+}
+
+/** 上传并远端复核一组不可变 OSS 对象。 */
+async function publishImmutableObjects(objects, storage) {
   for (const object of objects) {
     await storage.ensureObject(object.key, object.body, {
       cacheControl: 'public, max-age=31536000, immutable',
@@ -297,18 +319,175 @@ export async function promoteStableRelease(options, storage, dependencies = {}) 
     const remote = await storage.readObject(object.key)
     if (!remote.equals(object.body)) throw new Error(`remote OSS object differs from uploaded bytes: ${object.key}`)
   }
+}
+
+/** 准备供四个原生 smoke 使用的不可变 candidate，但不修改 Stable pointer。 */
+export async function prepareStableCandidate(options, storage, dependencies = {}) {
+  if (!/^[0-9a-f]{40}$/.test(options.candidateCommit ?? '')) {
+    throw new Error('candidate commit must be a full lowercase Git commit SHA')
+  }
+  const prefix = normalizePrefix(options.prefix)
+  let previousStable
+  let previousStableBody
+  try {
+    previousStableBody = await storage.readObject(`${prefix}/channels/stable/latest.json`)
+    previousStable = JSON.parse(previousStableBody.toString('utf8'))
+  } catch {
+    throw new Error('previous Stable manifest is required; bootstrap promotion is not allowed')
+  }
+  const previousVersion = releaseVersion(previousStable?.version)
+  const bundle = await buildReleaseBundle(options, dependencies)
+  if (previousVersion === bundle.version) throw new Error('candidate version must differ from previous Stable')
+  await publishImmutableObjects(bundle.objects, storage)
+  const manifestBody = Buffer.from(`${JSON.stringify(bundle.manifest, null, 2)}\n`)
+  const manifestSha256 = createHash('sha256').update(manifestBody).digest('hex')
+  const manifestKey = `${bundle.prefix}/candidates/${bundle.version}/${options.candidateCommit}/${manifestSha256}-latest.json`
+  await publishImmutableObjects([{
+    key: manifestKey,
+    body: manifestBody,
+    contentType: 'application/json; charset=utf-8'
+  }], storage)
+  return {
+    schema_version: 1,
+    candidate_tag: options.tag,
+    candidate_commit: options.candidateCommit,
+    previous_stable_tag: `v${previousVersion}`,
+    previous_stable_version: previousVersion,
+    previous_stable_url: new URL(`${prefix}/channels/stable/latest.json`, `${bundle.origin.href.replace(/\/$/, '')}/`).href,
+    previous_stable_manifest_sha256: createHash('sha256').update(previousStableBody).digest('hex'),
+    manifest_url: new URL(manifestKey, `${bundle.origin.href.replace(/\/$/, '')}/`).href,
+    manifest_sha256: manifestSha256,
+    manifest: bundle.manifest
+  }
+}
+
+/** 复核不可变 candidate 身份并将其原样写为 Stable 的最终 pointer。 */
+export async function finalizeStableCandidate(candidate, storage, options = {}) {
+  if (candidate?.schema_version !== 1) throw new Error('unsupported candidate schema version')
+  if (!/^[0-9a-f]{40}$/.test(candidate.candidate_commit ?? '')) throw new Error('candidate commit is invalid')
+  if (!/^[0-9a-f]{64}$/.test(candidate.manifest_sha256 ?? '')) throw new Error('candidate manifest digest is invalid')
+  const version = releaseVersion(candidate.candidate_tag)
+  if (candidate.manifest?.version !== version) throw new Error('candidate tag and manifest version mismatch')
+  if (JSON.stringify(Object.keys(candidate.manifest?.platforms ?? {})) !== JSON.stringify(TARGETS)) {
+    throw new Error('candidate must contain exactly the four canonical targets')
+  }
+  const prefix = normalizePrefix(options.prefix ?? 'dsh-desktop')
+  if (!/^[0-9a-f]{64}$/.test(candidate.previous_stable_manifest_sha256 ?? '')) {
+    throw new Error('previous Stable manifest digest is invalid')
+  }
+  const stableKey = `${prefix}/channels/stable/latest.json`
+  const stableUrl = new URL(candidate.previous_stable_url)
+  if (stableUrl.protocol !== 'https:' || !stableUrl.pathname.endsWith(`/${stableKey}`)) {
+    throw new Error('previous Stable URL does not match the authoritative pointer')
+  }
+  const currentStable = await storage.readObject(stableKey)
+  if (createHash('sha256').update(currentStable).digest('hex') !== candidate.previous_stable_manifest_sha256) {
+    throw new Error('previous Stable manifest changed after candidate preparation')
+  }
+  const manifestUrl = new URL(candidate.manifest_url)
+  if (manifestUrl.protocol !== 'https:') throw new Error('candidate manifest URL must use HTTPS')
+  const expectedSuffix = `/${prefix}/candidates/${version}/${candidate.candidate_commit}/${candidate.manifest_sha256}-latest.json`
+  if (!manifestUrl.pathname.endsWith(expectedSuffix)) throw new Error('candidate manifest URL does not match its identity')
+  const manifestKey = manifestUrl.pathname.slice(1)
+  const remoteManifest = await storage.readObject(manifestKey)
+  const remoteDigest = createHash('sha256').update(remoteManifest).digest('hex')
+  if (remoteDigest !== candidate.manifest_sha256) throw new Error('candidate manifest digest mismatch')
+  const expectedManifest = Buffer.from(`${JSON.stringify(candidate.manifest, null, 2)}\n`)
+  if (!remoteManifest.equals(expectedManifest)) throw new Error('candidate manifest bytes do not match candidate metadata')
   await storage.replaceObject(
-    `${prefix}/channels/stable/latest.json`,
-    Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`),
+    stableKey,
+    remoteManifest,
     { cacheControl: 'no-cache', contentType: 'application/json; charset=utf-8' }
   )
-  return manifest
+  return candidate.manifest
+}
+
+/** 从 production 环境创建限定应用前缀的短期 OSS storage。 */
+function createProductionStorage(environment, dependencies, prefix) {
+  const credentials = {
+    accessKeyId: environment.ALIBABA_CLOUD_ACCESS_KEY_ID,
+    accessKeySecret: environment.ALIBABA_CLOUD_ACCESS_KEY_SECRET,
+    securityToken: environment.ALIBABA_CLOUD_SECURITY_TOKEN
+  }
+  if (!credentials.accessKeyId || !credentials.accessKeySecret || !credentials.securityToken) {
+    throw new Error('short-lived Alibaba Cloud STS credentials are required')
+  }
+  if (!environment.OSS_BUCKET || !environment.OSS_REGION || !environment.UPDATE_BASE_URL) {
+    throw new Error('OSS_BUCKET, OSS_REGION, and UPDATE_BASE_URL are required')
+  }
+  return (dependencies.createStorage ?? createOssutilStorage)({
+    bucket: environment.OSS_BUCKET,
+    region: environment.OSS_REGION,
+    prefix,
+    credentials
+  })
+}
+
+/** 解析 candidate preparation CLI，并把不可变 candidate identity 写到指定文件。 */
+export async function runCandidatePreparationCli(environment = process.env, dependencies = {}, args = process.argv.slice(2)) {
+  const values = parseArguments(args)
+  const prefix = values.prefix ?? 'dsh-desktop'
+  if (!values.output) throw new Error('--output is required for candidate preparation')
+  if (!environment.TAURI_SIGNING_PUBLIC_KEY) throw new Error('TAURI_SIGNING_PUBLIC_KEY is required')
+  const storage = createProductionStorage(environment, dependencies, prefix)
+  const prepare = dependencies.prepare ?? prepareStableCandidate
+  const candidate = await prepare({
+    tag: values.tag,
+    releaseBody: values.notes,
+    publishedAt: values['published-at'],
+    candidateCommit: values['candidate-commit'],
+    artifactsDirectory: values.assets ?? 'artifacts',
+    downloadOrigin: environment.UPDATE_BASE_URL,
+    prefix
+  }, storage, {
+    verifySignature: dependencies.verifySignature
+      ?? ((artifactPath, signaturePath) => verifyTauriSignature(
+        artifactPath,
+        signaturePath,
+        environment.TAURI_SIGNING_PUBLIC_KEY,
+        dependencies.runMinisign
+      ))
+  })
+  await writeFile(values.output, `${JSON.stringify(candidate, null, 2)}\n`, { mode: 0o600 })
+  return candidate
+}
+
+/** 解析 final promotion CLI，并只从已验证 candidate 写入 Stable pointer。 */
+export async function runCandidateFinalizationCli(environment = process.env, dependencies = {}, args = process.argv.slice(2)) {
+  const values = parseArguments(args)
+  const prefix = values.prefix ?? 'dsh-desktop'
+  if (!values.candidate) throw new Error('--candidate is required for final promotion')
+  const candidate = JSON.parse(await readFile(values.candidate, 'utf8'))
+  const storage = createProductionStorage(environment, dependencies, prefix)
+  return (dependencies.finalize ?? finalizeStableCandidate)(candidate, storage, { prefix })
+}
+
+/** 提升一个完整的四目标更新发布，并返回写入 Stable channel 的 manifest。 */
+export async function promoteStableRelease(options, storage, dependencies = {}) {
+  const bundle = await buildReleaseBundle(options, dependencies)
+  await publishImmutableObjects(bundle.objects, storage)
+  await storage.replaceObject(
+    `${bundle.prefix}/channels/stable/latest.json`,
+    Buffer.from(`${JSON.stringify(bundle.manifest, null, 2)}\n`),
+    { cacheControl: 'no-cache', contentType: 'application/json; charset=utf-8' }
+  )
+  return bundle.manifest
 }
 
 /** 运行发布器 CLI，日志仅包含公开版本信息。 */
 async function main() {
-  const manifest = await runPromotionCli()
-  console.log(`Promoted Desktop ${manifest.version} to Stable`)
+  const [mode, ...args] = process.argv.slice(2)
+  if (mode === '--prepare-candidate') {
+    const candidate = await runCandidatePreparationCli(process.env, {}, args)
+    console.log(`Prepared Desktop ${candidate.candidate_tag} candidate`)
+    return
+  }
+  if (mode === '--finalize-candidate') {
+    const manifest = await runCandidateFinalizationCli(process.env, {}, args)
+    console.log(`Promoted Desktop ${manifest.version} to Stable`)
+    return
+  }
+  throw new Error('an explicit --prepare-candidate or --finalize-candidate mode is required')
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main()

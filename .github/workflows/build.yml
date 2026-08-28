@@ -143,6 +143,8 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          DSH_UPDATER_ENDPOINT: https://updates.cyunlab.com/dsh-desktop/channels/stable/latest.json
+          DSH_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
           APPIMAGE_EXTRACT_AND_RUN: 1
         run: pnpm package -- --verbose
       - name: Build and recursively sign macOS application
@@ -154,6 +156,8 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          DSH_UPDATER_ENDPOINT: https://updates.cyunlab.com/dsh-desktop/channels/stable/latest.json
+          DSH_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
         run: |
           set -euo pipefail
           pnpm tauri:build --bundles app --verbose

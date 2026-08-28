@@ -94,6 +94,13 @@ describe('native build workflow contract', () => {
     expect(workflow).not.toContain('pnpm package -- --verbose || pnpm package -- --verbose')
   })
 
+  /** 确保四目标正式二进制编译进受信 Stable endpoint 与同一 updater 公钥。 */
+  it('embeds the production Stable endpoint and promotion public key in every native build', () => {
+    expect(workflow.match(/DSH_UPDATER_ENDPOINT: https:\/\/updates\.cyunlab\.com\/dsh-desktop\/channels\/stable\/latest\.json/g)).toHaveLength(2)
+    expect(workflow.match(/DSH_UPDATER_PUBLIC_KEY: \$\{\{ vars\.TAURI_SIGNING_PUBLIC_KEY \}\}/g)).toHaveLength(2)
+    expect(workflow).not.toMatch(/DSH_UPDATER_ENDPOINT:\s*\$\{\{\s*inputs\./)
+  })
+
   /** 确保两个 macOS 架构都经过 Developer ID 签名、Apple 公证和装订。 */
   it('signs and notarizes every macOS release artifact', () => {
     expect(workflow).toContain("if: matrix.platform == 'mac'")
