@@ -87,7 +87,32 @@ fn periodic_timer_continues_the_six_hour_schedule() {
 
     assert_eq!(output.snapshot.sequence, 2);
     assert_eq!(output.snapshot.state, UpdateState::Checking);
-    assert_eq!(output.effects.len(), 2);
+    assert!(output.effects.is_empty());
+}
+
+/// 检查或下载进行中时重复触发不会启动重叠更新操作。
+#[test]
+fn overlapping_update_triggers_are_ignored() {
+    let mut controller = controller(None);
+    controller.handle(UpdateInput::Ready).unwrap();
+    for input in [
+        UpdateInput::Ready,
+        UpdateInput::PeriodicCheckDue,
+        UpdateInput::ManualCheck,
+    ] {
+        assert!(controller.handle(input).unwrap().effects.is_empty());
+    }
+    controller
+        .handle(UpdateInput::CheckSucceeded {
+            release: Some(release("2.1.0")),
+        })
+        .unwrap();
+    controller.handle(UpdateInput::DownloadStarted).unwrap();
+    assert!(controller
+        .handle(UpdateInput::ManualCheck)
+        .unwrap()
+        .effects
+        .is_empty());
 }
 
 /// Ready 之前到达的周期信号不会启动后台调度。
@@ -128,19 +153,21 @@ fn recovered_staging_remains_the_actionable_state() {
             version: "2.1.0".into(),
         })
         .unwrap();
-    let same = controller
-        .handle(UpdateInput::CheckSucceeded {
-            release: Some(release("2.1.0")),
-        })
-        .unwrap();
-    assert_eq!(
-        same.snapshot.state,
-        UpdateState::Staged {
-            version: "2.1.0".into(),
-            release_notes: String::new()
-        }
-    );
-    assert!(same.effects.is_empty());
+    for version in ["2.1.0", "2.0.16"] {
+        let same_or_older = controller
+            .handle(UpdateInput::CheckSucceeded {
+                release: Some(release(version)),
+            })
+            .unwrap();
+        assert_eq!(
+            same_or_older.snapshot.state,
+            UpdateState::Staged {
+                version: "2.1.0".into(),
+                release_notes: String::new()
+            }
+        );
+        assert!(same_or_older.effects.is_empty());
+    }
     let failed = controller
         .handle(UpdateInput::CheckFailed {
             message: "offline".into(),
@@ -154,6 +181,40 @@ fn recovered_staging_remains_the_actionable_state() {
             release_notes: String::new()
         }
     );
+}
+
+/// 新 Stable 会先请求丢弃旧 staging，且下载失败后不会恢复旧版本。
+#[test]
+fn newer_stable_discards_old_staging_before_download() {
+    let mut controller = controller(None);
+    controller
+        .handle(UpdateInput::RecoverStaged {
+            version: "2.1.0".into(),
+        })
+        .unwrap();
+    let discovered = controller
+        .handle(UpdateInput::CheckSucceeded {
+            release: Some(release("2.2.0")),
+        })
+        .unwrap();
+    assert_eq!(
+        discovered.effects,
+        vec![
+            UpdateEffect::DiscardOlderStaged {
+                replacement_version: "2.2.0".into(),
+            },
+            UpdateEffect::StartDownload {
+                release: release("2.2.0"),
+            },
+        ]
+    );
+    let failed = controller
+        .handle(UpdateInput::DownloadFailed {
+            message: "offline".into(),
+            retryable: false,
+        })
+        .unwrap();
+    assert!(matches!(failed.snapshot.state, UpdateState::Failed { .. }));
 }
 
 /// 等于或低于当前版本的结果均不会触发自动下载。

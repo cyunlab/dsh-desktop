@@ -18,7 +18,7 @@ memmap2 = "0.9"
 futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 tempfile = "3"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "sync"] }
 flate2 = "1"
 tar = "0.4"
 tauri = { version = "2", features = [] }

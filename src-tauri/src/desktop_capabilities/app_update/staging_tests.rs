@@ -162,6 +162,41 @@ fn successful_installation_cleans_the_staged_update() {
     assert_eq!(recovered.snapshot(), None);
 }
 
+/// Windows installer handoff 后只有新进程版本达到 staging 版本才清理。
+#[test]
+fn startup_reconciliation_cleans_only_after_version_advances() {
+    let cache = tempfile::tempdir().unwrap();
+    let mut repository = StagingRepository::open(cache.path(), DeterministicVerifier).unwrap();
+    repository
+        .stage(
+            StageCandidate::new("2.1.0", "trusted:package-v2").unwrap(),
+            "package-v2".as_bytes(),
+        )
+        .unwrap();
+
+    assert!(!repository.reconcile_current_version("2.0.15").unwrap());
+    assert_eq!(repository.snapshot().unwrap().version(), "2.1.0");
+    assert!(repository.reconcile_current_version("2.1.0").unwrap());
+    assert_eq!(repository.snapshot(), None);
+}
+
+/// 发现更高 Stable 时仓储立即清除旧 staging，同旧版本则保留。
+#[test]
+fn discard_older_staging_only_for_newer_replacement() {
+    let cache = tempfile::tempdir().unwrap();
+    let mut repository = StagingRepository::open(cache.path(), DeterministicVerifier).unwrap();
+    repository
+        .stage(
+            StageCandidate::new("2.1.0", "trusted:package-v2").unwrap(),
+            "package-v2".as_bytes(),
+        )
+        .unwrap();
+    assert!(!repository.discard_if_older_than("2.1.0").unwrap());
+    assert!(repository.snapshot().is_some());
+    assert!(repository.discard_if_older_than("2.2.0").unwrap());
+    assert!(repository.snapshot().is_none());
+}
+
 /// 验证中断的流式写入不会留下可恢复的部分更新。
 #[test]
 fn interrupted_stream_is_discarded() {

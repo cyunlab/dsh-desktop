@@ -124,6 +124,9 @@ pub enum UpdateEffect {
     StartDownload {
         release: StableRelease,
     },
+    DiscardOlderStaged {
+        replacement_version: String,
+    },
     ScheduleRetry {
         operation: UpdateOperation,
         after: Duration,
@@ -169,6 +172,7 @@ pub struct UpdateController<C, P> {
     current_release: Option<StableRelease>,
     staged_version: Option<Version>,
     ready: bool,
+    operation_active: bool,
     snapshot: UpdateSnapshot,
     pending_retry: Option<PendingRetry>,
 }
@@ -186,6 +190,7 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
             current_release: None,
             staged_version: None,
             ready: false,
+            operation_active: false,
             snapshot: UpdateSnapshot {
                 sequence: 0,
                 state: UpdateState::Idle,
@@ -221,12 +226,24 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
                 }
             }
             UpdateInput::Ready => {
+                if self.ready || self.operation_in_flight() {
+                    self.snapshot.sequence += 1;
+                    return Ok(UpdateOutput {
+                        snapshot: self.snapshot.clone(),
+                        effects,
+                    });
+                }
                 self.ready = true;
                 self.start_check(true, &mut effects);
             }
-            UpdateInput::PeriodicCheckDue if self.ready => self.start_check(true, &mut effects),
+            UpdateInput::PeriodicCheckDue if self.ready && !self.operation_in_flight() => {
+                self.start_check(true, &mut effects)
+            }
             UpdateInput::PeriodicCheckDue => {}
-            UpdateInput::ManualCheck => self.start_check(false, &mut effects),
+            UpdateInput::ManualCheck if !self.operation_in_flight() => {
+                self.start_check(false, &mut effects)
+            }
+            UpdateInput::ManualCheck => {}
             UpdateInput::CheckSucceeded { release } => {
                 self.accept_check_result(release, &mut effects)?
             }
@@ -238,6 +255,7 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
                 self.snapshot.automatic_download = enabled;
                 if enabled && matches!(self.snapshot.state, UpdateState::Available { .. }) {
                     if let Some(release) = self.current_release.clone() {
+                        self.operation_active = true;
                         effects.push(UpdateEffect::StartDownload { release });
                     }
                 }
@@ -259,6 +277,7 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
 
     /// 开始一次非阻塞检查并维护六小时周期。
     fn start_check(&mut self, schedule_next: bool, effects: &mut Vec<UpdateEffect>) {
+        self.operation_active = true;
         self.snapshot.state = UpdateState::Checking;
         self.pending_retry = None;
         effects.push(UpdateEffect::CheckStable);
@@ -277,6 +296,7 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
         effects: &mut Vec<UpdateEffect>,
     ) -> Result<(), UpdateDomainError> {
         self.pending_retry = None;
+        self.operation_active = false;
         let Some(release) = release else {
             self.current_release = None;
             self.snapshot.state = UpdateState::UpToDate;
@@ -305,15 +325,27 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
             };
             return Ok(());
         }
+        if self.staged_version.is_some() {
+            self.staged_version = None;
+            effects.push(UpdateEffect::DiscardOlderStaged {
+                replacement_version: release.version.clone(),
+            });
+        }
         self.snapshot.state = UpdateState::Available {
             version: release.version.clone(),
             release_notes: release.release_notes.clone(),
         };
         self.current_release = Some(release.clone());
         if self.snapshot.automatic_download {
+            self.operation_active = true;
             effects.push(UpdateEffect::StartDownload { release });
         }
         Ok(())
+    }
+
+    /// 判断真实检查或下载操作是否已经占用单一更新操作槽位。
+    fn operation_in_flight(&self) -> bool {
+        self.operation_active
     }
 
     /// 将已接受的 Stable 发布转换为下载中状态。
@@ -342,6 +374,7 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
 
     /// 将成功下载表示为待持久化 Adapter 接手的 staged 领域状态。
     fn finish_download(&mut self) {
+        self.operation_active = false;
         self.pending_retry = None;
         if let Some(release) = &self.current_release {
             self.staged_version = Version::parse(&release.version).ok();
@@ -360,6 +393,7 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
         retryable: bool,
         effects: &mut Vec<UpdateEffect>,
     ) {
+        self.operation_active = false;
         let prior_retries = self
             .pending_retry
             .as_ref()
@@ -400,11 +434,13 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
         };
         match pending.operation {
             UpdateOperation::Check => {
+                self.operation_active = true;
                 self.snapshot.state = UpdateState::Checking;
                 effects.push(UpdateEffect::CheckStable);
             }
             UpdateOperation::Download => {
                 if let Some(release) = self.current_release.clone() {
+                    self.operation_active = true;
                     effects.push(UpdateEffect::StartDownload { release });
                 }
             }

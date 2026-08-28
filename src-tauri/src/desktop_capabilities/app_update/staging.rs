@@ -277,6 +277,42 @@ impl<V: UpdateVerifier> StagingRepository<V> {
         self.clear()
     }
 
+    /// 在 Desktop 新进程版本达到暂存版本后确认 installer handoff 成功并清理。
+    pub fn reconcile_current_version(
+        &mut self,
+        current_version: &str,
+    ) -> Result<bool, StagingError> {
+        let Some(metadata) = &self.staged else {
+            return Ok(false);
+        };
+        let current =
+            Version::parse(current_version).map_err(|_| StagingError::InvalidCandidate)?;
+        let staged = Version::parse(&metadata.version).map_err(|_| StagingError::StorageFailed)?;
+        if current < staged {
+            return Ok(false);
+        }
+        self.clear()?;
+        Ok(true)
+    }
+
+    /// 发现更高 Stable 时立即丢弃旧 staging，为唯一候选腾出可信槽位。
+    pub fn discard_if_older_than(
+        &mut self,
+        replacement_version: &str,
+    ) -> Result<bool, StagingError> {
+        let Some(metadata) = &self.staged else {
+            return Ok(false);
+        };
+        let replacement =
+            Version::parse(replacement_version).map_err(|_| StagingError::InvalidCandidate)?;
+        let staged = Version::parse(&metadata.version).map_err(|_| StagingError::StorageFailed)?;
+        if replacement <= staged {
+            return Ok(false);
+        }
+        self.clear()?;
+        Ok(true)
+    }
+
     /// 删除包与元数据并同步清空公开快照。
     fn clear(&mut self) -> Result<(), StagingError> {
         remove_if_exists(&self.root.join(METADATA_FILE))?;
