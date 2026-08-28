@@ -101,3 +101,59 @@ The optional `DSH_NODE_PATH` environment variable that explicitly replaces the p
 ### Desktop shell
 
 The native application layer responsible for windowing, lifecycle, packaging, and future desktop capability bridges. The shell does not define the Harness runtime semantics.
+
+### Automatic update
+
+The Desktop-owned flow that discovers a newer trusted Desktop release and, after user confirmation, replaces the installed application and restarts it. Updating includes orderly shutdown of the owned Host before installation.
+
+### Update channel
+
+An ordered stream of Desktop releases offered to an installation. The first automatic-update milestone exposes only the Stable channel.
+
+### Stable channel
+
+The production Update channel intended for all users. A built release does not enter Stable until it has passed the release gate.
+
+### Update release
+
+A versioned set of signed, platform-specific Desktop packages and metadata that can be offered through an Update channel.
+
+### Stable promotion
+
+The admission of a validated Update release into the Stable channel. Promotion changes the release offered to Desktop installations; building or staging packages alone does not.
+
+### Update availability indicator
+
+A non-interrupting Desktop-owned signal that a newer Update release is available. It opens the update flow only when the user activates it and never presents an unsolicited update dialog.
+
+### Staged update
+
+A downloaded and verified Update release retained by Desktop until the user requests a restart or normally exits the application. Only one Update release may be staged for an installation at a time.
+
+### Update confirmation
+
+The user's explicit approval for Desktop to stop its owned Host, install a Staged update, and restart. Update availability and background download do not constitute confirmation.
+
+### Trusted update
+
+An Update release whose package signature verifies against the update public key embedded in Desktop. Operating-system publisher trust is separate from this Desktop update trust.
+
+### Update signing key
+
+The secret release credential used only by trusted automation to sign Update release packages. Desktop installations contain its public counterpart and never receive the secret key.
+
+### Desktop client plugin
+
+A private client package shipped as part of Desktop and layered onto the official Web composition. It may present Desktop-owned experience inside the Web Client but does not own native Desktop authority.
+
+### Trusted plugin
+
+A user-installed third-party DSH plugin treated as application code with the same ambient authority as its Host or Web Client runtime. Desktop capability declarations provide compatibility, user mediation, and diagnostics; they do not sandbox a Trusted plugin from other plugins in the same runtime.
+
+### Desktop capability
+
+A typed, task-level native behavior supplied by the Desktop shell to a Desktop client plugin or Trusted plugin. A capability hides Tauri commands, transport, platform differences, lifecycle, and native error details behind a domain Interface.
+
+### Desktop capability bridge
+
+The Desktop-owned Module that presents typed Desktop capabilities to plugins and adapts them to Rust-owned native behavior. It does not expose a generic native invocation Interface.

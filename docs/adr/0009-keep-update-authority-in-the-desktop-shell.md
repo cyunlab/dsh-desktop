@@ -1,0 +1,3 @@
+# Keep update authority in the Desktop shell
+
+A Desktop-owned Harness client plugin may register an Update availability indicator in the Web Client sidebar, but it is a display and request surface only. The indicator remains hidden when no update state needs attention; the native application menu provides persistent Check for Updates and Automatically Download Updates controls. User confirmation occurs in a packaged-origin Tauri modal window, while checking policy, trusted endpoints, download verification, Host shutdown, installation, and restart remain exclusively in the Rust shell. This preserves a native update entry inside the product without granting the Host-served Web Client or its other plugins direct application-update authority.
