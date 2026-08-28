@@ -11,6 +11,8 @@ use cli_supervisor::{
     build_command_plan, spawn_cli, CliProcess, ExitReason, ProcessExit, StopReport,
     SupervisorError, HOST_ORIGIN,
 };
+use desktop_capabilities::app_update::tauri_adapter::TauriUpdateRuntime;
+use desktop_capabilities::app_update::{UpdateInput, UpdateSnapshot};
 use lifecycle::{wait_for_readiness, ReadinessWaitError};
 use serde::Serialize;
 #[cfg(all(debug_assertions, feature = "wdio"))]
@@ -23,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -136,6 +139,17 @@ fn is_packaged_startup_url(target: &tauri::Url) -> bool {
         || (target.scheme() == "tauri" && target.host_str() == Some("localhost"));
     packaged_origin
         && matches!(target.path(), "" | "/" | "/index.html")
+        && target.query().is_none()
+        && target.fragment().is_none()
+}
+
+/// 判断调用方是否是精确的 Desktop 打包更新页面，拒绝 Host origin 冒充确认界面。
+fn is_packaged_update_url(target: &tauri::Url) -> bool {
+    let packaged_origin = (target.scheme() == "http"
+        && target.host_str() == Some("tauri.localhost"))
+        || (target.scheme() == "tauri" && target.host_str() == Some("localhost"));
+    packaged_origin
+        && target.path() == "/update.html"
         && target.query().is_none()
         && target.fragment().is_none()
 }
@@ -555,6 +569,9 @@ fn mark_client_page_loaded(app: &AppHandle, state: &RuntimeState, loaded_url: &t
         *loading_url = None;
     }
     transition(app, state, LifecycleState::Ready, "Ready.");
+    if let Some(updater) = app.try_state::<Arc<TauriUpdateRuntime>>() {
+        updater.inner().dispatch(app, UpdateInput::Ready);
+    }
 }
 
 /// HTTP 响应在有界读取中的严格 framing 判定。
@@ -1589,6 +1606,8 @@ enum ShutdownSource {
     Destroyed,
     /// 开发终端发出的 SIGINT 或 SIGTERM。
     TerminalSignal,
+    /// 打包来源更新界面请求安装后重启。
+    UpdateRestart,
 }
 
 #[cfg(all(debug_assertions, feature = "wdio"))]
@@ -1599,6 +1618,7 @@ impl ShutdownSource {
             Self::CloseRequested => "close-requested",
             Self::Destroyed => "destroyed",
             Self::TerminalSignal => "terminal-signal",
+            Self::UpdateRestart => "update-restart",
         }
     }
 }
@@ -1651,13 +1671,32 @@ fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>, source: Shutdown
             .as_ref()
             .is_some_and(|process| stop_cli(&state, process).is_err());
         drop(_gate);
+        let update_requested = matches!(
+            source,
+            ShutdownSource::CloseRequested | ShutdownSource::UpdateRestart
+        ) && app
+            .try_state::<Arc<TauriUpdateRuntime>>()
+            .is_some_and(|updater| updater.has_staged());
+        let install_failed = !cleanup_failed
+            && update_requested
+            && app
+                .try_state::<Arc<TauriUpdateRuntime>>()
+                .is_none_or(|updater| updater.install_staged(&app).is_err());
         #[cfg(all(debug_assertions, feature = "wdio"))]
         record_wdio_event(serde_json::json!({
             "event": "native-shutdown-completed",
             "generation": shutdown_generation,
             "cleanupSucceeded": !cleanup_failed
         }));
-        app.exit(if cleanup_failed { 1 } else { 0 });
+        if !cleanup_failed && !install_failed && matches!(source, ShutdownSource::UpdateRestart) {
+            app.restart();
+        } else {
+            app.exit(if cleanup_failed || install_failed {
+                1
+            } else {
+                0
+            });
+        }
     });
 }
 
@@ -1805,6 +1844,83 @@ fn startup_copy_diagnostics(
         .map_err(|error| error.to_string())
 }
 
+/// 返回 Rust 所有的完整更新快照，不接受任何更新资源参数。
+#[tauri::command]
+fn app_update_snapshot(state: State<'_, Arc<TauriUpdateRuntime>>) -> UpdateSnapshot {
+    state.snapshot()
+}
+
+/// 只请求打开 Desktop 打包来源的更新界面，不接受 URL、路径或安装参数。
+#[tauri::command]
+fn app_update_open_surface(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("app-update") {
+        window
+            .show()
+            .map_err(|_| "update surface unavailable".to_string())?;
+        window
+            .set_focus()
+            .map_err(|_| "update surface unavailable".to_string())?;
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(&app, "app-update", WebviewUrl::App("update.html".into()))
+        .title("DeepSeek Harness Desktop Update")
+        .inner_size(520.0, 440.0)
+        .resizable(false)
+        .center()
+        .build()
+        .map(|_| ())
+        .map_err(|_| "update surface unavailable".to_string())
+}
+
+/// 接受打包来源界面的无参数重启确认；包选择和安装原语仍完全由 Rust 所有。
+#[tauri::command]
+fn app_update_restart(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    lifecycle: State<'_, Arc<RuntimeState>>,
+) -> Result<(), String> {
+    let trusted_surface = window.label() == "app-update"
+        && window.url().is_ok_and(|url| is_packaged_update_url(&url));
+    if !trusted_surface {
+        return Err("Update confirmation requires the Desktop update surface.".into());
+    }
+    let staged = app
+        .try_state::<Arc<TauriUpdateRuntime>>()
+        .is_some_and(|updater| updater.has_staged());
+    if !staged {
+        return Err("No staged update is available.".into());
+    }
+    request_shutdown(&app, lifecycle.inner(), ShutdownSource::UpdateRestart);
+    Ok(())
+}
+
+/// 安装原生更新菜单，并把菜单意图直接送入 Rust controller。
+fn install_update_menu(app: &tauri::App, updater: &Arc<TauriUpdateRuntime>) -> tauri::Result<()> {
+    let check = MenuItemBuilder::with_id("app-update-check", "Check for Updates").build(app)?;
+    let automatic = CheckMenuItemBuilder::with_id(
+        "app-update-automatic-download",
+        "Automatically Download Updates",
+    )
+    .checked(updater.snapshot().automatic_download)
+    .build(app)?;
+    let submenu = SubmenuBuilder::new(app, "Updates")
+        .item(&check)
+        .item(&automatic)
+        .build()?;
+    let menu = MenuBuilder::new(app).item(&submenu).build()?;
+    app.set_menu(menu)?;
+    let updater = Arc::clone(updater);
+    app.on_menu_event(move |app, event| match event.id().as_ref() {
+        "app-update-check" => updater.dispatch(app, UpdateInput::ManualCheck),
+        "app-update-automatic-download" => {
+            let enabled = !updater.snapshot().automatic_download;
+            updater.dispatch(app, UpdateInput::SetAutomaticDownload(enabled));
+        }
+        _ => {}
+    });
+    Ok(())
+}
+
 /// 创建 Startup window，注册 Tauri IPC，并启动 direct CLI 生命周期监督线程。
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(all(debug_assertions, feature = "wdio"))]
@@ -1838,6 +1954,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         last_error: Mutex::new(None),
     });
     app.manage(Arc::clone(&state));
+    let update_runtime = TauriUpdateRuntime::new(app.handle())?;
+    install_update_menu(app, &update_runtime)?;
+    app.manage(update_runtime);
     let app_handle = app.handle().clone();
     #[cfg(all(debug_assertions, unix))]
     register_development_shutdown_signals(app_handle.clone(), Arc::clone(&state))?;
@@ -1979,11 +2098,19 @@ fn main() {
                 .open_js_links_on_click(false)
                 .build(),
         )
-        .plugin(tauri_plugin_clipboard_manager::init());
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(option_env!("DSH_UPDATER_PUBLIC_KEY").unwrap_or(""))
+                .build(),
+        );
     let builder = builder.invoke_handler(tauri::generate_handler![
         startup_snapshot,
         startup_retry,
-        startup_copy_diagnostics
+        startup_copy_diagnostics,
+        app_update_snapshot,
+        app_update_open_surface,
+        app_update_restart
     ]);
     #[cfg(feature = "wdio")]
     let builder = builder

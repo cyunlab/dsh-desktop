@@ -101,6 +101,61 @@ fn periodic_schedule_does_not_start_before_ready() {
     assert!(output.effects.is_empty());
 }
 
+/// 进程重启恢复的可信 staging 版本会立即重新呈现为待安装状态。
+#[test]
+fn recovered_staging_is_visible_before_network_check() {
+    let output = controller(None)
+        .handle(UpdateInput::RecoverStaged {
+            version: "2.1.0".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        output.snapshot.state,
+        UpdateState::Staged {
+            version: "2.1.0".into(),
+            release_notes: String::new()
+        }
+    );
+    assert!(output.effects.is_empty());
+}
+
+/// 已恢复的 staging 不会被同版本 Stable 重复下载或被检查失败遮盖。
+#[test]
+fn recovered_staging_remains_the_actionable_state() {
+    let mut controller = controller(None);
+    controller
+        .handle(UpdateInput::RecoverStaged {
+            version: "2.1.0".into(),
+        })
+        .unwrap();
+    let same = controller
+        .handle(UpdateInput::CheckSucceeded {
+            release: Some(release("2.1.0")),
+        })
+        .unwrap();
+    assert_eq!(
+        same.snapshot.state,
+        UpdateState::Staged {
+            version: "2.1.0".into(),
+            release_notes: String::new()
+        }
+    );
+    assert!(same.effects.is_empty());
+    let failed = controller
+        .handle(UpdateInput::CheckFailed {
+            message: "offline".into(),
+            retryable: true,
+        })
+        .unwrap();
+    assert_eq!(
+        failed.snapshot.state,
+        UpdateState::Staged {
+            version: "2.1.0".into(),
+            release_notes: String::new()
+        }
+    );
+}
+
 /// 等于或低于当前版本的结果均不会触发自动下载。
 #[test]
 fn check_result_never_downgrades_or_reinstalls_current_version() {
