@@ -23,6 +23,25 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
+      - name: Install checksum-verified ossutil
+        shell: bash
+        run: |
+          set -euo pipefail
+          OSSUTIL_ARCHIVE="$RUNNER_TEMP/ossutil-v1.7.19-linux-amd64.zip"
+          OSSUTIL_EXTRACT_DIR="$RUNNER_TEMP/ossutil-v1.7.19"
+          OSSUTIL_BIN_DIR="$RUNNER_TEMP/bin"
+          curl --fail --location --silent --show-error \
+            --output "$OSSUTIL_ARCHIVE" \
+            https://gosspublic.alicdn.com/ossutil/1.7.19/ossutil-v1.7.19-linux-amd64.zip
+          printf '%s  %s\n' \
+            dcc512e4a893e16bbee63bc769339d8e56b21744fd83c8212a9d8baf28767343 \
+            "$OSSUTIL_ARCHIVE" | sha256sum --check
+          mkdir -p "$OSSUTIL_EXTRACT_DIR" "$OSSUTIL_BIN_DIR"
+          unzip -q "$OSSUTIL_ARCHIVE" -d "$OSSUTIL_EXTRACT_DIR"
+          install -m 0755 \
+            "$OSSUTIL_EXTRACT_DIR/ossutil-v1.7.19-linux-amd64/ossutil" \
+            "$OSSUTIL_BIN_DIR/ossutil"
+          echo "$OSSUTIL_BIN_DIR" >> "$GITHUB_PATH"
       - name: Download the four signed updater packages
         env:
           GH_TOKEN: ${{ github.token }}
