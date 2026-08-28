@@ -8,6 +8,7 @@ import { requiredRuntimeAssets, runtimeTarget } from '../../scripts/runtime-clos
 import { probeDirectDshWeb, waitForListenerClosed } from '../../scripts/smoke-dsh-cli.mjs'
 
 const desktopManifest = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'))
+const trustedDesktopPatch = await readFile(new URL('../fixtures/desktop-update-client.patch.yml', import.meta.url), 'utf8')
 const pinnedDshVersion = desktopManifest.dependencies['@deepseek-ai/dsh'] as string
 const FIXED_PORT_TEST_TIMEOUT_MS = 7 * 60_000
 
@@ -122,7 +123,7 @@ async function createRuntimeFixture(cliSource: string): Promise<{ root: string; 
   const desktopPatch = path.join(nodeModulesRoot, '@cyunlab', 'dsh-desktop-update-client', 'cordis.patch.yml')
   const desktopEntry = path.join(path.dirname(desktopPatch), 'lib', 'index.js')
   await mkdir(path.dirname(desktopEntry), { recursive: true })
-  await writeFile(desktopPatch, "- insert:\n    - id: dsh-desktop-update-client\n      name: '@cyunlab/dsh-desktop-update-client'\n")
+  await writeFile(desktopPatch, trustedDesktopPatch)
   await writeFile(desktopEntry, 'export function apply() {}\n')
   return { root, contentRoot, eventsFile: path.join(root, 'events.log'), nodeExecutable, nodeModulesRoot, platformName: target.platformName, runtimeArch: target.runtimeArch }
 }
