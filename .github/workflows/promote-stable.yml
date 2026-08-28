@@ -165,6 +165,10 @@ jobs:
         with:
           name: update-smoke-evidence-${{ needs.prepare-candidate.outputs.candidate_tag }}-${{ needs.prepare-candidate.outputs.candidate_commit }}
           path: evidence
+      - name: Verify aggregate evidence attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh attestation verify evidence/* --repo "$GITHUB_REPOSITORY"
       - name: Verify exact, fresh, real four-target evidence
         run: >-
           node scripts/verify-update-smoke-evidence.mjs --evidence evidence
@@ -199,6 +203,10 @@ jobs:
         with:
           name: update-smoke-evidence-${{ needs.prepare-candidate.outputs.candidate_tag }}-${{ needs.prepare-candidate.outputs.candidate_commit }}
           path: evidence
+      - name: Verify aggregate evidence attestations again
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh attestation verify evidence/* --repo "$GITHUB_REPOSITORY"
       - name: Reverify promotion admission before OIDC exchange
         shell: bash
         env:
