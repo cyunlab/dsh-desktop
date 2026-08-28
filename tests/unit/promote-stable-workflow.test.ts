@@ -41,6 +41,16 @@ describe('Stable promotion workflow contract', () => {
     expect(workflow).not.toMatch(/acs:ram::\d+/)
   })
 
+  /** 确保 publisher 使用经过固定校验的官方 ossutil，而非未验证的远程安装脚本。 */
+  it('installs the pinned ossutil binary after verifying its checksum', () => {
+    expect(workflow).toContain('ossutil/1.7.19/ossutil-v1.7.19-linux-amd64.zip')
+    expect(workflow).toContain('dcc512e4a893e16bbee63bc769339d8e56b21744fd83c8212a9d8baf28767343')
+    expect(workflow).toContain('sha256sum --check')
+    expect(workflow).toContain('OSSUTIL_BIN_DIR="$RUNNER_TEMP/bin"')
+    expect(workflow).toContain('echo "$OSSUTIL_BIN_DIR" >> "$GITHUB_PATH"')
+    expect(workflow).not.toMatch(/curl[^\n]*\|\s*(?:ba)?sh/)
+  })
+
   /** 确保 publisher 接收 published Release 的 tag、正文和全部下载资产。 */
   it('passes the published release and downloaded assets to the publisher', () => {
     expect(workflow).toContain('github.event.release.tag_name')
@@ -49,5 +59,8 @@ describe('Stable promotion workflow contract', () => {
     expect(workflow).toContain('node scripts/promote-stable-release.mjs')
     expect(workflow).toContain('--assets artifacts')
     expect(workflow).toContain('--prefix dsh-desktop')
+    expect(workflow).toContain('for target in windows-x86_64 linux-x86_64 darwin-aarch64 darwin-x86_64; do')
+    expect(workflow).toContain('artifacts/${target}')
+    expect(workflow).toContain('dsh-desktop-${target}-updater.*')
   })
 })
