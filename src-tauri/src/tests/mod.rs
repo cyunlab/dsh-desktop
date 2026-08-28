@@ -1,10 +1,11 @@
 use super::{
     build_startup_diagnostics, bundled_node_relative_path, decide_navigation,
     exit_requires_failure, inspect_http_client_response, is_current_host_page_event,
-    is_finished_page_load, is_packaged_startup_url, navigation_event_matches,
-    parse_loopback_address, probe_client_page_with_timeout, retry_allowed, DiagnosticCode,
-    ExitReason, HttpResponseState, LifecycleSnapshot, LifecycleState, NavigationDecision,
-    PageLoadEvent, ProcessObservation, RuntimeState, HTTP_BODY_CAP,
+    is_finished_page_load, is_packaged_startup_url, is_packaged_update_url,
+    navigation_event_matches, parse_loopback_address, probe_client_page_with_timeout,
+    retry_allowed, DiagnosticCode, ExitReason, HttpResponseState, LifecycleSnapshot,
+    LifecycleState, NavigationDecision, PageLoadEvent, ProcessObservation, RuntimeState,
+    HTTP_BODY_CAP,
 };
 use std::io::Write;
 use std::net::TcpListener;
@@ -366,4 +367,21 @@ impl LifecycleState {
 /// 兼容已有纯值测试，把输入视为已经 EOF 的完整响应。
 fn is_html_client_response(response: &[u8]) -> bool {
     inspect_http_client_response(response, true) == HttpResponseState::Ready
+}
+
+/// 只有精确的打包 update.html 可以提交重启确认。
+#[test]
+fn update_confirmation_requires_packaged_update_page() {
+    assert!(is_packaged_update_url(
+        &tauri::Url::parse("tauri://localhost/update.html").unwrap()
+    ));
+    assert!(is_packaged_update_url(
+        &tauri::Url::parse("http://tauri.localhost/update.html").unwrap()
+    ));
+    assert!(!is_packaged_update_url(
+        &tauri::Url::parse("http://127.0.0.1:3080/update.html").unwrap()
+    ));
+    assert!(!is_packaged_update_url(
+        &tauri::Url::parse("tauri://localhost/update.html?url=https://evil.example").unwrap()
+    ));
 }
