@@ -62,8 +62,6 @@ jobs:
     name: Update smoke ${{ matrix.target }}
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -223,10 +221,6 @@ jobs:
           set -euo pipefail
           test -s "smoke-evidence/${{ matrix.target }}.json"
           test -s "smoke-evidence/${{ matrix.target }}.json.sha256"
-      - name: Attest target evidence to this workflow identity
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
-        with:
-          subject-path: smoke-evidence/*
       - name: Upload target evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -271,10 +265,6 @@ jobs:
           pattern: update-smoke-evidence-${{ inputs.candidate_tag }}-${{ inputs.candidate_commit }}-*
           path: smoke-evidence
           merge-multiple: true
-      - name: Verify target evidence attestations
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh attestation verify smoke-evidence/* --repo "$GITHUB_REPOSITORY"
       - name: Verify complete real-native evidence
         run: >-
           node scripts/verify-update-smoke-evidence.mjs

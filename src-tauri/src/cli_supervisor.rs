@@ -63,6 +63,7 @@ const DESKTOP_UPDATE_PATCH: &str = "@cyunlab/dsh-desktop-update-client/cordis.pa
 const DESKTOP_UPDATE_CLIENT_ENTRY: &str = "@cyunlab/dsh-desktop-update-client/lib/index.js";
 const DESKTOP_UPDATE_CLIENT_SPECIFIER: &str = "@cyunlab/dsh-desktop-update-client";
 const MATERIALIZED_PATCH_DIRECTORY: &str = ".dsh-desktop/runtime";
+const EXPECTED_DESKTOP_UPDATE_PATCH: &str = "- insert:\n    - id: dsh-desktop-update-client\n      name: '@cyunlab/dsh-desktop-update-client'\n";
 const PINNED_DSH_VERSION: &str = "0.1.0-rc.6";
 #[cfg(windows)]
 const CREATE_NEW_CONSOLE_FLAG: u32 = 0x0000_0010;
@@ -672,23 +673,19 @@ fn materialize_desktop_update_patch(
     )?;
     let source = fs::read_to_string(source_patch)
         .map_err(|error| format!("Desktop update patch cannot be read: {error}"))?;
-    let single_quoted = format!("'{DESKTOP_UPDATE_CLIENT_SPECIFIER}'");
-    let double_quoted = format!("\"{DESKTOP_UPDATE_CLIENT_SPECIFIER}\"");
-    let occurrences =
-        source.matches(&single_quoted).count() + source.matches(&double_quoted).count();
-    if occurrences != 1 {
-        return Err(format!(
-            "Desktop update patch must contain exactly one {DESKTOP_UPDATE_CLIENT_SPECIFIER} specifier"
-        ));
+    if source != EXPECTED_DESKTOP_UPDATE_PATCH {
+        return Err(
+            "Desktop update patch must match the trusted package-owned composition contract".into(),
+        );
     }
     let client_url = tauri::Url::from_file_path(&client_entry)
         .map_err(|_| "Desktop update client entry cannot be represented as a file URL".to_string())?
         .to_string();
-    let materialized = if source.contains(&single_quoted) {
-        source.replacen(&single_quoted, &format!("'{client_url}'"), 1)
-    } else {
-        source.replacen(&double_quoted, &format!("\"{client_url}\""), 1)
-    };
+    let materialized = source.replacen(
+        &format!("'{DESKTOP_UPDATE_CLIENT_SPECIFIER}'"),
+        &format!("'{client_url}'"),
+        1,
+    );
     let directory = resolve_materialized_patch_directory(harness_home)?;
     let output = directory.join("cordis.patch.yml");
     if output.exists() {
