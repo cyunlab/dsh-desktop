@@ -402,6 +402,37 @@ fn download_retry_reuses_the_trusted_release_context() {
     );
 }
 
+/// 用户 retry 只重放 Rust 记录的失败操作，并使尚未触发的自动计时器失效。
+#[test]
+fn user_retry_replays_current_failure_without_caller_parameters() {
+    let mut controller = controller(None);
+    controller
+        .handle(UpdateInput::CheckSucceeded {
+            release: Some(release("2.1.0")),
+        })
+        .unwrap();
+    controller.handle(UpdateInput::DownloadStarted).unwrap();
+    controller
+        .handle(UpdateInput::DownloadFailed {
+            message: "connection reset".to_owned(),
+            retryable: true,
+        })
+        .unwrap();
+
+    let output = controller.handle(UpdateInput::UserRetry).unwrap();
+    assert_eq!(
+        output.effects,
+        vec![UpdateEffect::StartDownload {
+            release: release("2.1.0"),
+        }]
+    );
+    assert!(controller
+        .handle(UpdateInput::RetryDue)
+        .unwrap()
+        .effects
+        .is_empty());
+}
+
 /// 检查失败作为可观察状态返回，不会成为阻塞启动的领域错误。
 #[test]
 fn failed_check_is_a_non_blocking_snapshot() {

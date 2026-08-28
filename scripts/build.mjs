@@ -19,6 +19,7 @@ await Promise.all([
   cp('src/startup/index.html', 'dist/startup/index.html'),
   cp('src/startup/index.css', 'dist/startup/index.css'),
   cp('src/update/index.html', 'dist/startup/update.html'),
+  cp('src/update/index.css', 'dist/startup/update.css'),
   cp(desktopLogoSource, `dist/startup/assets/${desktopLogoFileName}`),
   cp(desktopLogoSource, `dist/assets/${desktopLogoFileName}`),
   sharp(desktopLogoSource).resize(1024, 1024).png().toFile(desktopLogoRuntimePath)

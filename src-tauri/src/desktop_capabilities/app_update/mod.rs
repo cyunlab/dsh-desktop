@@ -145,6 +145,7 @@ pub enum UpdateInput {
     DownloadAdvanced(DownloadProgress),
     DownloadSucceeded,
     DownloadFailed { message: String, retryable: bool },
+    UserRetry,
     RetryDue,
 }
 
@@ -276,6 +277,7 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
             UpdateInput::DownloadFailed { message, retryable } => {
                 self.accept_failure(UpdateOperation::Download, message, retryable, &mut effects);
             }
+            UpdateInput::UserRetry => self.user_retry(&mut effects),
             UpdateInput::RetryDue => self.retry(&mut effects),
         }
         self.snapshot.sequence += 1;
@@ -453,6 +455,28 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
                 self.snapshot.state = UpdateState::Checking;
                 effects.push(UpdateEffect::CheckStable);
             }
+            UpdateOperation::Download => {
+                if let Some(release) = self.current_release.clone() {
+                    self.operation_active = true;
+                    effects.push(UpdateEffect::StartDownload { release });
+                }
+            }
+        }
+    }
+
+    /// 按当前 Rust 失败状态重放用户请求，且不让旧自动计时器重复启动操作。
+    fn user_retry(&mut self, effects: &mut Vec<UpdateEffect>) {
+        let operation = match &self.snapshot.state {
+            UpdateState::Failed {
+                operation,
+                retryable: true,
+                ..
+            } => *operation,
+            _ => return,
+        };
+        self.pending_retry = None;
+        match operation {
+            UpdateOperation::Check => self.start_check(false, effects),
             UpdateOperation::Download => {
                 if let Some(release) = self.current_release.clone() {
                     self.operation_active = true;
