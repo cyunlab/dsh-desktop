@@ -1,0 +1,66 @@
+name: Promote Stable release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  promote-stable:
+    name: Promote published release to OSS Stable
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.release.tag_name }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Download the four signed updater packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          for target in windows-x86_64 linux-x86_64 darwin-aarch64 darwin-x86_64; do
+            mkdir -p "artifacts/${target}"
+            gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir "artifacts/${target}" \
+              --pattern "dsh-desktop-${target}-updater.*"
+          done
+      - name: Exchange GitHub OIDC identity for short-lived RAM credentials
+        id: aliyun-credentials
+        uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d93a8781ac344a68e19a43341e79e6 # v1.1.0
+        with:
+          oidc-provider-arn: ${{ vars.ALIBABA_CLOUD_OIDC_PROVIDER_ARN }}
+          role-to-assume: ${{ vars.ALIBABA_CLOUD_ROLE_ARN }}
+          role-session-name: dsh-desktop-${{ github.run_id }}
+          role-session-expiration: 1800
+          audience: sts.aliyuncs.com
+      - name: Validate and atomically promote the published release
+        env:
+          ALIBABA_CLOUD_ACCESS_KEY_ID: ${{ steps.aliyun-credentials.outputs.aliyun-access-key-id }}
+          ALIBABA_CLOUD_ACCESS_KEY_SECRET: ${{ steps.aliyun-credentials.outputs.aliyun-access-key-secret }}
+          ALIBABA_CLOUD_SECURITY_TOKEN: ${{ steps.aliyun-credentials.outputs.aliyun-security-token }}
+          OSS_BUCKET: ${{ vars.OSS_BUCKET }}
+          OSS_REGION: ${{ vars.OSS_REGION }}
+          UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_NOTES: ${{ github.event.release.body }}
+          PUBLISHED_AT: ${{ github.event.release.published_at }}
+          RELEASE_UPLOAD_URL: ${{ github.event.release.upload_url }}
+        run: >-
+          node scripts/promote-stable-release.mjs
+          --tag "$RELEASE_TAG"
+          --notes "$RELEASE_NOTES"
+          --published-at "$PUBLISHED_AT"
+          --assets artifacts
+          --prefix dsh-desktop
