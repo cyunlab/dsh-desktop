@@ -46,13 +46,16 @@ describe('automatic update release operations guide', () => {
     expect(guide).toContain('must exactly match the public key embedded in Desktop')
   })
 
-  // 验证版本化发布对象不可覆盖，重跑只能复用逐字节相同的对象。
-  it('requires release-prefix overwrite prevention and byte-identical retries', () => {
+  // 验证不可变发布对象使用内容寻址键，并避免与 Versioning 互斥的防覆盖设置。
+  it('uses content-addressed release keys with Versioning-compatible retries', () => {
     const guide = readFileSync(operationsGuideUrl, 'utf8')
 
-    expect(guide).toContain('prevent-overwrite rule for `dsh-desktop/releases/`')
-    expect(guide).toContain('The Stable manifest is the only overwrite exception')
+    expect(guide).toContain('<sha256-prefix>-<artifact-basename>')
+    expect(guide).toContain('Different bytes therefore always produce a different OSS key')
     expect(guide).toContain('byte-for-byte identical')
+    expect(guide).toContain('Do not configure an OSS prevent-overwrite rule or `x-oss-forbid-overwrite`')
+    expect(guide).not.toContain('Enable a prevent-overwrite rule for `dsh-desktop/releases/`')
+    expect(guide).not.toContain('conditional writes that refuse overwrite')
   })
 
   // 验证构建任务只能读取签名密钥，而云身份仅授予 promotion 任务。
