@@ -7,3 +7,5 @@ allowBuilds:
   koffi: true
   node-pty: true
   protobufjs: true
+packages:
+  - 'packages/*'

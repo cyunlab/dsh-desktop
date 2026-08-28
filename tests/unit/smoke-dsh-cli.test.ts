@@ -1,10 +1,20 @@
 import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { formatWindowsControllerExitError, ownProcessTree, processTreeHasExited, readPositiveMilliseconds, stopCliProcess, terminateProcessTree, waitForListenerClosed, windowsJobControllerArguments } from '../../scripts/smoke-dsh-cli.mjs'
+import { directDshWebArgs, formatWindowsControllerExitError, ownProcessTree, processTreeHasExited, readPositiveMilliseconds, stopCliProcess, terminateProcessTree, waitForListenerClosed, windowsJobControllerArguments } from '../../scripts/smoke-dsh-cli.mjs'
 
 describe('published dsh CLI smoke cleanup', () => {
+  /** Desktop patch 必须作为 web launcher 参数放在 Host 应用参数之前。 */
+  it('mounts the packaged Desktop patch through dsh web --patch', () => {
+    expect(directDshWebArgs('/desktop/dist/node_modules')).toEqual([
+      'web',
+      '--patch',
+      path.join('/desktop/dist/node_modules', '@cyunlab', 'dsh-desktop-update-client', 'cordis.patch.yml'),
+      '--host', '127.0.0.1', '--port', '3080'
+    ])
+  })
   it('accepts a configurable Windows controller startup deadline', () => {
     expect(readPositiveMilliseconds(undefined, 60_000, 'TEST_TIMEOUT')).toBe(60_000)
     expect(readPositiveMilliseconds('90000', 60_000, 'TEST_TIMEOUT')).toBe(90_000)
