@@ -81,6 +81,13 @@ describe('native build workflow contract', () => {
     ]) expect(workflow).toContain(`bundle/${updaterPath}`)
   })
 
+  /** 确保四目标正式二进制编译进受信 Stable endpoint 与同一 updater 公钥。 */
+  it('embeds the production Stable endpoint and promotion public key in every native build', () => {
+    expect(workflow.match(/DSH_UPDATER_ENDPOINT: https:\/\/updates\.cyunlab\.com\/dsh-desktop\/channels\/stable\/latest\.json/g)).toHaveLength(2)
+    expect(workflow.match(/DSH_UPDATER_PUBLIC_KEY: \$\{\{ vars\.TAURI_SIGNING_PUBLIC_KEY \}\}/g)).toHaveLength(2)
+    expect(workflow).not.toMatch(/DSH_UPDATER_ENDPOINT:\s*\$\{\{\s*inputs\./)
+  })
+
   it('builds the Intel app and creates its DMG without Finder automation', () => {
     expect(workflow).toContain('Build Intel macOS package without Finder DMG automation')
     expect(workflow).toContain('pnpm tauri:build --bundles app --verbose')

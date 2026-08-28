@@ -18,6 +18,23 @@ export interface PromotionOptions {
   readonly prefix: string
 }
 
+export interface CandidatePreparationOptions extends PromotionOptions {
+  readonly candidateCommit: string
+}
+
+export interface StableCandidate {
+  readonly schema_version: 1
+  readonly candidate_tag: string
+  readonly candidate_commit: string
+  readonly previous_stable_tag: string
+  readonly previous_stable_version: string
+  readonly previous_stable_url: string
+  readonly previous_stable_manifest_sha256: string
+  readonly manifest_url: string
+  readonly manifest_sha256: string
+  readonly manifest: StableManifest
+}
+
 export interface StableManifest {
   readonly version: string
   readonly notes: string
@@ -56,7 +73,35 @@ export function verifyTauriSignature(
   runMinisign?: MinisignRunner
 ): Promise<void>
 
-/** 解析 CLI/environment 并执行 Stable promotion。 */
+/** 上传并验证不可变 candidate，但不修改 Stable。 */
+export function prepareStableCandidate(
+  options: CandidatePreparationOptions,
+  storage: PromotionStorage,
+  dependencies: { readonly verifySignature: (artifactPath: string, signaturePath: string) => Promise<void> }
+): Promise<StableCandidate>
+
+/** 复核 candidate 与上一 Stable 未漂移后，执行唯一的 Stable 写入。 */
+export function finalizeStableCandidate(
+  candidate: StableCandidate,
+  storage: PromotionStorage,
+  options?: { readonly prefix?: string }
+): Promise<StableManifest>
+
+/** 解析 candidate preparation CLI。 */
+export function runCandidatePreparationCli(
+  environment?: NodeJS.ProcessEnv,
+  dependencies?: Record<string, unknown>,
+  args?: string[]
+): Promise<StableCandidate>
+
+/** 解析 final promotion CLI。 */
+export function runCandidateFinalizationCli(
+  environment?: NodeJS.ProcessEnv,
+  dependencies?: Record<string, unknown>,
+  args?: string[]
+): Promise<StableManifest>
+
+/** @deprecated 仅保留旧单元边界；生产 CLI 拒绝不带显式 candidate mode 的调用。 */
 export function runPromotionCli(
   environment?: NodeJS.ProcessEnv,
   dependencies?: {
@@ -68,7 +113,7 @@ export function runPromotionCli(
   args?: string[]
 ): Promise<StableManifest>
 
-/** 提升一个完整的四目标更新发布。 */
+/** @deprecated 仅保留旧单元边界；生产 workflow 不得直接调用。 */
 export function promoteStableRelease(
   options: PromotionOptions,
   storage: PromotionStorage,

@@ -4,6 +4,8 @@ import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   createOssutilStorage,
+  finalizeStableCandidate,
+  prepareStableCandidate,
   promoteStableRelease,
   runPromotionCli,
   verifyTauriSignature,
@@ -15,15 +17,15 @@ import {
 async function createReleaseDirectory(): Promise<string> {
   const directory = await mkdtemp(path.join(tmpdir(), 'dsh-promotion-'))
   const artifacts = [
-    ['windows-x86_64', 'desktop.nsis.zip'],
-    ['linux-x86_64', 'desktop.AppImage.tar.gz'],
-    ['darwin-aarch64', 'desktop-aarch64.app.tar.gz'],
-    ['darwin-x86_64', 'desktop-x86_64.app.tar.gz']
+    ['windows-x86_64', 'dsh-desktop-windows-x86_64-updater.exe', Buffer.from([0x4d, 0x5a, 0x00, 0x01])],
+    ['linux-x86_64', 'dsh-desktop-linux-x86_64-updater.AppImage', Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0, 0, 0, 0, 0x41, 0x49, 0x02])],
+    ['darwin-aarch64', 'dsh-desktop-darwin-aarch64-updater.app.tar.gz', Buffer.from([0x1f, 0x8b, 0x08, 0x00])],
+    ['darwin-x86_64', 'dsh-desktop-darwin-x86_64-updater.app.tar.gz', Buffer.from([0x1f, 0x8b, 0x08, 0x00])]
   ] as const
-  for (const [target, filename] of artifacts) {
+  for (const [target, filename, body] of artifacts) {
     const targetDirectory = path.join(directory, target)
     await mkdir(targetDirectory, { recursive: true })
-    await writeFile(path.join(targetDirectory, filename), `${target}-package`)
+    await writeFile(path.join(targetDirectory, filename), body)
     await writeFile(path.join(targetDirectory, `${filename}.sig`), `literal-${target}-signature\n`)
   }
   return directory
@@ -63,12 +65,196 @@ function createStorage(): PromotionStorage & {
   }
 }
 
+/** 在 fake storage 中写入一个可供 candidate smoke 使用的上一 Stable pointer。 */
+function seedPreviousStable(storage: ReturnType<typeof createStorage>) {
+  storage.writes.push({
+    key: 'dsh-desktop/channels/stable/latest.json',
+    cacheControl: 'no-cache',
+    body: Buffer.from(JSON.stringify({ version: '2.0.15', platforms: {} }))
+  })
+}
+
 /** 使用通过的密码学验证 seam 执行测试 promotion。 */
 function promoteFixture(options: Parameters<typeof promoteStableRelease>[0], storage: PromotionStorage) {
   return promoteStableRelease(options, storage, { verifySignature: async () => {} })
 }
 
 describe('Stable update promotion', () => {
+  /** 验证 candidate 阶段只写不可变对象和隔离 manifest，绝不提前修改 Stable。 */
+  it('prepares an immutable candidate without changing Stable', async () => {
+    const directory = await createReleaseDirectory()
+    const storage = createStorage()
+    seedPreviousStable(storage)
+    try {
+      const candidate = await prepareStableCandidate({
+        tag: 'v2.1.0',
+        releaseBody: 'Candidate release notes.',
+        publishedAt: '2026-08-28T02:30:00Z',
+        candidateCommit: '0123456789abcdef0123456789abcdef01234567',
+        artifactsDirectory: directory,
+        downloadOrigin: 'https://updates.cyunlab.com',
+        prefix: 'dsh-desktop'
+      }, storage, { verifySignature: async () => {} })
+
+      expect(candidate).toMatchObject({
+        schema_version: 1,
+        candidate_tag: 'v2.1.0',
+        candidate_commit: '0123456789abcdef0123456789abcdef01234567',
+        manifest_url: expect.stringMatching(/^https:\/\/updates\.cyunlab\.com\/dsh-desktop\/candidates\/2\.1\.0\//),
+        manifest_sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+        previous_stable_tag: 'v2.0.15',
+        previous_stable_version: '2.0.15',
+        previous_stable_url: 'https://updates.cyunlab.com/dsh-desktop/channels/stable/latest.json',
+        previous_stable_manifest_sha256: expect.stringMatching(/^[0-9a-f]{64}$/)
+      })
+      expect(Object.keys(candidate.manifest.platforms)).toEqual([
+        'windows-x86_64',
+        'linux-x86_64',
+        'darwin-aarch64',
+        'darwin-x86_64'
+      ])
+      expect(storage.events.some(event => event.startsWith('replace:'))).toBe(false)
+      expect(storage.writes).toHaveLength(10)
+      expect(storage.writes.slice(1).every(write => write.cacheControl === 'public, max-age=31536000, immutable')).toBe(true)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  /** 验证 final promotion 复核远端 candidate 后才把同一份 manifest 写入 Stable。 */
+  it('writes Stable only from the byte-identical verified candidate manifest', async () => {
+    const directory = await createReleaseDirectory()
+    const storage = createStorage()
+    seedPreviousStable(storage)
+    try {
+      const candidate = await prepareStableCandidate({
+        tag: 'v2.1.0',
+        releaseBody: 'Candidate release notes.',
+        publishedAt: '2026-08-28T02:30:00Z',
+        candidateCommit: '0123456789abcdef0123456789abcdef01234567',
+        artifactsDirectory: directory,
+        downloadOrigin: 'https://updates.cyunlab.com',
+        prefix: 'dsh-desktop'
+      }, storage, { verifySignature: async () => {} })
+      storage.events.length = 0
+
+      const manifest = await finalizeStableCandidate(candidate, storage, { prefix: 'dsh-desktop' })
+
+      expect(manifest).toEqual(candidate.manifest)
+      expect(storage.events).toEqual([
+        'read:dsh-desktop/channels/stable/latest.json',
+        expect.stringMatching(/^read:dsh-desktop\/candidates\/2\.1\.0\//),
+        'replace:dsh-desktop/channels/stable/latest.json'
+      ])
+      expect(storage.writes.at(-1)).toMatchObject({
+        key: 'dsh-desktop/channels/stable/latest.json',
+        cacheControl: 'no-cache'
+      })
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  /** 验证 candidate manifest 被篡改时 final promotion 保留旧 Stable。 */
+  it('leaves Stable untouched when the remote candidate manifest no longer matches its digest', async () => {
+    const directory = await createReleaseDirectory()
+    const storage = createStorage()
+    seedPreviousStable(storage)
+    try {
+      const candidate = await prepareStableCandidate({
+        tag: 'v2.1.0',
+        releaseBody: 'Candidate release notes.',
+        publishedAt: '2026-08-28T02:30:00Z',
+        candidateCommit: '0123456789abcdef0123456789abcdef01234567',
+        artifactsDirectory: directory,
+        downloadOrigin: 'https://updates.cyunlab.com',
+        prefix: 'dsh-desktop'
+      }, storage, { verifySignature: async () => {} })
+      storage.events.length = 0
+      storage.readObject = async key => {
+        storage.events.push(`read:${key}`)
+        if (key === 'dsh-desktop/channels/stable/latest.json') {
+          return storage.writes.find(write => write.key === key)!.body
+        }
+        return Buffer.from('{"tampered":true}\n')
+      }
+
+      await expect(finalizeStableCandidate(candidate, storage, { prefix: 'dsh-desktop' }))
+        .rejects.toThrow('candidate manifest digest mismatch')
+      expect(storage.events.some(event => event.startsWith('replace:'))).toBe(false)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  /** 验证 smoke 期间 Stable pointer 发生漂移时拒绝覆盖新状态。 */
+  it('leaves Stable untouched when the authoritative previous Stable changed during smoke', async () => {
+    const directory = await createReleaseDirectory()
+    const storage = createStorage()
+    seedPreviousStable(storage)
+    try {
+      const candidate = await prepareStableCandidate({
+        tag: 'v2.1.0',
+        releaseBody: 'Candidate release notes.',
+        publishedAt: '2026-08-28T02:30:00Z',
+        candidateCommit: '0123456789abcdef0123456789abcdef01234567',
+        artifactsDirectory: directory,
+        downloadOrigin: 'https://updates.cyunlab.com',
+        prefix: 'dsh-desktop'
+      }, storage, { verifySignature: async () => {} })
+      storage.events.length = 0
+      storage.writes[0].body = Buffer.from(JSON.stringify({ version: '2.0.16', platforms: {} }))
+
+      await expect(finalizeStableCandidate(candidate, storage, { prefix: 'dsh-desktop' }))
+        .rejects.toThrow('previous Stable manifest changed after candidate preparation')
+      expect(storage.events.some(event => event.startsWith('replace:'))).toBe(false)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  /** 验证没有真实 previous Stable 时不能准备 candidate 或进入 bootstrap bypass。 */
+  it('fails closed when no previous Stable updater release exists', async () => {
+    const directory = await createReleaseDirectory()
+    const storage = createStorage()
+    try {
+      await expect(prepareStableCandidate({
+        tag: 'v2.1.0',
+        releaseBody: 'Candidate release notes.',
+        publishedAt: '2026-08-28T02:30:00Z',
+        candidateCommit: '0123456789abcdef0123456789abcdef01234567',
+        artifactsDirectory: directory,
+        downloadOrigin: 'https://updates.cyunlab.com',
+        prefix: 'dsh-desktop'
+      }, storage, { verifySignature: async () => {} })).rejects.toThrow('previous Stable manifest is required')
+      expect(storage.events.some(event => event.startsWith('ensure:'))).toBe(false)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  /** 验证伪装扩展名但没有目标平台 magic 的包在 OSS 写入前被拒绝。 */
+  it('rejects an updater artifact whose executable format does not match its target', async () => {
+    const directory = await createReleaseDirectory()
+    const storage = createStorage()
+    seedPreviousStable(storage)
+    await writeFile(path.join(directory, 'windows-x86_64', 'dsh-desktop-windows-x86_64-updater.exe'), 'not-a-pe-file')
+    try {
+      await expect(prepareStableCandidate({
+        tag: 'v2.1.0',
+        releaseBody: 'Candidate release notes.',
+        publishedAt: '2026-08-28T02:30:00Z',
+        candidateCommit: '0123456789abcdef0123456789abcdef01234567',
+        artifactsDirectory: directory,
+        downloadOrigin: 'https://updates.cyunlab.com',
+        prefix: 'dsh-desktop'
+      }, storage, { verifySignature: async () => {} })).rejects.toThrow('invalid Windows updater executable')
+      expect(storage.events.some(event => event.startsWith('ensure:'))).toBe(false)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   /** 验证四目标发布内容、metadata 与最终 manifest 顺序。 */
   it('publishes the four updater targets using the GitHub Release body and literal signatures', async () => {
     const directory = await createReleaseDirectory()
@@ -89,26 +275,26 @@ describe('Stable update promotion', () => {
         pub_date: '2026-08-28T02:30:00Z',
         platforms: {
           'windows-x86_64': {
-            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/windows-x86_64/0076b8231ad26d88f1d9f50c85e31f34d1669c6ccf4ca4b1570cb7f9cb794c30-desktop.nsis.zip',
+            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/windows-x86_64/b2a78f2057a9e54b7ca5c10ed45b35c26f0e0e9515e842092c6cb9976f117133-dsh-desktop-windows-x86_64-updater.exe',
             signature: 'literal-windows-x86_64-signature\n'
           },
           'linux-x86_64': {
-            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/linux-x86_64/b673dbc691888ed591d1e8d7b9ca2071b6d94a03129debd13d0c24c73f8e76ae-desktop.AppImage.tar.gz',
+            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/linux-x86_64/be9f459beb8b4cc94d69639157449701c5e65491c7962806be9f991971991e19-dsh-desktop-linux-x86_64-updater.AppImage',
             signature: 'literal-linux-x86_64-signature\n'
           },
           'darwin-aarch64': {
-            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/darwin-aarch64/eb6dff2c53b529b402a85d26fb9c264e1102bbd41d32ed203c4c314a4acb4f83-desktop-aarch64.app.tar.gz',
+            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/darwin-aarch64/fd72d30440b0bae1b1c6db6c8ad807f238ef3ca613aa7e8d5329e1e8ddf7da72-dsh-desktop-darwin-aarch64-updater.app.tar.gz',
             signature: 'literal-darwin-aarch64-signature\n'
           },
           'darwin-x86_64': {
-            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/darwin-x86_64/c838dd59aa087703d0fa3223e8fed37c49546d15caca947411264d6f0b154327-desktop-x86_64.app.tar.gz',
+            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/darwin-x86_64/fd72d30440b0bae1b1c6db6c8ad807f238ef3ca613aa7e8d5329e1e8ddf7da72-dsh-desktop-darwin-x86_64-updater.app.tar.gz',
             signature: 'literal-darwin-x86_64-signature\n'
           }
         }
       })
       expect(storage.writes).toHaveLength(9)
       expect(storage.writes.slice(0, 8).every(write => write.cacheControl === 'public, max-age=31536000, immutable')).toBe(true)
-      expect(storage.writes[1].key).toBe('dsh-desktop/releases/2.1.0/windows-x86_64/6db7805715b93f0d6e447c59cb476199f37623ed8c49664de1c9045ba338316a-desktop.nsis.zip.sig')
+      expect(storage.writes[1].key).toBe('dsh-desktop/releases/2.1.0/windows-x86_64/6db7805715b93f0d6e447c59cb476199f37623ed8c49664de1c9045ba338316a-dsh-desktop-windows-x86_64-updater.exe.sig')
       expect(storage.writes.at(-1)).toMatchObject({
         key: 'dsh-desktop/channels/stable/latest.json',
         cacheControl: 'no-cache'
@@ -134,8 +320,8 @@ describe('Stable update promotion', () => {
         downloadOrigin: 'https://updates.cyunlab.com',
         prefix: 'dsh-desktop'
       }, storage)
-      await writeFile(path.join(directory, 'windows-x86_64', 'desktop.nsis.zip'), 'changed-package')
-      await writeFile(path.join(directory, 'windows-x86_64', 'desktop.nsis.zip.sig'), 'changed-signature\n')
+      await writeFile(path.join(directory, 'windows-x86_64', 'dsh-desktop-windows-x86_64-updater.exe'), Buffer.from([0x4d, 0x5a, 0x02, 0x03]))
+      await writeFile(path.join(directory, 'windows-x86_64', 'dsh-desktop-windows-x86_64-updater.exe.sig'), 'changed-signature\n')
       const second = await promoteFixture({
         tag: 'v2.1.0',
         releaseBody: 'Corrected publication',
@@ -209,7 +395,7 @@ describe('Stable update promotion', () => {
   /** 验证任一目标缺签名时 fail closed。 */
   it('fails closed when any target signature is missing', async () => {
     const directory = await createReleaseDirectory()
-    await rm(path.join(directory, 'windows-x86_64', 'desktop.nsis.zip.sig'))
+    await rm(path.join(directory, 'windows-x86_64', 'dsh-desktop-windows-x86_64-updater.exe.sig'))
     try {
       await expect(promoteFixture({
         tag: 'v2.1.0',
