@@ -18,11 +18,17 @@ export interface UpdateSnapshot {
 }
 
 export interface UpdateModalApi {
+  /** 读取当前安装版本。 */
   getCurrentVersion(): Promise<string>
+  /** 读取 Rust 当前完整更新快照。 */
   getSnapshot(): Promise<UpdateSnapshot>
+  /** 订阅 Rust 后续完整更新快照。 */
   onSnapshot(listener: (snapshot: UpdateSnapshot) => void): () => void
+  /** 请求 Rust 根据当前失败状态重试。 */
   retry(): Promise<void>
+  /** 请求 Rust 安装已暂存更新并重启。 */
   restart(): Promise<void>
+  /** 关闭更新界面并保留当前状态。 */
   later(): Promise<void>
 }
 
@@ -32,11 +38,14 @@ export interface UpdateElement {
   disabled?: boolean
   value?: number
   max?: number
+  /** 移除一个 DOM 属性。 */
   removeAttribute(name: string): void
+  /** 注册按钮点击处理函数。 */
   addEventListener(type: 'click', listener: () => void): void
 }
 
 export interface UpdateDocument {
+  /** 查找打包模板中的更新界面元素。 */
   querySelector(selector: string): UpdateElement | null
 }
 
@@ -55,7 +64,7 @@ export function connectUpdatePage(api: UpdateModalApi, document: UpdateDocument)
   let renderedSequence = -1
   /** 按单调序号渲染 Rust 完整快照，避免较旧初始请求覆盖事件。 */
   const render = (snapshot: UpdateSnapshot): void => {
-    if (snapshot.sequence < renderedSequence) return
+    if (snapshot.sequence <= renderedSequence) return
     renderedSequence = snapshot.sequence
     const state = snapshot.state
     progress.hidden = state.kind !== 'downloading'

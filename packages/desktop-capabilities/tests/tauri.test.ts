@@ -2,6 +2,11 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { createTauriAppUpdateCapabilityWithTransport } from '../src/tauri-adapter.js'
 
+/** 等待 Adapter 的异步监听连接完成一个事件循环。 */
+function settleAdapter(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0))
+}
+
 describe('Tauri AppUpdateCapability', () => {
   it('subscribes before reading the initial snapshot and keeps a newer racing event', async () => {
     let publishNative: (snapshot: unknown) => void = () => {
@@ -103,6 +108,34 @@ describe('Tauri AppUpdateCapability', () => {
         totalBytes: 100,
       }],
     ])
+  })
+
+  it('releases the native listener after the final observer and reconnects safely', async () => {
+    const unlisteners: Array<ReturnType<typeof vi.fn>> = []
+    let sequence = 0
+    const capability = await createTauriAppUpdateCapabilityWithTransport({
+      listenSnapshot: async () => {
+        const unlisten = vi.fn()
+        unlisteners.push(unlisten)
+        return unlisten
+      },
+      readSnapshot: async () => ({ sequence: sequence++, state: { kind: 'idle' } }),
+      openSurface: async () => undefined,
+    })
+
+    expect(unlisteners).toHaveLength(1)
+    expect(unlisteners[0]).toHaveBeenCalledOnce()
+    const disposeFirst = capability.observe(vi.fn())
+    await settleAdapter()
+    expect(unlisteners).toHaveLength(2)
+    disposeFirst()
+    expect(unlisteners[1]).toHaveBeenCalledOnce()
+
+    const disposeSecond = capability.observe(vi.fn())
+    await settleAdapter()
+    expect(unlisteners).toHaveLength(3)
+    disposeSecond()
+    expect(unlisteners[2]).toHaveBeenCalledOnce()
   })
 
   it('normalizes native open failures without exposing their details', async () => {

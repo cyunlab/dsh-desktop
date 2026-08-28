@@ -45,6 +45,7 @@ function modalDocument() {
 function connect(initialState: UpdateState) {
   const view = modalDocument()
   let listener: ((snapshot: UpdateSnapshot) => void) | undefined
+  let sequence = 1
   const actions = { retry: 0, restart: 0, later: 0 }
   const api = {
     getCurrentVersion: async () => '2.0.15',
@@ -58,7 +59,12 @@ function connect(initialState: UpdateState) {
   return {
     ...view,
     actions,
-    emit(state: typeof initialState) { listener?.({ sequence: 2, automatic_download: true, state }) }
+    /** 以严格递增序号发布一份测试快照。 */
+    emit(state: typeof initialState) { listener?.({ sequence: ++sequence, automatic_download: true, state }) },
+    /** 以指定序号发布一份测试快照，用于验证竞态过滤。 */
+    emitAt(nextSequence: number, state: typeof initialState) {
+      listener?.({ sequence: nextSequence, automatic_download: true, state })
+    }
   }
 }
 
@@ -145,5 +151,16 @@ describe('packaged update modal', () => {
     expect(view.actions.later).toBe(1)
     view.elements.get('#update-restart')?.click()
     expect(view.actions.restart).toBe(1)
+  })
+
+  /** 重复或陈旧快照不能覆盖已经渲染的较新模态框状态。 */
+  it('ignores duplicate and stale snapshot sequences', () => {
+    const view = connect({ kind: 'available', version: '2.1.0', release_notes: 'Available' })
+    view.emit({ kind: 'staged', version: '2.1.0', release_notes: 'Ready' })
+    view.emitAt(2, { kind: 'failed', operation: 'download', retryable: true, message: 'duplicate' })
+    view.emitAt(1, { kind: 'failed', operation: 'check', retryable: true, message: 'stale' })
+
+    expect(view.elements.get('#update-state')?.textContent).toBe('Version 2.1.0 is ready')
+    expect(view.elements.get('#update-message')?.textContent).toBe('是否重启以更新应用')
   })
 })

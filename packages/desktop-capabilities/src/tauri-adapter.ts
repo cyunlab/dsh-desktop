@@ -29,6 +29,8 @@ class TauriAppUpdateCapability implements AppUpdateCapability {
   private readonly observers = new Set<AppUpdateObserver>()
   private sequence = -1
   private snapshot: AppUpdateSnapshot = { kind: 'none' }
+  private unlisten: (() => void) | undefined
+  private activation: Promise<void> | undefined
 
   /** 绑定只允许打开可信更新界面的传输。 */
   constructor(private readonly transport: AppUpdateTauriTransport) {}
@@ -46,7 +48,11 @@ class TauriAppUpdateCapability implements AppUpdateCapability {
   observe(observer: AppUpdateObserver): () => void {
     this.observers.add(observer)
     observer(this.snapshot)
-    return () => this.observers.delete(observer)
+    void this.activate().catch(ignoreBackgroundActivationFailure)
+    return () => {
+      this.observers.delete(observer)
+      if (this.observers.size === 0) this.deactivate()
+    }
   }
 
   /** 仅请求 Rust 打开 Desktop 自有更新界面。 */
@@ -60,7 +66,52 @@ class TauriAppUpdateCapability implements AppUpdateCapability {
       )
     }
   }
+
+  /** 在至少一个观察者存活时订阅事件，并用后取快照补齐重连空窗。 */
+  async activate(): Promise<void> {
+    if (this.unlisten || this.activation || this.observers.size === 0) return this.activation
+    this.activation = this.connect()
+    try {
+      await this.activation
+    } finally {
+      this.activation = undefined
+      if (this.observers.size === 0) this.deactivate()
+    }
+  }
+
+  /** 建立原生监听后读取完整快照，确保事件与初始读取之间没有竞态缺口。 */
+  private async connect(): Promise<void> {
+    const unlisten = await this.transport.listenSnapshot(snapshot => {
+      try {
+        this.acceptNative(snapshot)
+      } catch {
+        // 原生异常事件不能破坏最后一个已验证状态或事件分发循环。
+      }
+    })
+    this.unlisten = unlisten
+    try {
+      this.acceptNative(await this.transport.readSnapshot())
+    } catch (error) {
+      this.deactivate()
+      throw error
+    }
+  }
+
+  /** 释放当前原生事件监听，避免插件重载遗留闭包。 */
+  private deactivate(): void {
+    this.unlisten?.()
+    this.unlisten = undefined
+  }
+
+  /** 预取一个可信完整快照，但不在没有观察者时保留原生监听。 */
+  async initialize(): Promise<void> {
+    await this.connect()
+    this.deactivate()
+  }
 }
+
+/** 忽略重连失败并保留最后一个已验证快照，等待下次观察重试。 */
+function ignoreBackgroundActivationFailure(): void {}
 
 /** 断言动态输入是非空对象。 */
 function requireRecord(value: unknown): Record<string, unknown> {
@@ -146,31 +197,15 @@ export async function createTauriAppUpdateCapabilityWithTransport(
   transport: AppUpdateTauriTransport,
 ): Promise<AppUpdateCapability> {
   const capability = new TauriAppUpdateCapability(transport)
-  let unlisten: () => void
   try {
-    unlisten = await transport.listenSnapshot(snapshot => {
-      try {
-        capability.acceptNative(snapshot)
-      } catch {
-        // 原生异常事件不能破坏最后一个已验证状态或事件分发循环。
-      }
-    })
+    await capability.initialize()
   } catch {
     throw new AppUpdateCapabilityError(
       'native_failure',
       'Desktop update state is unavailable.',
     )
   }
-  try {
-    capability.acceptNative(await transport.readSnapshot())
-    return createAppUpdateCapabilityFacade(capability)
-  } catch {
-    unlisten()
-    throw new AppUpdateCapabilityError(
-      'native_failure',
-      'Desktop update state is unavailable.',
-    )
-  }
+  return createAppUpdateCapabilityFacade(capability)
 }
 
 /** 连接固定的 Tauri command 与事件，不接受调用方提供任何原生参数。 */
