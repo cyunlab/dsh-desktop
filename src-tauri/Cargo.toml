@@ -38,3 +38,6 @@ signal-hook = "0.3"
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 wdio = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver"]
+
+[dev-dependencies]
+tempfile = "3"
