@@ -781,6 +781,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-wdio",
  "tauri-plugin-wdio-webdriver",
+ "tempfile",
  "windows-sys 0.59.0",
 ]
 

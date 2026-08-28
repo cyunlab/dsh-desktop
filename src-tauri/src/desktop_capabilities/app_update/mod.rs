@@ -1,3 +1,5 @@
+pub mod staging;
+
 use semver::Version;
 use serde::Serialize;
 use std::fmt;
@@ -374,3 +376,5 @@ fn retry_delay(automatic_retry: u8) -> Duration {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod staging_tests;
