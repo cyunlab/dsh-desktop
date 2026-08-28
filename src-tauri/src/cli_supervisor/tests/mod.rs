@@ -135,9 +135,7 @@ fn constructs_exact_dsh_web_command() {
             OsStr::new("/desktop/runtime/@deepseek-ai/dsh/lib/bin.js"),
             OsStr::new("web"),
             OsStr::new("--patch"),
-            OsStr::new(
-                "/desktop/runtime/@cyunlab/dsh-desktop-update-client/cordis.patch.yml",
-            ),
+            OsStr::new("/desktop/runtime/@cyunlab/dsh-desktop-update-client/cordis.patch.yml",),
             OsStr::new("--host"),
             OsStr::new(HOST_ADDRESS),
             OsStr::new("--port"),
