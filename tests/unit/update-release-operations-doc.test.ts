@@ -36,6 +36,16 @@ describe('automatic update release operations guide', () => {
     }
   })
 
+  // 验证构建任务只能读取签名密钥，而云身份仅授予 promotion 任务。
+  it('separates build signing access from promotion cloud identity', () => {
+    const guide = readFileSync(operationsGuideUrl, 'utf8')
+
+    expect(guide).toContain('Build matrix jobs may reference `production` only to read the two `TAURI_SIGNING_*` secrets')
+    expect(guide).toContain('The promotion job is the only job granted `permissions: id-token: write`')
+    expect(guide).toContain('Build jobs must not consume or pass OIDC provider/role variables, request an ID token, or receive Alibaba Cloud credentials')
+    expect(guide).not.toContain('Only the promotion job may reference this Environment')
+  })
+
   // 验证身份信任被限定到仓库的 production Environment，发布角色也只覆盖 Desktop 前缀。
   it('documents exact OIDC identity and prefix-scoped OSS authorization', () => {
     const guide = readFileSync(operationsGuideUrl, 'utf8')
