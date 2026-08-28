@@ -7,7 +7,7 @@ describe('native update smoke reusable workflow contract', () => {
   /** workflow 只能由可信工作流复用或人工启动，并接收完整候选绑定。 */
   it('declares reusable inputs and a deterministic evidence output', () => {
     expect(workflow).toContain('workflow_call:')
-    for (const input of ['candidate_tag', 'candidate_commit', 'manifest_url', 'manifest_sha256', 'previous_stable_tag']) {
+    for (const input of ['candidate_tag', 'candidate_commit', 'manifest_url', 'manifest_sha256', 'previous_stable_tag', 'previous_stable_manifest_sha256']) {
       expect(workflow).toContain(`${input}:`)
     }
     expect(workflow).toContain('evidence_artifact_name:')
@@ -23,6 +23,8 @@ describe('native update smoke reusable workflow contract', () => {
     expect(workflow).toContain('ISOLATED_MANIFEST_URL: ${{ inputs.manifest_url }}')
     expect(workflow).toContain('default: https://updates.cyunlab.com/dsh-desktop/channels/stable/latest.json')
     expect(workflow).toContain('STABLE_MANIFEST_URL: ${{ inputs.stable_manifest_url }}')
+    expect(workflow).toContain('EXPECTED_STABLE_MANIFEST_SHA256: ${{ inputs.previous_stable_manifest_sha256 }}')
+    expect(workflow).toContain('test "$actual_stable_manifest_sha256" = "$EXPECTED_STABLE_MANIFEST_SHA256"')
     expect(workflow).toContain('--manifest-url "$ISOLATED_MANIFEST_URL"')
   })
 
@@ -35,6 +37,7 @@ describe('native update smoke reusable workflow contract', () => {
     expect(workflow).toContain('.json.sha256')
     expect(workflow).not.toContain('local-fixture')
     expect(workflow).toContain('DSH_UPDATE_SMOKE_DRIVER: scripts/native-update-smoke-driver.mjs')
+    expect(workflow).toContain('--baseline-manifest-sha256 "${{ inputs.previous_stable_manifest_sha256 }}"')
   })
 
   /** workflow 代码必须来自默认分支，candidate commit 只作为待验证数据。 */
@@ -59,6 +62,7 @@ describe('native update smoke reusable workflow contract', () => {
     expect(workflow).toContain('app-tar-gz')
     expect(workflow).toContain('APPLE_SIGNING_IDENTITY')
     expect(workflow).toContain('APPLE_API_ISSUER')
+    expect(workflow).toMatch(/native-smoke:[\s\S]*environment: production/)
   })
 
   /** evidence 通过 GitHub 原生 attestations 签名并按候选与 target 唯一命名。 */

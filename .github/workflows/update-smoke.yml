@@ -23,6 +23,10 @@ on:
         description: Tag expected from the current OSS Stable manifest
         required: true
         type: string
+      previous_stable_manifest_sha256:
+        description: SHA-256 of the authoritative Stable manifest read during candidate preparation
+        required: true
+        type: string
       stable_manifest_url:
         description: Authoritative OSS Stable latest.json HTTPS URL
         required: false
@@ -93,6 +97,7 @@ jobs:
             install_scope: user
             authenticode: not-applicable
     runs-on: ${{ matrix.runner }}
+    environment: production
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -153,6 +158,7 @@ jobs:
           PREVIOUS_STABLE_TAG: ${{ inputs.previous_stable_tag }}
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
           EXPECTED_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          EXPECTED_STABLE_MANIFEST_SHA256: ${{ inputs.previous_stable_manifest_sha256 }}
         run: |
           set -euo pipefail
           previous_version="${PREVIOUS_STABLE_TAG#v}"
@@ -170,7 +176,9 @@ jobs:
             --output-directory smoke-assets \
             --label candidate
           actual_manifest_sha256="$(node -p "require('./smoke-assets/candidate/asset.json').manifestSha256")"
+          actual_stable_manifest_sha256="$(node -p "require('./smoke-assets/baseline/asset.json').manifestSha256")"
           test "$actual_manifest_sha256" = "$EXPECTED_MANIFEST_SHA256"
+          test "$actual_stable_manifest_sha256" = "$EXPECTED_STABLE_MANIFEST_SHA256"
       - name: Apply the fail-closed repository-owned native evidence gate
         shell: bash
         env:
@@ -270,6 +278,8 @@ jobs:
           --candidate-tag "${{ inputs.candidate_tag }}"
           --candidate-commit "${{ inputs.candidate_commit }}"
           --manifest-sha256 "${{ inputs.manifest_sha256 }}"
+          --baseline-tag "${{ inputs.previous_stable_tag }}"
+          --baseline-manifest-sha256 "${{ inputs.previous_stable_manifest_sha256 }}"
           --max-age-hours 24
           --require-real-native
       - name: Attest aggregate evidence to this workflow identity

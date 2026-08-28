@@ -18,6 +18,10 @@ const candidate = Object.freeze({
   commit: '1234567890abcdef1234567890abcdef12345678',
   manifest_sha256: 'a'.repeat(64)
 })
+const baselineExpectation = Object.freeze({
+  baselineTag: 'v2.0.15',
+  baseline_manifest_sha256: 'f'.repeat(64)
+})
 
 /** 根据目标生成一份完整且与候选版本绑定的原生证据。 */
 function validEvidence(target: string, evidenceKind = 'real-native') {
@@ -98,8 +102,26 @@ describe('update smoke evidence verifier public seam', () => {
 
   /** 完整真实原生证据应满足 Stable promotion 的候选绑定。 */
   it('accepts one complete real-native document for every supported target', () => {
-    const result = verifyUpdateSmokeEvidenceSet(validSet(), { ...candidate, now: new Date('2026-08-28T09:00:00.000Z'), maxAgeHours: 24, requireRealNative: true })
+    const result = verifyUpdateSmokeEvidenceSet(validSet(), { ...candidate, ...baselineExpectation, now: new Date('2026-08-28T09:00:00.000Z'), maxAgeHours: 24, requireRealNative: true })
     expect(result).toEqual({ schemaVersion: 1, targets: REQUIRED_SMOKE_TARGETS, candidate })
+  })
+
+  /** previous Stable 身份必须与 candidate preparation 读取的权威 pointer 完全一致。 */
+  it('rejects a baseline tag or manifest digest that differs from candidate preparation', () => {
+    expect(() => verifyUpdateSmokeEvidenceSet(validSet(), {
+      ...candidate,
+      ...baselineExpectation,
+      baselineTag: 'v2.0.14',
+      now: new Date('2026-08-28T09:00:00.000Z'),
+      maxAgeHours: 24
+    })).toThrow('baseline tag does not match candidate preparation')
+    expect(() => verifyUpdateSmokeEvidenceSet(validSet(), {
+      ...candidate,
+      ...baselineExpectation,
+      baseline_manifest_sha256: '0'.repeat(64),
+      now: new Date('2026-08-28T09:00:00.000Z'),
+      maxAgeHours: 24
+    })).toThrow('baseline Stable manifest does not match candidate preparation')
   })
 
   /** fixture 只能验证合约，不能成为 Stable promotion 证据。 */

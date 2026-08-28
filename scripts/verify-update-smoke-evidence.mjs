@@ -151,6 +151,12 @@ function verifyDocument(document, expectations) {
   if (!SHA256.test(baseline.artifact_sha256)) throw new Error('baseline artifact_sha256 must be lowercase SHA-256')
   if (!SHA256.test(baseline.signature_sha256)) throw new Error('baseline signature_sha256 must be lowercase SHA-256')
   if (!SHA256.test(baseline.stable_manifest_sha256)) throw new Error('baseline stable_manifest_sha256 must be lowercase SHA-256')
+  if (expectations.baselineTag !== undefined && baseline.tag !== expectations.baselineTag) {
+    throw new Error('baseline tag does not match candidate preparation')
+  }
+  if (expectations.baseline_manifest_sha256 !== undefined && baseline.stable_manifest_sha256 !== expectations.baseline_manifest_sha256) {
+    throw new Error('baseline Stable manifest does not match candidate preparation')
+  }
   let baselineUrl
   try { baselineUrl = new URL(baseline.artifact_url) } catch { throw new Error('baseline artifact_url must be an HTTPS URL') }
   if (baselineUrl.protocol !== 'https:' || baselineUrl.hostname !== 'updates.cyunlab.com' || baselineUrl.username || baselineUrl.password || baselineUrl.search || baselineUrl.hash) {
@@ -268,7 +274,7 @@ function parseArguments(args) {
 /** 校验 CLI 参数并验证一个 evidence artifact 目录。 */
 export async function runUpdateSmokeEvidenceCli(args = process.argv.slice(2), now = new Date()) {
   const values = parseArguments(args)
-  for (const name of ['evidence', 'candidate-tag', 'candidate-commit', 'manifest-sha256', 'max-age-hours']) {
+  for (const name of ['evidence', 'candidate-tag', 'candidate-commit', 'manifest-sha256', 'baseline-tag', 'baseline-manifest-sha256', 'max-age-hours']) {
     if (!values[name]) throw new Error(`--${name} is required`)
   }
   const tagMatch = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/.exec(values['candidate-tag'])
@@ -279,6 +285,8 @@ export async function runUpdateSmokeEvidenceCli(args = process.argv.slice(2), no
     version,
     commit: values['candidate-commit'],
     manifest_sha256: values['manifest-sha256'],
+    baselineTag: values['baseline-tag'],
+    baseline_manifest_sha256: values['baseline-manifest-sha256'],
     maxAgeHours: Number(values['max-age-hours']),
     requireRealNative: values.requireRealNative === true,
     now
