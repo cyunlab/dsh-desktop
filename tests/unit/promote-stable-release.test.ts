@@ -213,6 +213,7 @@ describe('Stable update promotion', () => {
   /** 验证默认 minisign 适配器使用官方校验参数且不经 shell。 */
   it('verifies a Tauri signature with minisign and the configured public key', async () => {
     const calls: Array<{ args: string[]; shell: boolean }> = []
+    /** 记录 minisign 适配器收到的公开参数，避免执行本机二进制。 */
     await verifyTauriSignature('/release/app.exe', '/release/app.exe.sig', 'RWQpublic', async (args, options) => {
       calls.push({ args, shell: options.shell })
     })
