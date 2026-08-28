@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { inspectMountedDmg, probeBundledRuntime, removeInspectionRoot, verifyExtractedBundleContents, verifyTauriArtifact } from '../../scripts/verify-tauri-artifact.mjs'
+import { detachMountedDmg, inspectMountedDmg, probeBundledRuntime, removeInspectionRoot, verifyExtractedBundleContents, verifyTauriArtifact } from '../../scripts/verify-tauri-artifact.mjs'
 import { requiredRuntimeAssets, runtimeTarget } from '../../scripts/runtime-closure.mjs'
 import { probeDirectDshWeb, waitForListenerClosed } from '../../scripts/smoke-dsh-cli.mjs'
 
@@ -413,6 +413,32 @@ describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TI
     } finally {
       await rm(root, { recursive: true, force: true })
     }
+  })
+
+  /** 确保 Finder 或运行时短暂占用挂载点时，验证器会重试并最终强制卸载。 */
+  it('retries a busy DMG detach before forcing unmount', async () => {
+    const calls: string[][] = []
+    await expect(detachMountedDmg('/tmp/mounted', async (_file, args) => {
+      calls.push(args)
+      if (calls.length < 3) throw Object.assign(new Error('Resource busy'), { code: 16, stderr: 'Resource busy' })
+    }, { retryDelayMilliseconds: 1 })).resolves.toBeUndefined()
+    expect(calls).toEqual([
+      ['detach', '/tmp/mounted'],
+      ['detach', '/tmp/mounted'],
+      ['detach', '/tmp/mounted']
+    ])
+  })
+
+  /** 确保普通卸载持续繁忙时，强制卸载失败也不会推翻已经完成的产物验证。 */
+  it('does not invalidate a verified DMG when forced detach remains busy', async () => {
+    const calls: string[][] = []
+    const warnings: string[] = []
+    await expect(detachMountedDmg('/tmp/mounted', async (_file, args) => {
+      calls.push(args)
+      throw Object.assign(new Error('Resource busy'), { code: 16, stderr: 'Resource busy' })
+    }, { maxRetries: 1, retryDelayMilliseconds: 1, warn: message => warnings.push(message) })).resolves.toBeUndefined()
+    expect(calls.at(-1)).toEqual(['detach', '-force', '/tmp/mounted'])
+    expect(warnings).toEqual([expect.stringContaining('remains mounted')])
   })
 
   it('retries transient macOS mount-directory cleanup failures', async () => {

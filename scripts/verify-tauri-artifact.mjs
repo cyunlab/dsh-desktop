@@ -31,6 +31,30 @@ export async function removeInspectionRoot(directory, remover = rm, options = {}
   }
 }
 
+/** 卸载已检查的 DMG，并为 macOS 偶发的 Resource busy 提供重试和强制卸载兜底。 */
+export async function detachMountedDmg(mountPoint, commandRunner = execFileAsync, options = {}) {
+  const maxRetries = options.maxRetries ?? 5
+  const retryDelayMilliseconds = options.retryDelayMilliseconds ?? 300
+  const warn = options.warn ?? console.warn
+  let lastError
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      await commandRunner('hdiutil', ['detach', mountPoint])
+      return
+    } catch (error) {
+      lastError = error
+      const transient = error?.code === 16 || /resource busy/i.test(error?.stderr ?? error?.message ?? '')
+      if (!transient) throw error
+      if (attempt < maxRetries) await new Promise(resolve => setTimeout(resolve, retryDelayMilliseconds * (attempt + 1)))
+    }
+  }
+  try {
+    await commandRunner('hdiutil', ['detach', '-force', mountPoint])
+  } catch (error) {
+    warn(`Verified DMG remains mounted after detach retries: ${lastError?.message ?? error?.message ?? mountPoint}`)
+  }
+}
+
 /** 根据 CI 矩阵平台返回发布包、资源目录和架构约束。 */
 function artifactContract(platformName, runtimeArch = hostArch()) {
   const contracts = {
@@ -245,7 +269,7 @@ export async function inspectMountedDmg(artifact, inspectionRoot, inspect, comma
   let detachError
   if (attachAttempted) {
     try {
-      await commandRunner('hdiutil', ['detach', mountPoint])
+      await detachMountedDmg(mountPoint, commandRunner)
     } catch (error) {
       detachError = error
     }

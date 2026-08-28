@@ -31,6 +31,12 @@ export function removeInspectionRoot(
   }
 ): Promise<void>
 
+export function detachMountedDmg(
+  mountPoint: string,
+  commandRunner?: (file: string, args: string[]) => Promise<unknown>,
+  options?: { maxRetries?: number; retryDelayMilliseconds?: number; warn?: (message: string) => void }
+): Promise<void>
+
 /** 在真实 DMG 挂载点内执行检查，并在异常路径也确认卸载命令已发出。 */
 export function inspectMountedDmg(
   artifact: string,
