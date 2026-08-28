@@ -54,11 +54,16 @@ describe('native build workflow contract', () => {
     expect(workflow).not.toContain('APPIMAGE_EXTRACT_AND_RUN')
   })
 
-  it('builds the Intel app and creates its DMG without Finder automation', () => {
-    expect(workflow).toContain('Build Intel macOS package without Finder DMG automation')
+  /** 确保两种 macOS 架构都绕过 Finder，并在封装 DMG 前递归签署原生资源。 */
+  it('builds and recursively signs each macOS app before creating its DMG', () => {
+    expect(workflow).toContain('Build and recursively sign macOS application')
     expect(workflow).toContain('pnpm tauri:build --bundles app --verbose')
+    expect(workflow).toContain("file -b \"$candidate\" | grep -q 'Mach-O'")
+    expect(workflow).toContain('--options runtime')
+    expect(workflow).toContain('codesign --verify --deep --strict --verbose=2 "$app_path"')
     expect(workflow).toContain('hdiutil create -volname "DeepSeek Harness Desktop"')
     expect(workflow).toContain('-format UDZO "$dmg_path"')
+    expect(workflow).toContain("if: matrix.platform != 'mac'")
     expect(workflow).not.toContain('pnpm package -- --verbose || pnpm package -- --verbose')
   })
 

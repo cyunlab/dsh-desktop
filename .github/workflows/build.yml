@@ -138,26 +138,38 @@ jobs:
           security find-identity -v -p codesigning "$keychain" | grep -F "$APPLE_SIGNING_IDENTITY"
           echo "APPLE_API_KEY_PATH=$api_key" >> "$GITHUB_ENV"
       - name: Build native Tauri package with official Node and published CLI
-        if: ${{ !(matrix.platform == 'mac' && matrix.arch == 'x64') }}
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ matrix.platform == 'mac' && secrets.APPLE_SIGNING_IDENTITY || '' }}
-          APPLE_API_ISSUER: ${{ matrix.platform == 'mac' && secrets.APPLE_API_ISSUER || '' }}
-          APPLE_API_KEY: ${{ matrix.platform == 'mac' && secrets.APPLE_API_KEY || '' }}
+        if: matrix.platform != 'mac'
         run: pnpm package -- --verbose
-      - name: Build Intel macOS package without Finder DMG automation
-        if: ${{ matrix.platform == 'mac' && matrix.arch == 'x64' }}
+      - name: Build and recursively sign macOS application
+        if: matrix.platform == 'mac'
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: |
+          set -euo pipefail
           pnpm tauri:build --bundles app --verbose
           version="$(node -p "require('./package.json').version")"
           app_path="src-tauri/target/release/bundle/macos/DeepSeek Harness Desktop.app"
           dmg_directory="src-tauri/target/release/bundle/dmg"
-          dmg_path="${dmg_directory}/DeepSeek Harness Desktop_${version}_x64.dmg"
+          dmg_path="${dmg_directory}/DeepSeek Harness Desktop_${version}_${{ matrix.arch }}.dmg"
           test -d "$app_path"
+
+          while IFS= read -r -d '' candidate; do
+            if file -b "$candidate" | grep -q 'Mach-O'; then
+              codesign --force \
+                --sign "$APPLE_SIGNING_IDENTITY" \
+                --options runtime \
+                --timestamp \
+                "$candidate"
+            fi
+          done < <(find "$app_path/Contents" -type f -print0)
+          codesign --force \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            --options runtime \
+            --timestamp \
+            "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+
           mkdir -p "$dmg_directory"
           hdiutil create -volname "DeepSeek Harness Desktop" \
             -srcfolder "$app_path" -ov -format UDZO "$dmg_path"
