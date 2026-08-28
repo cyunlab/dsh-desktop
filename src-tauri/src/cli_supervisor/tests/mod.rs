@@ -144,7 +144,7 @@ fn materializes_desktop_patch_for_launch_plan() {
         .to_string();
     assert_eq!(
         fs::read_to_string(&plan.desktop_patch).unwrap(),
-        format!("- insert:\n    - id: dsh-desktop-update-client\n      name: '{expected_url}'\n")
+        format!("# Desktop-owned overlay mounted by the native shell through `dsh web --patch`.\n- insert:\n    - id: dsh-desktop-update-client\n      name: '{expected_url}'\n")
     );
     fs::remove_dir_all(root).unwrap();
 }
