@@ -1,4 +1,4 @@
-use super::staging::{StageCandidate, StagingRepository, UpdateVerifier};
+use super::staging::{InstallKind, StageCandidate, StagingRepository, UpdateVerifier};
 use super::{
     Clock, DownloadProgress, PreferenceError, PreferenceStore, StableRelease, UpdateController,
     UpdateEffect, UpdateInput, UpdateSnapshot, UpdateState,
@@ -17,6 +17,310 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 
 pub const UPDATE_SNAPSHOT_EVENT: &str = "app-update:snapshot";
 use std::path::Path;
+
+/// 平台安装完成后说明是否已由 installer 接管重新启动。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfflineInstallOutcome {
+    pub relaunch_handled: bool,
+}
+
+/// 对复验后磁盘包执行平台替换的系统边界。
+pub trait OfflinePackageInstaller {
+    /// 使用持久化可信计划安装包，不访问 manifest 或网络。
+    fn install(
+        &mut self,
+        package: &Path,
+        version: &str,
+        target: &str,
+        install_kind: InstallKind,
+        relaunch: bool,
+    ) -> Result<OfflineInstallOutcome, String>;
+}
+
+/// 复验恢复的 staging package、执行离线安装，并只在成功后清理仓储。
+pub fn install_verified_offline<V: UpdateVerifier>(
+    repository: &mut StagingRepository<V>,
+    installer: &mut impl OfflinePackageInstaller,
+    relaunch: bool,
+) -> Result<OfflineInstallOutcome, String> {
+    let package = repository
+        .verify_for_install()
+        .map_err(|_| "update package verification failed".to_string())?;
+    let outcome = installer.install(
+        package.path(),
+        package.version(),
+        package.target(),
+        package.install_kind(),
+        relaunch,
+    )?;
+    repository
+        .complete_install(&package)
+        .map_err(|_| "update cleanup failed".to_string())?;
+    Ok(outcome)
+}
+
+/// 复刻 Tauri 2.10 平台安装语义、但直接消费已复验磁盘包的生产 Adapter。
+pub struct PlatformInstaller {
+    #[cfg(target_os = "windows")]
+    app_name: String,
+}
+
+impl PlatformInstaller {
+    /// 从 Desktop 应用元数据创建当前平台安装器。
+    pub fn new(app: &AppHandle) -> Self {
+        #[cfg(not(target_os = "windows"))]
+        let _ = app;
+        Self {
+            #[cfg(target_os = "windows")]
+            app_name: app.package_info().name.clone(),
+        }
+    }
+}
+
+impl OfflinePackageInstaller for PlatformInstaller {
+    /// 校验持久化 target/install kind 与当前平台一致后执行离线安装。
+    fn install(
+        &mut self,
+        package: &Path,
+        _version: &str,
+        target: &str,
+        install_kind: InstallKind,
+        relaunch: bool,
+    ) -> Result<OfflineInstallOutcome, String> {
+        #[cfg(not(target_os = "windows"))]
+        let _ = relaunch;
+        if install_kind != InstallKind::current()
+            || target
+                != tauri_plugin_updater::target()
+                    .as_deref()
+                    .unwrap_or_default()
+        {
+            return Err("update installer target mismatch".into());
+        }
+        #[cfg(target_os = "macos")]
+        return install_macos_app(package).map(|()| OfflineInstallOutcome {
+            relaunch_handled: false,
+        });
+        #[cfg(target_os = "linux")]
+        return install_linux_appimage(package).map(|()| OfflineInstallOutcome {
+            relaunch_handled: false,
+        });
+        #[cfg(target_os = "windows")]
+        return install_windows_nsis(package, &self.app_name, relaunch).map(|()| {
+            OfflineInstallOutcome {
+                relaunch_handled: relaunch,
+            }
+        });
+    }
+}
+
+/// 在 macOS 上从 updater tar.gz 解包并以可回滚目录替换当前 `.app`。
+#[cfg(target_os = "macos")]
+fn install_macos_app(package: &Path) -> Result<(), String> {
+    use flate2::read::GzDecoder;
+    let current_exe = std::env::current_exe().map_err(|_| "current application unavailable")?;
+    let destination = tauri_plugin_updater::extract_path_from_executable(&current_exe)
+        .map_err(|_| "current application unavailable")?;
+    let backup = tempfile::Builder::new()
+        .prefix("dsh-current-app")
+        .tempdir()
+        .map_err(|_| "update temporary directory unavailable")?;
+    let extracted = tempfile::Builder::new()
+        .prefix("dsh-updated-app")
+        .tempdir()
+        .map_err(|_| "update temporary directory unavailable")?;
+    let file = File::open(package).map_err(|_| "update package unavailable")?;
+    let mut archive = tar::Archive::new(GzDecoder::new(file));
+    let mut extracted_any = false;
+    for entry in archive.entries().map_err(|_| "update archive invalid")? {
+        let mut entry = entry.map_err(|_| "update archive invalid")?;
+        let relative: PathBuf = entry
+            .path()
+            .map_err(|_| "update archive invalid")?
+            .iter()
+            .skip(1)
+            .collect();
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let output = extracted.path().join(relative);
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent).map_err(|_| "update extraction failed")?;
+        }
+        entry
+            .unpack(&output)
+            .map_err(|_| "update extraction failed")?;
+        extracted_any = true;
+    }
+    if !extracted_any {
+        return Err("update archive invalid".into());
+    }
+    let backup_path = backup.path().join("current_app");
+    match fs::rename(&destination, &backup_path) {
+        Ok(()) => {
+            if let Err(_) = fs::rename(extracted.path(), &destination) {
+                let _ = fs::rename(&backup_path, &destination);
+                return Err("update replacement failed".into());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            install_macos_with_authorization(extracted.path(), &destination)?;
+        }
+        Err(_) => return Err("update replacement failed".into()),
+    }
+    let _ = std::process::Command::new("touch")
+        .arg(destination)
+        .status();
+    Ok(())
+}
+
+/// 使用系统 AppleScript 权限对话框替换不可直接写入的 macOS 应用。
+#[cfg(target_os = "macos")]
+fn install_macos_with_authorization(source: &Path, destination: &Path) -> Result<(), String> {
+    let command = format!(
+        "rm -rf -- {} && mv -f -- {} {}",
+        shell_quote(destination),
+        shell_quote(source),
+        shell_quote(destination)
+    );
+    let apple_script = format!(
+        "do shell script \"{}\" with administrator privileges",
+        command.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let status = std::process::Command::new("osascript")
+        .args(["-e", &apple_script])
+        .status()
+        .map_err(|_| "update authorization unavailable")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("update authorization denied".into())
+    }
+}
+
+/// 为 shell command 生成不执行插值的单引号参数。
+#[cfg(target_os = "macos")]
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// 在 Linux 上从 updater tar.gz 或原始包替换当前 AppImage，并保留回滚副本。
+#[cfg(target_os = "linux")]
+fn install_linux_appimage(package: &Path) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::PermissionsExt;
+    let destination = std::env::var_os("APPIMAGE")
+        .map(PathBuf::from)
+        .ok_or_else(|| "current AppImage unavailable".to_string())?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "current AppImage unavailable".to_string())?;
+    let temporary = tempfile::Builder::new()
+        .prefix("dsh-appimage-update")
+        .tempdir_in(parent)
+        .map_err(|_| "update temporary directory unavailable")?;
+    let candidate = temporary.path().join("candidate.AppImage");
+    let mut input = File::open(package).map_err(|_| "update package unavailable")?;
+    let mut magic = [0_u8; 2];
+    input
+        .read_exact(&mut magic)
+        .map_err(|_| "update package unavailable")?;
+    input
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| "update package unavailable")?;
+    if magic == [0x1f, 0x8b] {
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(input));
+        let mut found = false;
+        for entry in archive.entries().map_err(|_| "update archive invalid")? {
+            let mut entry = entry.map_err(|_| "update archive invalid")?;
+            if entry
+                .path()
+                .ok()
+                .and_then(|path| path.extension().map(|value| value == "AppImage"))
+                .unwrap_or(false)
+            {
+                entry
+                    .unpack(&candidate)
+                    .map_err(|_| "update extraction failed")?;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err("update archive invalid".into());
+        }
+    } else {
+        fs::copy(package, &candidate).map_err(|_| "update extraction failed")?;
+    }
+    let permissions = fs::metadata(&destination)
+        .map_err(|_| "current AppImage unavailable")?
+        .permissions();
+    fs::set_permissions(&candidate, permissions).map_err(|_| "update extraction failed")?;
+    let backup = temporary.path().join("current.AppImage");
+    fs::rename(&destination, &backup).map_err(|_| "update replacement failed")?;
+    if fs::rename(&candidate, &destination).is_err() {
+        let _ = fs::rename(&backup, &destination);
+        return Err("update replacement failed".into());
+    }
+    let mut executable = fs::metadata(&destination)
+        .map_err(|_| "update replacement failed")?
+        .permissions();
+    executable.set_mode(executable.mode() | 0o700);
+    fs::set_permissions(destination, executable).map_err(|_| "update replacement failed")
+}
+
+/// 在 Windows 上从 updater ZIP 或原始 EXE 启动 current-user NSIS installer。
+#[cfg(target_os = "windows")]
+fn install_windows_nsis(package: &Path, app_name: &str, relaunch: bool) -> Result<(), String> {
+    use std::io::Read;
+    let mut file = File::open(package).map_err(|_| "update package unavailable")?;
+    let mut magic = [0_u8; 2];
+    file.read_exact(&mut magic)
+        .map_err(|_| "update package unavailable")?;
+    let directory = tempfile::Builder::new()
+        .prefix(&format!("{app_name}-updater"))
+        .tempdir()
+        .map_err(|_| "update temporary directory unavailable")?
+        .keep();
+    let installer = if magic == [b'M', b'Z'] {
+        let path = directory.join("installer.exe");
+        fs::copy(package, &path).map_err(|_| "update extraction failed")?;
+        path
+    } else {
+        let mut archive = zip::ZipArchive::new(file).map_err(|_| "update archive invalid")?;
+        let mut installer = None;
+        for index in 0..archive.len() {
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|_| "update archive invalid")?;
+            if Path::new(entry.name())
+                .extension()
+                .is_some_and(|value| value == "exe")
+            {
+                let path = directory.join("installer.exe");
+                let mut output = File::create(&path).map_err(|_| "update extraction failed")?;
+                std::io::copy(&mut entry, &mut output).map_err(|_| "update extraction failed")?;
+                installer = Some(path);
+                break;
+            }
+        }
+        installer.ok_or_else(|| "update archive invalid".to_string())?
+    };
+    let mut command = std::process::Command::new(installer);
+    command.args(windows_nsis_args(relaunch));
+    command.spawn().map_err(|_| "update installation failed")?;
+    Ok(())
+}
+
+/// 为 Windows NSIS 区分正常退出安装与显式重启安装参数。
+#[cfg(any(target_os = "windows", test))]
+fn windows_nsis_args(relaunch: bool) -> &'static [&'static str] {
+    if relaunch {
+        &["/P", "/UPDATE", "/R"]
+    } else {
+        &["/P", "/UPDATE"]
+    }
+}
 
 /// 更新 Adapter 的可信配置错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,7 +829,13 @@ impl TauriUpdateRuntime {
             );
             return;
         }
-        let candidate = match StageCandidate::new(&update.version, &update.signature) {
+        let target = tauri_plugin_updater::target().unwrap_or_default();
+        let candidate = match StageCandidate::with_install_plan(
+            &update.version,
+            &update.signature,
+            &target,
+            InstallKind::current(),
+        ) {
             Ok(value) => value,
             Err(_) => {
                 self.dispatch(
@@ -564,8 +874,12 @@ impl TauriUpdateRuntime {
             .is_some()
     }
 
-    /// 安装前复验唯一 staging package，并通过 Tauri installer 安装短暂读取的字节。
-    pub fn install_staged(&self, app: &AppHandle) -> Result<(), String> {
+    /// 安装前复验唯一 staging package，并通过持久化可信计划离线安装。
+    pub fn install_staged(
+        &self,
+        app: &AppHandle,
+        relaunch: bool,
+    ) -> Result<OfflineInstallOutcome, String> {
         let mut repositories = self
             .staging
             .lock()
@@ -573,42 +887,8 @@ impl TauriUpdateRuntime {
         let repository = repositories
             .as_mut()
             .ok_or_else(|| "update staging unavailable".to_string())?;
-        let package = repository
-            .verify_for_install()
-            .map_err(|_| "update package verification failed".to_string())?;
-        let update = match self.pending.lock().ok().and_then(|value| value.clone()) {
-            Some(value) => value,
-            None => {
-                let config = self
-                    .config
-                    .as_ref()
-                    .map_err(|_| "update installer metadata unavailable".to_string())?;
-                let endpoint = reqwest::Url::parse(&config.endpoint)
-                    .map_err(|_| "update installer metadata unavailable".to_string())?;
-                let updater = app
-                    .updater_builder()
-                    .endpoints(vec![endpoint])
-                    .map(|builder| builder.pubkey(&config.public_key))
-                    .and_then(|builder| builder.build())
-                    .map_err(|_| "update installer metadata unavailable".to_string())?;
-                tauri::async_runtime::block_on(updater.check())
-                    .map_err(|_| "update installer metadata unavailable".to_string())?
-                    .ok_or_else(|| "update installer metadata unavailable".to_string())?
-            }
-        };
-        if package.version() != update.version {
-            return Err("update installer metadata mismatch".into());
-        }
-        // Tauri 2.10 的 installer 只接受 &[u8]；该 Vec 仅在安装调用期间存在，staging 本身始终在磁盘。
-        let bytes =
-            fs::read(package.path()).map_err(|_| "update package unavailable".to_string())?;
-        update
-            .install(&bytes)
-            .map_err(|_| "update installation failed".to_string())?;
-        drop(bytes);
-        repository
-            .complete_install(&package)
-            .map_err(|_| "update cleanup failed".to_string())
+        let mut installer = PlatformInstaller::new(app);
+        install_verified_offline(repository, &mut installer, relaunch)
     }
 }
 
@@ -688,6 +968,29 @@ impl SafeUpdateLog {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// 记录恢复后离线安装拿到的可信计划，不访问网络。
+    struct OfflineRecorder {
+        observed: Option<(String, String, super::InstallKind, bool)>,
+    }
+
+    impl super::OfflinePackageInstaller for OfflineRecorder {
+        /// 记录 repository 复验后交付的安装计划。
+        fn install(
+            &mut self,
+            package: &Path,
+            version: &str,
+            target: &str,
+            install_kind: super::InstallKind,
+            relaunch: bool,
+        ) -> Result<super::OfflineInstallOutcome, String> {
+            assert_eq!(fs::read(package).unwrap(), b"test");
+            self.observed = Some((version.into(), target.into(), install_kind, relaunch));
+            Ok(super::OfflineInstallOutcome {
+                relaunch_handled: false,
+            })
+        }
+    }
 
     /// 记录 cleanup 与安装的公开可观察顺序。
     struct Recorder {
@@ -807,5 +1110,51 @@ mod tests {
         ));
         assert!(!is_retryable_http_status(reqwest::StatusCode::NOT_FOUND));
         assert!(!is_retryable_http_status(reqwest::StatusCode::UNAUTHORIZED));
+    }
+
+    /// 恢复 staging 后无需 manifest 或网络即可按持久化可信计划安装。
+    #[test]
+    fn recovered_staged_package_installs_offline() {
+        let cache = tempfile::tempdir().unwrap();
+        let key_text = "untrusted comment: minisign public key E7620F1842B4E81F\nRWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+        let signature_text = "untrusted comment: signature from minisign secret key\nRWQf6LRCGA9i59SLOFxz6NxvASXDJeRtuZykwQepbDEGt87ig1BNpWaVWuNrm73YiIiJbq71Wi+dP9eKL8OC351vwIasSSbXxwA=\ntrusted comment: timestamp:1555779966\tfile:test\nQtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfNQUaOAA==";
+        let key = base64::engine::general_purpose::STANDARD.encode(key_text);
+        let signature = base64::engine::general_purpose::STANDARD.encode(signature_text);
+        let mut repository =
+            StagingRepository::open(cache.path(), TauriMinisignVerifier::new(&key).unwrap())
+                .unwrap();
+        let target = tauri_plugin_updater::target().unwrap();
+        repository
+            .stage(
+                StageCandidate::with_install_plan(
+                    "2.1.0",
+                    &signature,
+                    &target,
+                    super::InstallKind::current(),
+                )
+                .unwrap(),
+                b"test".as_slice(),
+            )
+            .unwrap();
+        drop(repository);
+        let mut recovered =
+            StagingRepository::open(cache.path(), TauriMinisignVerifier::new(&key).unwrap())
+                .unwrap();
+        let mut installer = OfflineRecorder { observed: None };
+        let outcome =
+            super::install_verified_offline(&mut recovered, &mut installer, true).unwrap();
+        assert!(!outcome.relaunch_handled);
+        assert_eq!(
+            installer.observed,
+            Some(("2.1.0".into(), target, super::InstallKind::current(), true))
+        );
+        assert!(recovered.snapshot().is_none());
+    }
+
+    /// Windows 正常退出不会请求 installer reopen，显式重启才使用 `/R`。
+    #[test]
+    fn windows_nsis_relaunch_is_explicit() {
+        assert_eq!(windows_nsis_args(false), ["/P", "/UPDATE"]);
+        assert_eq!(windows_nsis_args(true), ["/P", "/UPDATE", "/R"]);
     }
 }

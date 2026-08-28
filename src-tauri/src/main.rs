@@ -1677,18 +1677,30 @@ fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>, source: Shutdown
         ) && app
             .try_state::<Arc<TauriUpdateRuntime>>()
             .is_some_and(|updater| updater.has_staged());
-        let install_failed = !cleanup_failed
-            && update_requested
-            && app
-                .try_state::<Arc<TauriUpdateRuntime>>()
-                .is_none_or(|updater| updater.install_staged(&app).is_err());
+        let install_result = (!cleanup_failed && update_requested).then(|| {
+            app.try_state::<Arc<TauriUpdateRuntime>>().map_or_else(
+                || Err("update runtime unavailable".to_string()),
+                |updater| {
+                    updater.install_staged(&app, matches!(source, ShutdownSource::UpdateRestart))
+                },
+            )
+        });
+        let install_failed = install_result.as_ref().is_some_and(Result::is_err);
+        let relaunch_handled = install_result
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .is_some_and(|outcome| outcome.relaunch_handled);
         #[cfg(all(debug_assertions, feature = "wdio"))]
         record_wdio_event(serde_json::json!({
             "event": "native-shutdown-completed",
             "generation": shutdown_generation,
             "cleanupSucceeded": !cleanup_failed
         }));
-        if !cleanup_failed && !install_failed && matches!(source, ShutdownSource::UpdateRestart) {
+        if !cleanup_failed
+            && !install_failed
+            && !relaunch_handled
+            && matches!(source, ShutdownSource::UpdateRestart)
+        {
             app.restart();
         } else {
             app.exit(if cleanup_failed || install_failed {

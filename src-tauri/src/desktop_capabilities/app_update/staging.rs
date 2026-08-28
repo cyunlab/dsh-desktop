@@ -11,6 +11,28 @@ const METADATA_TEMP_FILE: &str = ".staged.json.tmp";
 const PACKAGE_FILE: &str = "package.bin";
 const PACKAGE_TEMP_FILE: &str = ".package.bin.tmp";
 
+/// 选择受信平台安装实现的持久化分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallKind {
+    WindowsNsis,
+    LinuxAppImage,
+    #[default]
+    MacosApp,
+}
+
+impl InstallKind {
+    /// 返回当前构建目标唯一允许的 updater 安装类型。
+    pub fn current() -> Self {
+        #[cfg(target_os = "windows")]
+        return Self::WindowsNsis;
+        #[cfg(target_os = "linux")]
+        return Self::LinuxAppImage;
+        #[cfg(target_os = "macos")]
+        return Self::MacosApp;
+    }
+}
+
 /// 更新包签名验证的系统边界。
 pub trait UpdateVerifier {
     /// 使用候选签名验证磁盘上的完整更新包。
@@ -22,6 +44,8 @@ pub trait UpdateVerifier {
 pub struct StageCandidate {
     version: Version,
     signature: String,
+    target: String,
+    install_kind: InstallKind,
 }
 
 impl fmt::Debug for StageCandidate {
@@ -45,7 +69,25 @@ impl StageCandidate {
         Ok(Self {
             version,
             signature: signature.into(),
+            target: String::new(),
+            install_kind: InstallKind::current(),
         })
+    }
+
+    /// 创建绑定 manifest target 与平台安装类型的生产暂存候选。
+    pub fn with_install_plan(
+        version: &str,
+        signature: &str,
+        target: &str,
+        install_kind: InstallKind,
+    ) -> Result<Self, StagingError> {
+        let mut candidate = Self::new(version, signature)?;
+        if target.trim().is_empty() || install_kind != InstallKind::current() {
+            return Err(StagingError::InvalidCandidate);
+        }
+        candidate.target = target.into();
+        candidate.install_kind = install_kind;
+        Ok(candidate)
     }
 }
 
@@ -67,6 +109,8 @@ impl StagedUpdate {
 pub struct VerifiedStagedPackage {
     version: String,
     path: PathBuf,
+    target: String,
+    install_kind: InstallKind,
 }
 
 impl fmt::Debug for VerifiedStagedPackage {
@@ -90,6 +134,16 @@ impl VerifiedStagedPackage {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// 返回下载时由 Tauri 选择并持久化的 manifest target。
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// 返回下载时绑定的唯一平台安装类型。
+    pub fn install_kind(&self) -> InstallKind {
+        self.install_kind
+    }
 }
 
 /// 暂存仓储的稳定错误分类，不包含本机路径或签名。
@@ -107,6 +161,10 @@ pub enum StagingError {
 struct StoredMetadata {
     version: String,
     signature: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    install_kind: InstallKind,
 }
 
 /// 负责单个已验证更新包持久化、恢复和清理的仓储。
@@ -166,6 +224,8 @@ impl<V: UpdateVerifier> StagingRepository<V> {
             let metadata = StoredMetadata {
                 version: candidate.version.to_string(),
                 signature: candidate.signature,
+                target: candidate.target,
+                install_kind: candidate.install_kind,
             };
             atomic_replace(&package_temp, &self.root.join(PACKAGE_FILE))?;
             sync_directory(&self.root)?;
@@ -198,6 +258,8 @@ impl<V: UpdateVerifier> StagingRepository<V> {
         Ok(VerifiedStagedPackage {
             version: metadata.version.clone(),
             path: package,
+            target: metadata.target.clone(),
+            install_kind: metadata.install_kind,
         })
     }
 
