@@ -30,7 +30,8 @@ describe('Tauri resource layout', () => {
       'icons/icon.icns',
       'icons/icon.ico'
     ])
-    expect(config.bundle.targets).toEqual(['nsis', 'dmg', 'deb'])
+    expect(config.bundle.targets).toEqual(['nsis', 'dmg', 'appimage'])
+    expect(config.bundle.createUpdaterArtifacts).toBe(true)
   })
 
   /** 验证平台配置不会把发布矩阵声明的安装包类型覆盖回其他格式。 */
@@ -40,7 +41,7 @@ describe('Tauri resource layout', () => {
       readFile(path.join(root, 'src-tauri/tauri.macos.conf.json'), 'utf8'),
       readFile(path.join(root, 'src-tauri/tauri.windows.conf.json'), 'utf8')
     ]).then(configs => configs.map(config => JSON.parse(config)))
-    expect(linux.bundle.targets).toEqual(['deb'])
+    expect(linux.bundle.targets).toEqual(['appimage'])
     expect(macos.bundle.targets).toEqual(['dmg'])
     expect(windows.bundle.targets).toEqual(['nsis'])
   })

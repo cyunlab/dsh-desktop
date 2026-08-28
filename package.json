@@ -28,6 +28,7 @@
     "test:behavior": "pnpm test && pnpm test:integration && pnpm test:e2e",
     "typecheck": "tsc --noEmit",
     "release:tag": "node scripts/tag-release.mjs",
+    "release:promote": "node scripts/promote-stable-release.mjs",
     "verify:release-version": "node scripts/verify-release-version.mjs"
   },
   "devDependencies": {
