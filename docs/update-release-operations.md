@@ -26,7 +26,7 @@ Do not put private business data in this bucket. It is a shared public-release b
 
 ## Required GitHub Environment configuration
 
-Create an Environment named exactly `production`. Configure required reviewers or other deployment protection appropriate to the organization. Only the promotion job may reference this Environment and receive `permissions: id-token: write`; build and test jobs must not receive an Alibaba Cloud identity.
+Create an Environment named exactly `production`. Configure required reviewers or other deployment protection appropriate to the organization. Build matrix jobs may reference `production` only to read the two `TAURI_SIGNING_*` secrets required to sign updater artifacts. The promotion job is the only job granted `permissions: id-token: write` and the only job that consumes the OIDC provider, RAM role, OSS, and update-origin variables below. Build jobs must not consume or pass OIDC provider/role variables, request an ID token, or receive Alibaba Cloud credentials; unrelated test jobs should not reference `production` at all.
 
 Set these Environment variables exactly as shown:
 
