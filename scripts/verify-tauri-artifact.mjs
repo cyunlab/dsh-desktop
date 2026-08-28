@@ -75,9 +75,9 @@ function artifactContract(platformName, runtimeArch = hostArch()) {
       architecture: runtimeArch === 'arm64' ? 'aarch64' : 'x86_64'
     },
     linux: {
-      directory: path.join('src-tauri', 'target', 'release', 'bundle', 'deb'),
-      extension: '.deb',
-      label: 'Linux Debian package',
+      directory: path.join('src-tauri', 'target', 'release', 'bundle', 'appimage'),
+      extension: '.AppImage',
+      label: 'Linux AppImage',
       resourceName: 'linux-x86_64',
       executableName: 'node',
       architecture: 'x86_64'
@@ -159,10 +159,14 @@ async function verifyContainerFormat(artifact, contract) {
     return
   }
   if (contract.platformName === 'linux') {
-    const header = await readPrefix(artifact, 8)
-    if (header.toString('ascii') !== '!<arch>\n') throw new Error(`Debian ar container magic is missing: ${artifact}`)
-    const { stdout } = await execFileAsync('dpkg-deb', ['--field', artifact, 'Architecture'], { encoding: 'utf8' })
-    if (stdout.trim() !== 'amd64') throw new Error(`Debian package architecture mismatch: expected amd64, found ${stdout.trim()}`)
+    const header = await readPrefix(artifact, 20)
+    if (!header.subarray(8, 11).equals(Buffer.from([0x41, 0x49, 0x02]))) {
+      throw new Error(`AppImage type-2 magic is missing: ${artifact}`)
+    }
+    const architecture = await readElfArchitecture(artifact)
+    if (architecture !== contract.architecture) {
+      throw new Error(`AppImage architecture mismatch: expected ${contract.architecture}, found ${architecture}`)
+    }
     return
   }
   const information = await stat(artifact)
@@ -313,9 +317,8 @@ async function verifyInspectableContainer(artifact, contract) {
       const sevenZip = await locateSevenZip()
       await execFileAsync(sevenZip, ['x', '-y', `-o${contentRoot}`, artifact], { windowsHide: true })
     } else if (contract.platformName === 'linux') {
-      contentRoot = path.join(inspectionRoot, 'extracted')
-      await mkdir(contentRoot)
-      await execFileAsync('dpkg-deb', ['--extract', artifact, contentRoot])
+      await execFileAsync(artifact, ['--appimage-extract'], { cwd: inspectionRoot })
+      contentRoot = path.join(inspectionRoot, 'squashfs-root')
     } else {
       await inspectMountedDmg(artifact, inspectionRoot, async mountedRoot => {
         await verifyExtractedBundleContents(mountedRoot, contract.platformName, contract.architecture === 'aarch64' ? 'arm64' : 'x64')

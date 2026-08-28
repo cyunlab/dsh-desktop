@@ -22,6 +22,15 @@ function fakePe(machine: number, marker = ''): Buffer {
   return buffer
 }
 
+/** 创建带 x86_64 ELF 头和 AppImage type-2 magic 的最小测试文件。 */
+function fakeAppImage(): Buffer {
+  const buffer = Buffer.alloc(512)
+  buffer.set([0x7f, 0x45, 0x4c, 0x46, 2, 1], 0)
+  buffer.set([0x41, 0x49, 2], 8)
+  buffer.writeUInt16LE(0x3e, 18)
+  return buffer
+}
+
 /** 为 artifact 静态验证创建完整的 Windows runtime closure。 */
 async function createWindowsClosure(nodeModulesRoot: string): Promise<void> {
   const target = runtimeTarget('win32', 'x64')
@@ -194,6 +203,23 @@ function processExists(pid: number): boolean {
 }
 
 describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TIMEOUT_MS }, () => {
+  it('accepts one x86_64 AppImage as the Linux release artifact', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-appimage-contract-'))
+    const artifactDirectory = path.join(root, 'src-tauri', 'target', 'release', 'bundle', 'appimage')
+    const artifact = path.join(artifactDirectory, 'DeepSeek Harness Desktop_1.1.1_amd64.AppImage')
+    try {
+      await mkdir(artifactDirectory, { recursive: true })
+      await writeFile(artifact, fakeAppImage())
+      await expect(verifyTauriArtifact('linux', {
+        projectRoot: root,
+        runtimeArch: 'x64',
+        containerInspector: async () => undefined
+      })).resolves.toBe(artifact)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('checks NSIS magic, application, official Node and the complete published CLI closure', async () => {
     const fixture = await createWindowsFixture()
     try {

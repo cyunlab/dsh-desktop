@@ -49,9 +49,24 @@ describe('native build workflow contract', () => {
     expect(workflow).toContain('patchelf')
   })
 
-  it('builds a Debian package without the unreliable linuxdeploy path', () => {
+  it('builds an AppImage in extraction mode for hosted runners', () => {
     expect(workflow).not.toContain('NO_STRIP')
-    expect(workflow).not.toContain('APPIMAGE_EXTRACT_AND_RUN')
+    expect(workflow).toContain('APPIMAGE_EXTRACT_AND_RUN: 1')
+  })
+
+  /** 确保所有原生构建都用生产 updater 密钥生成强制签名。 */
+  it('signs updater artifacts for every native target', () => {
+    expect(workflow).toMatch(/build:[\s\S]*runs-on: \$\{\{ matrix\.runner \}\}\n    environment: production/)
+    expect(workflow).not.toContain('id-token: write')
+    expect(workflow).toContain('TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}')
+    expect(workflow).toContain('TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}')
+    for (const updaterPath of [
+      'nsis/*.exe.sig',
+      'macos/*.app.tar.gz',
+      'macos/*.app.tar.gz.sig',
+      'appimage/*.AppImage',
+      'appimage/*.AppImage.sig'
+    ]) expect(workflow).toContain(`bundle/${updaterPath}`)
   })
 
   /** 确保两种 macOS 架构都绕过 Finder，并在封装 DMG 前递归签署原生资源。 */
@@ -89,7 +104,7 @@ describe('native build workflow contract', () => {
     ['windows-2025', 'win', 'x64', 'nsis/*.exe'],
     ['macos-15', 'mac', 'arm64', 'dmg/*.dmg'],
     ['macos-15-intel', 'mac', 'x64', 'dmg/*.dmg'],
-    ['ubuntu-22.04', 'linux', 'x64', 'deb/*.deb']
+    ['ubuntu-22.04', 'linux', 'x64', 'appimage/*.AppImage']
   ])('builds %s natively', (runner, platform, arch, artifactPath) => {
     expect(workflow).toContain(`runner: ${runner}`)
     expect(workflow).toContain(`platform: ${platform}`)
@@ -106,6 +121,7 @@ describe('native build workflow contract', () => {
     expect(workflow).toContain('fetch-depth: 0')
     expect(workflow).not.toMatch(/gh release (?:edit|create)[^\n]*--draft=false/)
     expect(workflow).not.toContain('gh release publish')
+    expect(workflow).not.toContain('promote-stable-release.mjs')
   })
 
   it('validates every tag candidate before allowing native builds', () => {
