@@ -1,0 +1,3 @@
+# Publish immutable updates through a shared OSS release bucket
+
+Desktop Update releases are published from `cn-shenzhen` without a CDN under the `dsh-desktop/` namespace of an OSS bucket dedicated to public release artifacts and capable of hosting future applications under separate top-level prefixes. `updates.cyunlab.com` provides the stable HTTPS download origin, immutable release packages are retained permanently, and only the channel manifest is overwritten with OSS Versioning enabled. Each application uses a distinct prefix-scoped RAM role, and the bucket must not contain private business data because public update downloads require anonymous read access to the release namespace.
