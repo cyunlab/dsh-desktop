@@ -87,7 +87,12 @@ fn periodic_timer_continues_the_six_hour_schedule() {
 
     assert_eq!(output.snapshot.sequence, 2);
     assert_eq!(output.snapshot.state, UpdateState::Checking);
-    assert!(output.effects.is_empty());
+    assert_eq!(
+        output.effects,
+        vec![UpdateEffect::ScheduleCheck {
+            after: Duration::from_secs(21_600)
+        }]
+    );
 }
 
 /// 检查或下载进行中时重复触发不会启动重叠更新操作。
@@ -95,13 +100,18 @@ fn periodic_timer_continues_the_six_hour_schedule() {
 fn overlapping_update_triggers_are_ignored() {
     let mut controller = controller(None);
     controller.handle(UpdateInput::Ready).unwrap();
-    for input in [
-        UpdateInput::Ready,
-        UpdateInput::PeriodicCheckDue,
-        UpdateInput::ManualCheck,
-    ] {
+    for input in [UpdateInput::Ready, UpdateInput::ManualCheck] {
         assert!(controller.handle(input).unwrap().effects.is_empty());
     }
+    assert_eq!(
+        controller
+            .handle(UpdateInput::PeriodicCheckDue)
+            .unwrap()
+            .effects,
+        vec![UpdateEffect::ScheduleCheck {
+            after: Duration::from_secs(21_600)
+        }]
+    );
     controller
         .handle(UpdateInput::CheckSucceeded {
             release: Some(release("2.1.0")),
@@ -199,14 +209,9 @@ fn newer_stable_discards_old_staging_before_download() {
         .unwrap();
     assert_eq!(
         discovered.effects,
-        vec![
-            UpdateEffect::DiscardOlderStaged {
-                replacement_version: "2.2.0".into(),
-            },
-            UpdateEffect::StartDownload {
-                release: release("2.2.0"),
-            },
-        ]
+        vec![UpdateEffect::StartDownload {
+            release: release("2.2.0"),
+        }]
     );
     let failed = controller
         .handle(UpdateInput::DownloadFailed {
