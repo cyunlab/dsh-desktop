@@ -7,9 +7,9 @@ use super::{
     CREATE_SUSPENDED_FLAG, SW_HIDE_VALUE,
 };
 use super::{
-    classify_exit, classify_exit_with_code, preflight_address, prepend_node_path,
-    resolve_dsh_cli_entry, spawn_owned_command, CliCommandPlan, ExitReason, SupervisorError,
-    HOST_ADDRESS,
+    build_command_plan, classify_exit, classify_exit_with_code, preflight_address,
+    prepend_node_path, resolve_dsh_cli_entry, spawn_owned_command, CliCommandPlan, ExitReason,
+    SupervisorError, HOST_ADDRESS,
 };
 use crate::lifecycle::StopOutcome;
 use std::ffi::{OsStr, OsString};
@@ -88,6 +88,16 @@ fn write_cli_fixture(root: &Path, declared_entry: &str) -> PathBuf {
     entry
 }
 
+/// 写入最小 Desktop composition patch 与 canonical Client entry。
+fn write_desktop_patch_fixture(root: &Path, patch: &str) -> PathBuf {
+    let package = root.join("@cyunlab/dsh-desktop-update-client");
+    fs::create_dir_all(package.join("lib")).unwrap();
+    let entry = package.join("lib/index.js");
+    fs::write(&entry, "export function apply() {}\n").unwrap();
+    fs::write(package.join("cordis.patch.yml"), patch).unwrap();
+    entry
+}
+
 /// 验证入口只由固定版本发布包的 `bin.dsh` 决定。
 #[test]
 fn resolves_manifest_declared_cli_entry() {
@@ -108,6 +118,96 @@ fn rejects_cli_entry_outside_published_package() {
     fs::write(root.join("outside.js"), "process.exit(0)\n").unwrap();
     assert!(resolve_dsh_cli_entry(&root).is_err());
     fs::remove_dir_all(root).unwrap();
+}
+
+/// 验证 LaunchPlan 使用 isolated Harness Home 内已物化且 URL 编码的 Desktop patch。
+#[test]
+fn materializes_desktop_patch_for_launch_plan() {
+    let root = temporary_directory("materialized patch with spaces");
+    write_cli_fixture(&root, "lib/bin.js");
+    let entry = write_desktop_patch_fixture(
+        &root,
+        "- insert:\n    - id: dsh-desktop-update-client\n      name: '@cyunlab/dsh-desktop-update-client'\n",
+    );
+    let harness_home = root.join("isolated-harness-home");
+    let plan = build_command_plan(
+        root.join("node/bin/node"),
+        &root,
+        harness_home.clone(),
+        root.join("working-directory"),
+    )
+    .unwrap();
+    assert!(plan
+        .desktop_patch
+        .starts_with(harness_home.canonicalize().unwrap()));
+    let expected_url = tauri::Url::from_file_path(entry.canonicalize().unwrap())
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        fs::read_to_string(&plan.desktop_patch).unwrap(),
+        format!("- insert:\n    - id: dsh-desktop-update-client\n      name: '{expected_url}'\n")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// 验证缺失或重复的精确 bare specifier 不会生成 LaunchPlan。
+#[test]
+fn rejects_missing_or_ambiguous_desktop_patch_specifier() {
+    let root = temporary_directory("invalid-patch");
+    write_cli_fixture(&root, "lib/bin.js");
+    let entry = write_desktop_patch_fixture(&root, "- insert: []\n");
+    let build = || {
+        build_command_plan(
+            root.join("node/bin/node"),
+            &root,
+            root.join("harness-home"),
+            root.join("working-directory"),
+        )
+    };
+    assert!(build().unwrap_err().contains("exactly one"));
+    fs::write(
+        entry.parent().unwrap().parent().unwrap().join("cordis.patch.yml"),
+        "- name: '@cyunlab/dsh-desktop-update-client'\n- name: '@cyunlab/dsh-desktop-update-client'\n",
+    )
+    .unwrap();
+    assert!(build().unwrap_err().contains("exactly one"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// 验证 canonical Client entry 或物化输出目录经过 symlink 时立即拒绝。
+#[cfg(unix)]
+#[test]
+fn rejects_symlinked_desktop_patch_assets_and_output() {
+    use std::os::unix::fs::symlink;
+
+    let root = temporary_directory("patch-symlink");
+    write_cli_fixture(&root, "lib/bin.js");
+    let entry =
+        write_desktop_patch_fixture(&root, "- name: '@cyunlab/dsh-desktop-update-client'\n");
+    let outside = temporary_directory("patch-outside").join("index.js");
+    fs::write(&outside, "export function apply() {}\n").unwrap();
+    fs::remove_file(&entry).unwrap();
+    symlink(&outside, &entry).unwrap();
+    let build = || {
+        build_command_plan(
+            root.join("node/bin/node"),
+            &root,
+            root.join("harness-home"),
+            root.join("working-directory"),
+        )
+    };
+    assert!(build().unwrap_err().contains("symbolic link"));
+    fs::remove_file(&entry).unwrap();
+    fs::write(&entry, "export function apply() {}\n").unwrap();
+    fs::create_dir_all(root.join("harness-home/.dsh-desktop")).unwrap();
+    symlink(
+        outside.parent().unwrap(),
+        root.join("harness-home/.dsh-desktop/runtime"),
+    )
+    .unwrap();
+    assert!(build().unwrap_err().contains("symbolic link"));
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside.parent().unwrap()).unwrap();
 }
 
 /// 验证命令使用官方 Node、发布入口、固定参数、隔离 Home 和独立 cwd。

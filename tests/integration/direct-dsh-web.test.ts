@@ -16,8 +16,9 @@ describe.skipIf(!existsSync(nodeExecutable)).sequential('published dsh web compo
     const outputRoot = await mkdtemp(path.join(tmpdir(), 'dsh-direct-web-integration-'))
     try {
       const nodeModulesRoot = await prepareRuntimeClosure({ projectRoot: root, outputRoot, target })
-      const result = await probeDirectDshWeb({ nodeExecutable, nodeModulesRoot, timeoutMilliseconds: 60_000 })
-      expect(result.command.args.slice(1)).toEqual(directDshWebArgs(nodeModulesRoot))
+      const workDirectory = outputRoot
+      const result = await probeDirectDshWeb({ nodeExecutable, nodeModulesRoot, workDirectory, timeoutMilliseconds: 60_000 })
+      expect(result.command.args.slice(1)).toEqual(directDshWebArgs(nodeModulesRoot, path.join(workDirectory, 'harness-home')))
       expect(result.command.executable).toBe(nodeExecutable)
       expect(result.html.trim()).not.toBe('')
     } finally {

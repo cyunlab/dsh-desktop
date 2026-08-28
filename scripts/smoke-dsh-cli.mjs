@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { arch, platform, tmpdir } from 'node:os'
 import path from 'node:path'
@@ -14,13 +15,84 @@ const DEFAULT_WINDOWS_CONTROLLER_START_TIMEOUT_MS = 60_000
 const MAX_WINDOWS_CONTROLLER_ERROR_BYTES = 4 * 1024
 const WINDOWS_JOB_CONTROLLER = path.join(root, 'scripts', 'windows-job-controller.ps1')
 export const FIXED_HOST_ORIGIN = 'http://127.0.0.1:3080/'
+const DESKTOP_UPDATE_PACKAGE = '@cyunlab/dsh-desktop-update-client'
+const DESKTOP_UPDATE_PATCH = path.join(DESKTOP_UPDATE_PACKAGE, 'cordis.patch.yml')
+const DESKTOP_UPDATE_ENTRY = path.join(DESKTOP_UPDATE_PACKAGE, 'lib', 'index.js')
+const MATERIALIZED_PATCH_DIRECTORY = path.join('.dsh-desktop', 'runtime')
+
+/** 解析 verified runtime closure 内不经过 symlink 的普通文件。 */
+function resolveClosureFile(nodeModulesRoot, relativePath, label) {
+  const closureRoot = realpathSync(nodeModulesRoot)
+  let cursor = closureRoot
+  for (const component of relativePath.split(/[\\/]+/)) {
+    cursor = path.join(cursor, component)
+    const metadata = lstatSync(cursor)
+    if (metadata.isSymbolicLink()) throw new Error(`${label} must not be a symbolic link`)
+  }
+  const resolved = realpathSync(cursor)
+  if (resolved !== closureRoot && !resolved.startsWith(closureRoot + path.sep)) throw new Error(`${label} escapes the runtime closure`)
+  if (!lstatSync(resolved).isFile()) throw new Error(`${label} must be a regular file`)
+  return resolved
+}
+
+/** 在 isolated Harness Home 中创建并验证 Desktop 私有物化目录。 */
+function resolveMaterializedPatchDirectory(harnessHome) {
+  if (existsSync(harnessHome) && lstatSync(harnessHome).isSymbolicLink()) throw new Error('Harness Home must not be a symbolic link')
+  mkdirSync(harnessHome, { recursive: true })
+  const home = realpathSync(harnessHome)
+  let cursor = home
+  for (const component of MATERIALIZED_PATCH_DIRECTORY.split(path.sep)) {
+    cursor = path.join(cursor, component)
+    if (existsSync(cursor)) {
+      const metadata = lstatSync(cursor)
+      if (metadata.isSymbolicLink()) throw new Error('Desktop materialized patch directory must not be a symbolic link')
+      if (!metadata.isDirectory()) throw new Error('Desktop materialized patch directory must be a directory')
+    } else mkdirSync(cursor, { mode: 0o700 })
+  }
+  const resolved = realpathSync(cursor)
+  if (!resolved.startsWith(home + path.sep)) throw new Error('Desktop materialized patch directory escapes Harness Home')
+  return resolved
+}
+
+/** 只替换 package-owned patch 中唯一精确的 Desktop Client bare specifier。 */
+function materializeDesktopUpdatePatch(nodeModulesRoot, harnessHome) {
+  const sourcePatch = resolveClosureFile(nodeModulesRoot, DESKTOP_UPDATE_PATCH, 'Desktop update patch')
+  const clientEntry = resolveClosureFile(nodeModulesRoot, DESKTOP_UPDATE_ENTRY, 'Desktop update client entry')
+  const source = readFileSync(sourcePatch, 'utf8')
+  const singleQuoted = `'${DESKTOP_UPDATE_PACKAGE}'`
+  const doubleQuoted = `"${DESKTOP_UPDATE_PACKAGE}"`
+  const occurrences = source.split(singleQuoted).length - 1 + source.split(doubleQuoted).length - 1
+  if (occurrences !== 1) {
+    throw new Error(`Desktop update patch must contain exactly one ${DESKTOP_UPDATE_PACKAGE} specifier`)
+  }
+  const outputDirectory = resolveMaterializedPatchDirectory(harnessHome)
+  const output = path.join(outputDirectory, 'cordis.patch.yml')
+  if (existsSync(output)) {
+    const metadata = lstatSync(output)
+    if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error('Desktop materialized patch output must be a regular file')
+    rmSync(output)
+  }
+  const temporary = path.join(outputDirectory, `.desktop-update-client.${process.pid}.${Date.now()}.tmp`)
+  const descriptor = openSync(temporary, 'wx', 0o600)
+  try {
+    const clientUrl = pathToFileURL(clientEntry).href
+    const materialized = source.includes(singleQuoted)
+      ? source.replace(singleQuoted, `'${clientUrl}'`)
+      : source.replace(doubleQuoted, `"${clientUrl}"`)
+    writeFileSync(descriptor, materialized, 'utf8')
+  } finally {
+    closeSync(descriptor)
+  }
+  renameSync(temporary, output)
+  return output
+}
 
 /** 构造带 Desktop 私有 composition patch 的正式 direct Web 参数。 */
-export function directDshWebArgs(nodeModulesRoot) {
+export function directDshWebArgs(nodeModulesRoot, harnessHome) {
   return Object.freeze([
     'web',
     '--patch',
-    path.join(nodeModulesRoot, '@cyunlab', 'dsh-desktop-update-client', 'cordis.patch.yml'),
+    materializeDesktopUpdatePatch(nodeModulesRoot, harnessHome),
     '--host', '127.0.0.1', '--port', '3080'
   ])
 }
@@ -463,7 +535,7 @@ export async function probeDirectDshWeb(options) {
     const command = await packagedDshCliCommand({
       nodeExecutable: options.nodeExecutable,
       nodeModulesRoot: options.nodeModulesRoot,
-      args: directDshWebArgs(options.nodeModulesRoot),
+      args: directDshWebArgs(options.nodeModulesRoot, environment.DSH_HOME),
       environment
     })
     const { child, ownership } = await spawnOwnedCli(command, workDirectory)

@@ -1,20 +1,68 @@
 import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { directDshWebArgs, formatWindowsControllerExitError, ownProcessTree, processTreeHasExited, readPositiveMilliseconds, stopCliProcess, terminateProcessTree, waitForListenerClosed, windowsJobControllerArguments } from '../../scripts/smoke-dsh-cli.mjs'
 
 describe('published dsh CLI smoke cleanup', () => {
-  /** Desktop patch 必须作为 web launcher 参数放在 Host 应用参数之前。 */
-  it('mounts the packaged Desktop patch through dsh web --patch', () => {
-    expect(directDshWebArgs('/desktop/dist/node_modules')).toEqual([
+  /** 创建包含 package-owned patch 与 canonical Client entry 的最小 runtime closure。 */
+  async function writeDesktopPatchFixture(root: string, patch = "- insert:\n    - id: dsh-desktop-update-client\n      name: '@cyunlab/dsh-desktop-update-client'\n") {
+    const packageRoot = path.join(root, '@cyunlab', 'dsh-desktop-update-client')
+    await mkdir(path.join(packageRoot, 'lib'), { recursive: true })
+    await writeFile(path.join(packageRoot, 'cordis.patch.yml'), patch)
+    await writeFile(path.join(packageRoot, 'lib', 'index.js'), 'export function apply() {}\n')
+    return packageRoot
+  }
+
+  /** Desktop patch 必须物化到隔离 Home，并把唯一 package specifier 改成 closure 内编码后的 file URL。 */
+  it('materializes the packaged Desktop patch through dsh web --patch', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-smoke-patch-root-'))
+    const harnessHome = await mkdtemp(path.join(tmpdir(), 'dsh-smoke-patch-home-'))
+    const packageRoot = await writeDesktopPatchFixture(path.join(root, 'runtime closure with 空格'))
+    const nodeModulesRoot = path.resolve(packageRoot, '..', '..')
+    const args = directDshWebArgs(nodeModulesRoot, harnessHome)
+    const materializedPatch = args[2]
+    expect(args).toEqual([
       'web',
       '--patch',
-      path.join('/desktop/dist/node_modules', '@cyunlab', 'dsh-desktop-update-client', 'cordis.patch.yml'),
+      materializedPatch,
       '--host', '127.0.0.1', '--port', '3080'
     ])
+    expect(materializedPatch.startsWith(await realpath(harnessHome) + path.sep)).toBe(true)
+    expect(await readFile(materializedPatch, 'utf8')).toBe(
+      `- insert:\n    - id: dsh-desktop-update-client\n      name: '${pathToFileURL(await realpath(path.join(packageRoot, 'lib', 'index.js'))).href}'\n`
+    )
   })
+
+  /** 不完整或包含多个目标 specifier 的 package patch 必须在启动前失败。 */
+  it('rejects missing and ambiguous Desktop patch specifiers', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-smoke-patch-invalid-'))
+    const harnessHome = await mkdtemp(path.join(tmpdir(), 'dsh-smoke-patch-home-'))
+    const packageRoot = await writeDesktopPatchFixture(root, '- insert: []\n')
+    expect(() => directDshWebArgs(path.resolve(packageRoot, '..', '..'), harnessHome)).toThrow('exactly one')
+    await writeFile(path.join(packageRoot, 'cordis.patch.yml'), "- name: '@cyunlab/dsh-desktop-update-client'\n- name: '@cyunlab/dsh-desktop-update-client'\n")
+    expect(() => directDshWebArgs(path.resolve(packageRoot, '..', '..'), harnessHome)).toThrow('exactly one')
+  })
+
+  /** package patch 或 Client entry 经 symlink 越出 verified closure 时必须失败。 */
+  it.skipIf(process.platform === 'win32')('rejects symlinked and escaping Desktop patch assets', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-smoke-patch-symlink-'))
+    const harnessHome = await mkdtemp(path.join(tmpdir(), 'dsh-smoke-patch-home-'))
+    const packageRoot = await writeDesktopPatchFixture(root)
+    const outside = path.join(await mkdtemp(path.join(tmpdir(), 'dsh-smoke-patch-outside-')), 'index.js')
+    await writeFile(outside, 'export function apply() {}\n')
+    await writeFile(path.join(packageRoot, 'lib', 'placeholder.js'), '')
+    await symlink(outside, path.join(packageRoot, 'lib', 'escaping.js'))
+    await writeFile(path.join(packageRoot, 'lib', 'index.js'), '')
+    await symlink(outside, path.join(packageRoot, 'lib', 'index-link.js'))
+    await rm(path.join(packageRoot, 'lib', 'index.js'))
+    await rename(path.join(packageRoot, 'lib', 'index-link.js'), path.join(packageRoot, 'lib', 'index.js'))
+    expect(() => directDshWebArgs(root, harnessHome)).toThrow(/symbolic link|escapes/)
+  })
+
   it('accepts a configurable Windows controller startup deadline', () => {
     expect(readPositiveMilliseconds(undefined, 60_000, 'TEST_TIMEOUT')).toBe(60_000)
     expect(readPositiveMilliseconds('90000', 60_000, 'TEST_TIMEOUT')).toBe(90_000)
