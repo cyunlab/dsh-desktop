@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cyunlab.com/schemas/dsh-desktop/update-smoke-evidence-v1.schema.json",
+  "title": "DSH Desktop native update smoke evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_kind",
+    "target",
+    "runner",
+    "candidate",
+    "baseline",
+    "previous_version",
+    "started_at",
+    "completed_at",
+    "platform",
+    "observations",
+    "checkpoints"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "evidence_kind": { "enum": ["real-native", "local-fixture", "source-rebuild"] },
+    "target": { "enum": ["windows-x86_64", "linux-x86_64", "darwin-aarch64", "darwin-x86_64"] },
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "arch"],
+      "properties": {
+        "os": { "enum": ["windows", "linux", "macos"] },
+        "arch": { "enum": ["x86_64", "aarch64"] }
+      }
+    },
+    "candidate": { "$ref": "#/$defs/candidate" },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag", "version", "commit", "provenance", "artifact_sha256", "signature_sha256", "stable_manifest_sha256", "artifact_url"],
+      "properties": {
+        "tag": { "$ref": "#/$defs/boundedString" },
+        "version": { "$ref": "#/$defs/boundedString" },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "provenance": { "enum": ["published-release", "source-rebuild", "local-fixture"] },
+        "artifact_sha256": { "$ref": "#/$defs/sha256" },
+        "signature_sha256": { "$ref": "#/$defs/sha256" },
+        "stable_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "artifact_url": { "type": "string", "format": "uri", "pattern": "^https://" }
+      }
+    },
+    "previous_version": { "$ref": "#/$defs/boundedString" },
+    "started_at": { "type": "string", "format": "date-time" },
+    "completed_at": { "type": "string", "format": "date-time" },
+    "platform": {
+      "type": "object",
+      "required": ["package_kind", "install_scope", "authenticode", "code_signing", "notarization"],
+      "properties": {
+        "package_kind": { "enum": ["nsis-exe", "appimage", "app-tar-gz"] },
+        "install_scope": { "enum": ["current-user", "user"] },
+        "authenticode": { "enum": ["not-required", "not-applicable"] },
+        "signing_credentials_configured": { "type": "boolean" },
+        "code_signing": { "enum": ["verified", "not-configured", "not-applicable"] },
+        "notarization": { "enum": ["verified", "not-configured", "not-applicable"] },
+        "install_registry_root": { "const": "HKCU" },
+        "install_location_class": { "const": "user-profile" },
+        "msi_present": { "const": false },
+        "replacement_path_same": { "const": true },
+        "executable_bit": { "const": true },
+        "digest_changed": { "const": true }
+      }
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "official_node",
+        "cli_runtime_closure",
+        "desktop_capabilities_package",
+        "desktop_update_client_package",
+        "composition_patch",
+        "trusted_updater_configuration"
+      ],
+      "properties": {
+        "official_node": { "const": true },
+        "cli_runtime_closure": { "const": true },
+        "desktop_capabilities_package": { "const": true },
+        "desktop_update_client_package": { "const": true },
+        "composition_patch": { "const": true },
+        "trusted_updater_configuration": { "const": true }
+      }
+    },
+    "checkpoints": {
+      "type": "array",
+      "minItems": 22,
+      "maxItems": 22,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status"],
+        "properties": {
+          "id": { "$ref": "#/$defs/checkpointId" },
+          "status": { "const": "passed" },
+          "details": { "$ref": "#/$defs/boundedString" }
+        }
+      }
+    },
+    "diagnostics": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^\\r\\n\\u0000]+$" }
+  },
+  "$defs": {
+    "boundedString": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\r\\n\\u0000]+$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag", "version", "commit", "manifest_sha256", "package_sha256", "signature_sha256"],
+      "properties": {
+        "tag": { "$ref": "#/$defs/boundedString" },
+        "version": { "$ref": "#/$defs/boundedString" },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "package_sha256": { "$ref": "#/$defs/sha256" },
+        "signature_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "checkpointId": {
+      "enum": [
+        "update.available",
+        "update.downloaded",
+        "update.staged",
+        "ui.user_opened",
+        "install.restart_requested",
+        "host.cleanup_confirmed_restart",
+        "install.restart_completed",
+        "app.relaunched",
+        "app.updated_origin_ready",
+        "install.normal_close_requested",
+        "host.cleanup_confirmed_normal_close",
+        "install.normal_close_completed",
+        "app.normal_close_no_relaunch",
+        "negative.bad_signature_blocked",
+        "negative.missing_signature_blocked",
+        "negative.missing_target_blocked",
+        "negative.unreachable_object_blocked",
+        "negative.tampered_staged_package_blocked",
+        "negative.failed_host_cleanup_blocked",
+        "setting.manual_check",
+        "setting.background_download_off",
+        "artifact.updater_signature_verified"
+      ]
+    }
+  }
+}

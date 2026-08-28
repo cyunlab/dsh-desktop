@@ -171,6 +171,32 @@ The current 2.0.15 Stable application was not built with the automatic updater. 
 
 Never manually edit Stable to point at a partly uploaded release. Never reuse a version path or overwrite an immutable package.
 
+## Native automatic-update smoke evidence
+
+Stable promotion must consume the versioned contract in `docs/update-smoke-evidence-v1.schema.json` through the public verifier `scripts/verify-update-smoke-evidence.mjs --require-real-native`. Exactly one document is required for Windows x64, Linux x64 AppImage, macOS arm64, and macOS x64. Every JSON file has a byte-exact `.sha256` companion. The checksum detects accidental or later byte changes; it is not by itself a signature. The reusable `.github/workflows/update-smoke.yml` additionally binds uploaded evidence to the trusted workflow identity with GitHub artifact attestations and retains the aggregate artifact for 30 days.
+
+The authoritative previous Stable is the version and target entry fetched from the configured OSS Stable `latest.json`, not GitHub's latest-release selection. Evidence binds that manifest digest, its exact immutable package URL, literal paired updater signature digest, package digest, previous tag/version, and the Git commit resolved for that tag. Candidate evidence independently binds the isolated manifest digest, tag, version, commit, package digest, and signature digest. Missing, duplicate, stale, failed, mismatched, oversized, or tampered evidence fails closed.
+
+`real-native` means a matching hosted runner installed the exact package selected by the OSS Stable manifest and obtained every checkpoint from repository-owned observation of the real process, filesystem, network, and application surfaces. A source rebuild with an isolated compile-time endpoint is useful development evidence but is labelled `source-rebuild`; fixture adapters are labelled `local-fixture`. Neither is accepted by `--require-real-native`.
+
+The required native observations include both update exit modes and all guard paths:
+
+- available → downloaded → staged → user-opened → explicit restart → confirmed Host cleanup → install → relaunch → candidate version and fixed Host origin ready;
+- normal operating-system close with a staged update → confirmed Host cleanup → install without automatic relaunch, followed by a separately observed manual launch;
+- bad and missing signatures, missing target, unreachable immutable object, tampered staged package, and failed Host cleanup all block installation;
+- manual check and background-download-off remain functional;
+- the installed candidate contains the Official Node executable, complete published CLI Runtime closure, both private Desktop packages, composition patch, and a working trusted updater configuration.
+
+Windows evidence additionally requires an NSIS EXE installed under the current user (`HKCU` and a user-profile location), no MSI, and no assumption that Authenticode exists. Linux requires executable AppImage replacement at the same path with a changed package digest. macOS requires a native-architecture application archive; when production Apple credentials are configured, the runner must observe strict code-signature verification, Gatekeeper assessment, and notarization/stapling rather than only reading workflow configuration.
+
+### Current bootstrap limitation
+
+The current previous Stable, `2.0.15`, predates the automatic updater. Its published binary therefore cannot discover an isolated candidate manifest or exercise either install path. The updater endpoint is also compiled into the binary. Rebuilding the `2.0.15` source with another endpoint would be `source-rebuild` evidence, not evidence for the published Stable artifact.
+
+The repository-owned native driver currently stops after verifying the real runner identity and reports this limitation. It does not emit evidence. This is an unimplemented internal test capability, not an external credential or runner configuration problem. Normal close can be automated through operating-system close plus process, staging, port, replacement, and manual-relaunch observations, but that observation code is not yet implemented in the production driver. The packaged explicit Restart action also has no durable native automation entry. Rust unit tests and debug-only WDIO hooks do not satisfy this production evidence contract.
+
+Before the first automatic-update release can pass the gate, maintainers must approve and implement a bootstrap strategy and a production-safe, repository-owned automation entry for the explicit Restart flow. That decision must receive its own review because it changes the trust/test surface. Do not add a first-release exception, temporarily point Stable at an unvalidated candidate, accept a source rebuild, or synthesize the missing checkpoint. Until a previously published updater-capable Stable exists and all four real runners emit valid evidence, Stable promotion must remain blocked.
+
 ## Failure handling and recovery
 
 ### Failure before the manifest write
@@ -207,6 +233,8 @@ Disable the `production` Environment or publishing role first. Revoke or tighten
 - [ ] Draft creation leaves Stable unchanged; every candidate, smoke, evidence, credential, or revalidation failure also leaves Stable unchanged.
 - [ ] A successful published-release smoke has passed on all four targets and its evidence is recorded.
 - [ ] A separately reviewed bootstrap policy has resolved the 2.0.15 no-updater predecessor blocker without fabricating real evidence.
+- [ ] The four evidence documents pass `verify-update-smoke-evidence.mjs --require-real-native`, and their GitHub artifact attestations verify against this repository and workflow run.
+- [ ] The evidence baseline is the exact OSS Stable manifest target, not a source rebuild, fixture, or GitHub latest-release guess.
 
 Until every checkbox is complete, production automatic updates remain not configured or not verified.
 
