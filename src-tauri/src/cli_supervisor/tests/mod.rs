@@ -40,6 +40,8 @@ use windows_sys::Win32::System::Threading::{
 
 #[cfg(unix)]
 static HELPER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+const TRUSTED_DESKTOP_PATCH_FIXTURE: &str =
+    include_str!("../../../../tests/fixtures/desktop-update-client.patch.yml");
 
 #[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP_FLAG: u32 = 0x0000_0200;
@@ -125,10 +127,7 @@ fn rejects_cli_entry_outside_published_package() {
 fn materializes_desktop_patch_for_launch_plan() {
     let root = temporary_directory("materialized patch with spaces");
     write_cli_fixture(&root, "lib/bin.js");
-    let entry = write_desktop_patch_fixture(
-        &root,
-        "- insert:\n    - id: dsh-desktop-update-client\n      name: '@cyunlab/dsh-desktop-update-client'\n",
-    );
+    let entry = write_desktop_patch_fixture(&root, TRUSTED_DESKTOP_PATCH_FIXTURE);
     let harness_home = root.join("isolated-harness-home");
     let plan = build_command_plan(
         root.join("node/bin/node"),
@@ -150,7 +149,7 @@ fn materializes_desktop_patch_for_launch_plan() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// 验证缺失或重复的精确 bare specifier 不会生成 LaunchPlan。
+/// 验证任何偏离共享可信 composition contract 的 patch 不会生成 LaunchPlan。
 #[test]
 fn rejects_missing_or_ambiguous_desktop_patch_specifier() {
     let root = temporary_directory("invalid-patch");
@@ -164,13 +163,30 @@ fn rejects_missing_or_ambiguous_desktop_patch_specifier() {
             root.join("working-directory"),
         )
     };
-    assert!(build().unwrap_err().contains("exactly one"));
+    assert!(build()
+        .unwrap_err()
+        .contains("trusted package-owned composition contract"));
     fs::write(
         entry.parent().unwrap().parent().unwrap().join("cordis.patch.yml"),
         "- name: '@cyunlab/dsh-desktop-update-client'\n- name: '@cyunlab/dsh-desktop-update-client'\n",
     )
     .unwrap();
-    assert!(build().unwrap_err().contains("exactly one"));
+    assert!(build()
+        .unwrap_err()
+        .contains("trusted package-owned composition contract"));
+    fs::write(
+        entry
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("cordis.patch.yml"),
+        "- remove:\n    - name: '@cyunlab/dsh-desktop-update-client'\n",
+    )
+    .unwrap();
+    assert!(build()
+        .unwrap_err()
+        .contains("trusted package-owned composition contract"));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -182,8 +198,7 @@ fn rejects_symlinked_desktop_patch_assets_and_output() {
 
     let root = temporary_directory("patch-symlink");
     write_cli_fixture(&root, "lib/bin.js");
-    let entry =
-        write_desktop_patch_fixture(&root, "- name: '@cyunlab/dsh-desktop-update-client'\n");
+    let entry = write_desktop_patch_fixture(&root, TRUSTED_DESKTOP_PATCH_FIXTURE);
     let outside = temporary_directory("patch-outside").join("index.js");
     fs::write(&outside, "export function apply() {}\n").unwrap();
     fs::remove_file(&entry).unwrap();

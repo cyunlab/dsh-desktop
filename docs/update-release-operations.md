@@ -27,7 +27,7 @@ Do not put private business data in this bucket. It is a shared public-release b
 
 ## Required GitHub Environment configuration
 
-Create an Environment named exactly `production`. Configure required reviewers or other deployment protection appropriate to the organization. Build matrix jobs may reference `production` only to read updater signing material and embed the trusted Stable endpoint/public key. Exactly two OSS jobs are granted `permissions: id-token: write`: `prepare-candidate` may write only content-addressed immutable objects and the isolated candidate manifest, while `promote-stable` runs only after aggregate evidence admission and may replace the Stable pointer. Build, native smoke, and aggregate evidence jobs must not consume OIDC provider/role variables, request an ID token, or receive Alibaba Cloud credentials.
+Create an Environment named exactly `production`. Configure required reviewers or other deployment protection appropriate to the organization. Build matrix jobs may reference `production` only to read updater signing material and embed the trusted Stable endpoint/public key. Exactly two OSS jobs consume Alibaba Cloud OIDC provider/role variables: `prepare-candidate` may write only content-addressed immutable objects and the isolated candidate manifest, while `promote-stable` runs only after aggregate evidence admission and may replace the Stable pointer. Native smoke jobs receive no ID token. The aggregate evidence job may request a GitHub OIDC token only to attest the already verified evidence set; it must not consume Alibaba Cloud OIDC variables or receive Alibaba Cloud credentials.
 
 Set these Environment variables exactly as shown:
 

@@ -19,6 +19,7 @@ const DESKTOP_UPDATE_PACKAGE = '@cyunlab/dsh-desktop-update-client'
 const DESKTOP_UPDATE_PATCH = path.join(DESKTOP_UPDATE_PACKAGE, 'cordis.patch.yml')
 const DESKTOP_UPDATE_ENTRY = path.join(DESKTOP_UPDATE_PACKAGE, 'lib', 'index.js')
 const MATERIALIZED_PATCH_DIRECTORY = path.join('.dsh-desktop', 'runtime')
+const EXPECTED_DESKTOP_UPDATE_PATCH = "- insert:\n    - id: dsh-desktop-update-client\n      name: '@cyunlab/dsh-desktop-update-client'\n"
 
 /** 解析 verified runtime closure 内不经过 symlink 的普通文件。 */
 function resolveClosureFile(nodeModulesRoot, relativePath, label) {
@@ -59,11 +60,8 @@ function materializeDesktopUpdatePatch(nodeModulesRoot, harnessHome) {
   const sourcePatch = resolveClosureFile(nodeModulesRoot, DESKTOP_UPDATE_PATCH, 'Desktop update patch')
   const clientEntry = resolveClosureFile(nodeModulesRoot, DESKTOP_UPDATE_ENTRY, 'Desktop update client entry')
   const source = readFileSync(sourcePatch, 'utf8')
-  const singleQuoted = `'${DESKTOP_UPDATE_PACKAGE}'`
-  const doubleQuoted = `"${DESKTOP_UPDATE_PACKAGE}"`
-  const occurrences = source.split(singleQuoted).length - 1 + source.split(doubleQuoted).length - 1
-  if (occurrences !== 1) {
-    throw new Error(`Desktop update patch must contain exactly one ${DESKTOP_UPDATE_PACKAGE} specifier`)
+  if (source !== EXPECTED_DESKTOP_UPDATE_PATCH) {
+    throw new Error('Desktop update patch must match the trusted package-owned composition contract')
   }
   const outputDirectory = resolveMaterializedPatchDirectory(harnessHome)
   const output = path.join(outputDirectory, 'cordis.patch.yml')
@@ -76,9 +74,7 @@ function materializeDesktopUpdatePatch(nodeModulesRoot, harnessHome) {
   const descriptor = openSync(temporary, 'wx', 0o600)
   try {
     const clientUrl = pathToFileURL(clientEntry).href
-    const materialized = source.includes(singleQuoted)
-      ? source.replace(singleQuoted, `'${clientUrl}'`)
-      : source.replace(doubleQuoted, `"${clientUrl}"`)
+    const materialized = source.replace(`'${DESKTOP_UPDATE_PACKAGE}'`, `'${clientUrl}'`)
     writeFileSync(descriptor, materialized, 'utf8')
   } finally {
     closeSync(descriptor)

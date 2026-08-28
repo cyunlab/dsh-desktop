@@ -1,5 +1,6 @@
 import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -7,9 +8,11 @@ import { pathToFileURL } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { directDshWebArgs, formatWindowsControllerExitError, ownProcessTree, processTreeHasExited, readPositiveMilliseconds, stopCliProcess, terminateProcessTree, waitForListenerClosed, windowsJobControllerArguments } from '../../scripts/smoke-dsh-cli.mjs'
 
+const trustedDesktopPatch = readFileSync(new URL('../fixtures/desktop-update-client.patch.yml', import.meta.url), 'utf8')
+
 describe('published dsh CLI smoke cleanup', () => {
   /** 创建包含 package-owned patch 与 canonical Client entry 的最小 runtime closure。 */
-  async function writeDesktopPatchFixture(root: string, patch = "- insert:\n    - id: dsh-desktop-update-client\n      name: '@cyunlab/dsh-desktop-update-client'\n") {
+  async function writeDesktopPatchFixture(root: string, patch = trustedDesktopPatch) {
     const packageRoot = path.join(root, '@cyunlab', 'dsh-desktop-update-client')
     await mkdir(path.join(packageRoot, 'lib'), { recursive: true })
     await writeFile(path.join(packageRoot, 'cordis.patch.yml'), patch)
@@ -37,14 +40,16 @@ describe('published dsh CLI smoke cleanup', () => {
     )
   })
 
-  /** 不完整或包含多个目标 specifier 的 package patch 必须在启动前失败。 */
-  it('rejects missing and ambiguous Desktop patch specifiers', async () => {
+  /** 任何偏离共享可信 composition contract 的 patch 必须在启动前失败。 */
+  it('rejects missing, ambiguous, and structurally unexpected Desktop patches', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'dsh-smoke-patch-invalid-'))
     const harnessHome = await mkdtemp(path.join(tmpdir(), 'dsh-smoke-patch-home-'))
     const packageRoot = await writeDesktopPatchFixture(root, '- insert: []\n')
-    expect(() => directDshWebArgs(path.resolve(packageRoot, '..', '..'), harnessHome)).toThrow('exactly one')
+    expect(() => directDshWebArgs(path.resolve(packageRoot, '..', '..'), harnessHome)).toThrow('trusted package-owned composition contract')
     await writeFile(path.join(packageRoot, 'cordis.patch.yml'), "- name: '@cyunlab/dsh-desktop-update-client'\n- name: '@cyunlab/dsh-desktop-update-client'\n")
-    expect(() => directDshWebArgs(path.resolve(packageRoot, '..', '..'), harnessHome)).toThrow('exactly one')
+    expect(() => directDshWebArgs(path.resolve(packageRoot, '..', '..'), harnessHome)).toThrow('trusted package-owned composition contract')
+    await writeFile(path.join(packageRoot, 'cordis.patch.yml'), "- remove:\n    - name: '@cyunlab/dsh-desktop-update-client'\n")
+    expect(() => directDshWebArgs(path.resolve(packageRoot, '..', '..'), harnessHome)).toThrow('trusted package-owned composition contract')
   })
 
   /** package patch 或 Client entry 经 symlink 越出 verified closure 时必须失败。 */

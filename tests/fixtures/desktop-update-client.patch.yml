@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-desktop-update-client
+      name: '@cyunlab/dsh-desktop-update-client'

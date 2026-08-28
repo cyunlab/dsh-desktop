@@ -71,7 +71,10 @@ describe('native update smoke reusable workflow contract', () => {
     expect(workflow).toContain('id-token: write')
     expect(workflow).toMatch(/uses: actions\/attest-build-provenance@[0-9a-f]{40} # v\d+\.\d+\.\d+/)
     expect(workflow).toContain('retention-days: 30')
-    expect(workflow).toContain('gh attestation verify smoke-evidence/* --repo "$GITHUB_REPOSITORY"')
+    expect(workflow).not.toContain('Verify target evidence attestations')
+    const nativeJob = workflow.match(/  native-smoke:[\s\S]*?  aggregate:/)?.[0] ?? ''
+    expect(nativeJob).not.toContain('id-token: write')
+    expect(nativeJob).not.toContain('attestations: write')
     expect(workflow).toContain('update-smoke-evidence-${{ inputs.candidate_tag }}-${{ inputs.candidate_commit }}-${{ matrix.target }}')
   })
 })
