@@ -1,4 +1,5 @@
 pub mod staging;
+pub mod tauri_adapter;
 
 use semver::Version;
 use serde::Serialize;
@@ -132,6 +133,7 @@ pub enum UpdateEffect {
 /// 公开 Controller 接收的可信结果与窄化用户意图。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateInput {
+    RecoverStaged { version: String },
     Ready,
     PeriodicCheckDue,
     ManualCheck,
@@ -165,6 +167,7 @@ pub struct UpdateController<C, P> {
     preferences: P,
     current_version: Version,
     current_release: Option<StableRelease>,
+    staged_version: Option<Version>,
     ready: bool,
     snapshot: UpdateSnapshot,
     pending_retry: Option<PendingRetry>,
@@ -181,6 +184,7 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
             preferences,
             current_version,
             current_release: None,
+            staged_version: None,
             ready: false,
             snapshot: UpdateSnapshot {
                 sequence: 0,
@@ -201,6 +205,21 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
     pub fn handle(&mut self, input: UpdateInput) -> Result<UpdateOutput, UpdateDomainError> {
         let mut effects = Vec::new();
         match input {
+            UpdateInput::RecoverStaged { version } => {
+                let candidate = Version::parse(&version)
+                    .map_err(|_| UpdateDomainError::InvalidReleaseVersion(version.clone()))?;
+                if candidate > self.current_version {
+                    self.staged_version = Some(candidate);
+                    self.current_release = Some(StableRelease {
+                        version: version.clone(),
+                        release_notes: String::new(),
+                    });
+                    self.snapshot.state = UpdateState::Staged {
+                        version,
+                        release_notes: String::new(),
+                    };
+                }
+            }
             UpdateInput::Ready => {
                 self.ready = true;
                 self.start_check(true, &mut effects);
@@ -270,6 +289,22 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
             self.snapshot.state = UpdateState::UpToDate;
             return Ok(());
         }
+        if self
+            .staged_version
+            .as_ref()
+            .is_some_and(|staged| candidate <= *staged)
+        {
+            let version = self
+                .staged_version
+                .as_ref()
+                .expect("checked above")
+                .to_string();
+            self.snapshot.state = UpdateState::Staged {
+                version,
+                release_notes: String::new(),
+            };
+            return Ok(());
+        }
         self.snapshot.state = UpdateState::Available {
             version: release.version.clone(),
             release_notes: release.release_notes.clone(),
@@ -309,6 +344,7 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
     fn finish_download(&mut self) {
         self.pending_retry = None;
         if let Some(release) = &self.current_release {
+            self.staged_version = Version::parse(&release.version).ok();
             self.snapshot.state = UpdateState::Staged {
                 version: release.version.clone(),
                 release_notes: release.release_notes.clone(),
@@ -343,11 +379,18 @@ impl<C: Clock, P: PreferenceStore> UpdateController<C, P> {
             operation,
             automatic_retries: retries,
         });
-        self.snapshot.state = UpdateState::Failed {
-            operation,
-            retryable,
-            message,
-        };
+        if let Some(version) = &self.staged_version {
+            self.snapshot.state = UpdateState::Staged {
+                version: version.to_string(),
+                release_notes: String::new(),
+            };
+        } else {
+            self.snapshot.state = UpdateState::Failed {
+                operation,
+                retryable,
+                message,
+            };
+        }
     }
 
     /// 在计时器到期时只重放领域已记录的操作，不接受外部资源参数。
@@ -375,6 +418,6 @@ fn retry_delay(automatic_retry: u8) -> Duration {
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod staging_tests;
+#[cfg(test)]
+mod tests;
