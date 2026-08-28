@@ -42,6 +42,11 @@ function createStorage(): PromotionStorage & {
     /** 记录上传边界的可观察输入。 */
     async ensureObject(key, body, metadata) {
       events.push(`ensure:${key}`)
+      const existing = writes.find(write => write.key === key)
+      if (existing) {
+        if (!existing.body.equals(body)) throw new Error(`immutable object changed: ${key}`)
+        return 'reused' as const
+      }
       writes.push({ key, body, cacheControl: metadata.cacheControl })
       return 'uploaded' as const
     },
@@ -84,25 +89,26 @@ describe('Stable update promotion', () => {
         pub_date: '2026-08-28T02:30:00Z',
         platforms: {
           'windows-x86_64': {
-            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/windows-x86_64/desktop.nsis.zip',
+            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/windows-x86_64/0076b8231ad26d88f1d9f50c85e31f34d1669c6ccf4ca4b1570cb7f9cb794c30-desktop.nsis.zip',
             signature: 'literal-windows-x86_64-signature\n'
           },
           'linux-x86_64': {
-            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/linux-x86_64/desktop.AppImage.tar.gz',
+            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/linux-x86_64/b673dbc691888ed591d1e8d7b9ca2071b6d94a03129debd13d0c24c73f8e76ae-desktop.AppImage.tar.gz',
             signature: 'literal-linux-x86_64-signature\n'
           },
           'darwin-aarch64': {
-            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/darwin-aarch64/desktop-aarch64.app.tar.gz',
+            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/darwin-aarch64/eb6dff2c53b529b402a85d26fb9c264e1102bbd41d32ed203c4c314a4acb4f83-desktop-aarch64.app.tar.gz',
             signature: 'literal-darwin-aarch64-signature\n'
           },
           'darwin-x86_64': {
-            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/darwin-x86_64/desktop-x86_64.app.tar.gz',
+            url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/darwin-x86_64/c838dd59aa087703d0fa3223e8fed37c49546d15caca947411264d6f0b154327-desktop-x86_64.app.tar.gz',
             signature: 'literal-darwin-x86_64-signature\n'
           }
         }
       })
       expect(storage.writes).toHaveLength(9)
       expect(storage.writes.slice(0, 8).every(write => write.cacheControl === 'public, max-age=31536000, immutable')).toBe(true)
+      expect(storage.writes[1].key).toBe('dsh-desktop/releases/2.1.0/windows-x86_64/6db7805715b93f0d6e447c59cb476199f37623ed8c49664de1c9045ba338316a-desktop.nsis.zip.sig')
       expect(storage.writes.at(-1)).toMatchObject({
         key: 'dsh-desktop/channels/stable/latest.json',
         cacheControl: 'no-cache'
@@ -110,6 +116,40 @@ describe('Stable update promotion', () => {
       expect(JSON.parse(storage.writes.at(-1)!.body.toString('utf8'))).toEqual(manifest)
       expect(storage.events.at(-1)).toBe('replace:dsh-desktop/channels/stable/latest.json')
       expect(storage.events.slice(8, 16).every(event => event.startsWith('read:'))).toBe(true)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  /** 验证同一 semver 的不同字节使用新 key，旧 immutable 对象不会被覆盖。 */
+  it('uses different content-addressed keys for changed package and signature bytes', async () => {
+    const directory = await createReleaseDirectory()
+    const storage = createStorage()
+    try {
+      const first = await promoteFixture({
+        tag: 'v2.1.0',
+        releaseBody: 'First publication',
+        publishedAt: '2026-08-28T02:30:00Z',
+        artifactsDirectory: directory,
+        downloadOrigin: 'https://updates.cyunlab.com',
+        prefix: 'dsh-desktop'
+      }, storage)
+      await writeFile(path.join(directory, 'windows-x86_64', 'desktop.nsis.zip'), 'changed-package')
+      await writeFile(path.join(directory, 'windows-x86_64', 'desktop.nsis.zip.sig'), 'changed-signature\n')
+      const second = await promoteFixture({
+        tag: 'v2.1.0',
+        releaseBody: 'Corrected publication',
+        publishedAt: '2026-08-28T03:30:00Z',
+        artifactsDirectory: directory,
+        downloadOrigin: 'https://updates.cyunlab.com',
+        prefix: 'dsh-desktop'
+      }, storage)
+
+      expect(second.platforms['windows-x86_64'].url).not.toBe(first.platforms['windows-x86_64'].url)
+      const windowsObjects = storage.writes.filter(write => write.key.includes('/windows-x86_64/'))
+      expect(windowsObjects).toHaveLength(4)
+      expect(new Set(windowsObjects.map(write => write.key)).size).toBe(4)
+      expect(storage.events.at(-1)).toBe('replace:dsh-desktop/channels/stable/latest.json')
     } finally {
       await rm(directory, { recursive: true, force: true })
     }

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -10,6 +11,11 @@ const TARGETS = Object.freeze([
   'darwin-aarch64',
   'darwin-x86_64'
 ])
+
+/** 以对象内容 SHA-256 为 canonical 文件名增加不可变地址前缀。 */
+function contentAddressedName(filename, body) {
+  return `${createHash('sha256').update(body).digest('hex')}-${filename}`
+}
 
 /** 将 GitHub Release tag 解析为 Stable channel 使用的语义版本。 */
 function releaseVersion(tag) {
@@ -259,10 +265,12 @@ export async function promoteStableRelease(options, storage, dependencies = {}) 
   for (const target of TARGETS) {
     const artifact = await readTargetArtifact(options.artifactsDirectory, target)
     artifacts.push(artifact)
-    const key = `${prefix}/releases/${version}/${target}/${artifact.filename}`
+    const releasePrefix = `${prefix}/releases/${version}/${target}`
+    const key = `${releasePrefix}/${contentAddressedName(artifact.filename, artifact.body)}`
+    const signatureKey = `${releasePrefix}/${contentAddressedName(`${artifact.filename}.sig`, artifact.signatureBody)}`
     objects.push(
       { key, body: artifact.body, contentType: 'application/octet-stream' },
-      { key: `${key}.sig`, body: artifact.signatureBody, contentType: 'text/plain; charset=utf-8' }
+      { key: signatureKey, body: artifact.signatureBody, contentType: 'text/plain; charset=utf-8' }
     )
     platforms[target] = {
       url: new URL(key, `${origin.href.replace(/\/$/, '')}/`).href,
