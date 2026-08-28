@@ -4,6 +4,7 @@
 compile_error!("the wdio feature is test-only and cannot be enabled in release builds");
 
 mod cli_supervisor;
+mod desktop_capabilities;
 mod lifecycle;
 
 use cli_supervisor::{
