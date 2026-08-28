@@ -227,7 +227,8 @@ impl<V: UpdateVerifier> StagingRepository<V> {
                 target: candidate.target,
                 install_kind: candidate.install_kind,
             };
-            atomic_replace(&package_temp, &self.root.join(PACKAGE_FILE))?;
+            atomic_replace_file(&package_temp, &self.root.join(PACKAGE_FILE))
+                .map_err(|_| StagingError::StorageFailed)?;
             sync_directory(&self.root)?;
             write_metadata(&self.root, &metadata)?;
             Ok(metadata)
@@ -369,14 +370,14 @@ fn write_metadata(root: &Path, metadata: &StoredMetadata) -> Result<(), StagingE
     file.write_all(&bytes)
         .and_then(|_| file.sync_all())
         .map_err(|_| StagingError::StorageFailed)?;
-    atomic_replace(&temporary, &destination)?;
+    atomic_replace_file(&temporary, &destination).map_err(|_| StagingError::StorageFailed)?;
     sync_directory(root)
 }
 
 /// 在支持的平台上以覆盖语义原子替换同一目录中的目标文件。
 #[cfg(not(windows))]
-fn atomic_replace(source: &Path, destination: &Path) -> Result<(), StagingError> {
-    fs::rename(source, destination).map_err(|_| StagingError::StorageFailed)
+pub(crate) fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
 }
 
 /// 在 Unix 上同步目录项，确保原子晋级在崩溃恢复后仍然可见。
@@ -395,7 +396,7 @@ fn sync_directory(_directory: &Path) -> Result<(), StagingError> {
 
 /// 在 Windows 上使用系统覆盖语义原子替换同一卷中的目标文件。
 #[cfg(windows)]
-fn atomic_replace(source: &Path, destination: &Path) -> Result<(), StagingError> {
+pub(crate) fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -415,7 +416,7 @@ fn atomic_replace(source: &Path, destination: &Path) -> Result<(), StagingError>
         )
     };
     if moved == 0 {
-        Err(StagingError::StorageFailed)
+        Err(io::Error::last_os_error())
     } else {
         Ok(())
     }
