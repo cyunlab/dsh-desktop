@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -262,10 +262,25 @@ describe('Stable update promotion', () => {
     })).rejects.toThrow('short-lived Alibaba Cloud STS credentials are required')
   })
 
-  it('uses a no-shell ossutil boundary and compares downloaded remote bytes', async () => {
-    const calls: Array<{ args: string[]; env: NodeJS.ProcessEnv; input?: Buffer }> = []
-    const runOssutil = async (args: string[], options: { env: NodeJS.ProcessEnv; input?: Buffer }): Promise<OssutilResult> => {
-      calls.push({ args, env: options.env, input: options.input })
+  it('uses a short-lived v1 ossutil config without exposing credentials in arguments or environment', async () => {
+    const calls: Array<{ args: string[]; env: NodeJS.ProcessEnv; configFile: string; config: string; directoryMode: number; fileMode: number }> = []
+    /** 读取调用时仍存在的临时配置及其权限。 */
+    const runOssutil = async (args: string[], options: { env: NodeJS.ProcessEnv }): Promise<OssutilResult> => {
+      const configIndex = args.indexOf('--config-file')
+      const configFile = args[configIndex + 1]
+      const [config, directoryInformation, fileInformation] = await Promise.all([
+        readFile(configFile, 'utf8'),
+        stat(path.dirname(configFile)),
+        stat(configFile)
+      ])
+      calls.push({
+        args,
+        env: options.env,
+        configFile,
+        config,
+        directoryMode: directoryInformation.mode & 0o777,
+        fileMode: fileInformation.mode & 0o777
+      })
       return { stdout: args[0] === 'cat' ? Buffer.from('package bytes') : Buffer.alloc(0), stderr: '' }
     }
     const storage = createOssutilStorage({
@@ -292,15 +307,22 @@ describe('Stable update promotion', () => {
     expect(calls[1].args).toEqual([
       'cat',
       'oss://cyunlab-public-releases/dsh-desktop/releases/2.1.0/linux-x86_64/package',
-      '--region',
-      'cn-shenzhen'
+      '--config-file',
+      calls[1].configFile
     ])
-    expect(calls[0].env).toMatchObject({
-      OSS_ACCESS_KEY_ID: 'temporary-id',
-      OSS_ACCESS_KEY_SECRET: 'temporary-secret',
-      OSS_SESSION_TOKEN: 'temporary-token'
-    })
-    expect(calls[0].env).not.toHaveProperty('GITHUB_TOKEN')
+    expect(calls[0].config).toBe([
+      '[Credentials]',
+      'endpoint=oss-cn-shenzhen.aliyuncs.com',
+      'accessKeyID=temporary-id',
+      'accessKeySecret=temporary-secret',
+      'stsToken=temporary-token',
+      ''
+    ].join('\n'))
+    expect(calls.every(call => call.directoryMode === 0o700 && call.fileMode === 0o600)).toBe(true)
+    expect(calls.every(call => !JSON.stringify(call.args).includes('temporary-'))).toBe(true)
+    expect(calls.every(call => !JSON.stringify(call.env).includes('temporary-'))).toBe(true)
+    expect(new Set(calls.map(call => call.configFile)).size).toBe(2)
+    for (const call of calls) await expect(stat(call.configFile)).rejects.toThrow()
     await expect(storage.putObject('another-app/releases/2.1.0/package', Buffer.from('wrong scope'), {
       cacheControl: 'no-cache'
     })).rejects.toThrow('outside the configured application prefix')
