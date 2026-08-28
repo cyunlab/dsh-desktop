@@ -38,6 +38,8 @@ export interface UpdateSmokeExpectations {
   readonly version: string
   readonly commit: string
   readonly manifest_sha256: string
+  readonly baselineTag?: string
+  readonly baseline_manifest_sha256?: string
   readonly maxAgeHours: number
   readonly requireRealNative?: boolean
   readonly now?: Date

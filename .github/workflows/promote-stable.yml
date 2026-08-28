@@ -25,6 +25,8 @@ jobs:
       manifest_url: ${{ steps.candidate.outputs.manifest_url }}
       manifest_sha256: ${{ steps.candidate.outputs.manifest_sha256 }}
       previous_stable_tag: ${{ steps.candidate.outputs.previous_stable_tag }}
+      previous_stable_url: ${{ steps.candidate.outputs.previous_stable_url }}
+      previous_stable_manifest_sha256: ${{ steps.candidate.outputs.previous_stable_manifest_sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -118,7 +120,7 @@ jobs:
             --prefix dsh-desktop --output candidate.json
           node -e '
             const candidate = require("./candidate.json");
-            for (const key of ["candidate_tag", "candidate_commit", "manifest_url", "manifest_sha256", "previous_stable_tag"])
+            for (const key of ["candidate_tag", "candidate_commit", "manifest_url", "manifest_sha256", "previous_stable_tag", "previous_stable_url", "previous_stable_manifest_sha256"])
               process.stdout.write(`${key}=${candidate[key]}\n`)
           ' >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -140,6 +142,8 @@ jobs:
       manifest_url: ${{ needs.prepare-candidate.outputs.manifest_url }}
       manifest_sha256: ${{ needs.prepare-candidate.outputs.manifest_sha256 }}
       previous_stable_tag: ${{ needs.prepare-candidate.outputs.previous_stable_tag }}
+      stable_manifest_url: ${{ needs.prepare-candidate.outputs.previous_stable_url }}
+      previous_stable_manifest_sha256: ${{ needs.prepare-candidate.outputs.previous_stable_manifest_sha256 }}
       artifact_name_prefix: dsh-desktop
       signing_configured: true
 
@@ -167,6 +171,8 @@ jobs:
           --candidate-tag "${{ needs.prepare-candidate.outputs.candidate_tag }}"
           --candidate-commit "${{ needs.prepare-candidate.outputs.candidate_commit }}"
           --manifest-sha256 "${{ needs.prepare-candidate.outputs.manifest_sha256 }}"
+          --baseline-tag "${{ needs.prepare-candidate.outputs.previous_stable_tag }}"
+          --baseline-manifest-sha256 "${{ needs.prepare-candidate.outputs.previous_stable_manifest_sha256 }}"
           --max-age-hours 24 --require-real-native
 
   promote-stable:
@@ -199,6 +205,8 @@ jobs:
           CANDIDATE_TAG: ${{ needs.prepare-candidate.outputs.candidate_tag }}
           CANDIDATE_COMMIT: ${{ needs.prepare-candidate.outputs.candidate_commit }}
           MANIFEST_SHA256: ${{ needs.prepare-candidate.outputs.manifest_sha256 }}
+          PREVIOUS_STABLE_TAG: ${{ needs.prepare-candidate.outputs.previous_stable_tag }}
+          PREVIOUS_STABLE_MANIFEST_SHA256: ${{ needs.prepare-candidate.outputs.previous_stable_manifest_sha256 }}
         run: |
           set -euo pipefail
           node -e '
@@ -214,7 +222,10 @@ jobs:
           '
           node scripts/verify-update-smoke-evidence.mjs --evidence evidence \
             --candidate-tag "$CANDIDATE_TAG" --candidate-commit "$CANDIDATE_COMMIT" \
-            --manifest-sha256 "$MANIFEST_SHA256" --max-age-hours 24 --require-real-native
+            --manifest-sha256 "$MANIFEST_SHA256" \
+            --baseline-tag "$PREVIOUS_STABLE_TAG" \
+            --baseline-manifest-sha256 "$PREVIOUS_STABLE_MANIFEST_SHA256" \
+            --max-age-hours 24 --require-real-native
       - name: Install checksum-verified ossutil
         shell: bash
         run: |
