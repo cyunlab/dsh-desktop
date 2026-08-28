@@ -14,7 +14,16 @@ const DEFAULT_WINDOWS_CONTROLLER_START_TIMEOUT_MS = 60_000
 const MAX_WINDOWS_CONTROLLER_ERROR_BYTES = 4 * 1024
 const WINDOWS_JOB_CONTROLLER = path.join(root, 'scripts', 'windows-job-controller.ps1')
 export const FIXED_HOST_ORIGIN = 'http://127.0.0.1:3080/'
-export const DIRECT_DSH_WEB_ARGS = Object.freeze(['web', '--host', '127.0.0.1', '--port', '3080'])
+
+/** 构造带 Desktop 私有 composition patch 的正式 direct Web 参数。 */
+export function directDshWebArgs(nodeModulesRoot) {
+  return Object.freeze([
+    'web',
+    '--patch',
+    path.join(nodeModulesRoot, '@cyunlab', 'dsh-desktop-update-client', 'cordis.patch.yml'),
+    '--host', '127.0.0.1', '--port', '3080'
+  ])
+}
 
 /** 从环境变量读取正整数毫秒值，无效配置立即失败。 */
 export function readPositiveMilliseconds(value, fallback, variableName) {
@@ -454,7 +463,7 @@ export async function probeDirectDshWeb(options) {
     const command = await packagedDshCliCommand({
       nodeExecutable: options.nodeExecutable,
       nodeModulesRoot: options.nodeModulesRoot,
-      args: DIRECT_DSH_WEB_ARGS,
+      args: directDshWebArgs(options.nodeModulesRoot),
       environment
     })
     const { child, ownership } = await spawnOwnedCli(command, workDirectory)

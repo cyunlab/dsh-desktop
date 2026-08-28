@@ -5,7 +5,7 @@ import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { detachMountedDmg, inspectMountedDmg, probeBundledRuntime, removeInspectionRoot, verifyExtractedBundleContents, verifyTauriArtifact } from '../../scripts/verify-tauri-artifact.mjs'
 import { requiredRuntimeAssets, runtimeTarget } from '../../scripts/runtime-closure.mjs'
-import { probeDirectDshWeb, waitForListenerClosed } from '../../scripts/smoke-dsh-cli.mjs'
+import { directDshWebArgs, probeDirectDshWeb, waitForListenerClosed } from '../../scripts/smoke-dsh-cli.mjs'
 
 const desktopManifest = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'))
 const pinnedDshVersion = desktopManifest.dependencies['@deepseek-ai/dsh'] as string
@@ -39,7 +39,9 @@ async function createWindowsClosure(nodeModulesRoot: string): Promise<void> {
     '@deepseek-ai/dsh-base',
     '@deepseek-ai/dsh-cmdline',
     '@deepseek-ai/dsh-launch-environment',
-    '@deepseek-ai/dsh-web-app'
+    '@deepseek-ai/dsh-web-app',
+    '@cyunlab/dsh-desktop-capabilities',
+    '@cyunlab/dsh-desktop-update-client'
   ]) {
     const directory = path.join(nodeModulesRoot, name)
     await mkdir(directory, { recursive: true })
@@ -117,6 +119,9 @@ async function createRuntimeFixture(cliSource: string): Promise<{ root: string; 
     dependencies: {}
   }))
   await writeFile(cliEntry, cliSource)
+  const desktopPatch = path.join(nodeModulesRoot, '@cyunlab', 'dsh-desktop-update-client', 'cordis.patch.yml')
+  await mkdir(path.dirname(desktopPatch), { recursive: true })
+  await writeFile(desktopPatch, '- insert: []\n')
   return { root, contentRoot, eventsFile: path.join(root, 'events.log'), nodeExecutable, nodeModulesRoot, platformName: target.platformName, runtimeArch: target.runtimeArch }
 }
 
@@ -125,11 +130,13 @@ function directCliSource(options: { readonly body?: string; readonly contentType
   return `
 import { appendFileSync } from 'node:fs'
 import { createServer } from 'node:http'
+import path from 'node:path'
 const eventsFile = process.env.DSH_FIXTURE_EVENTS
 const record = event => eventsFile && appendFileSync(eventsFile, event + '\\n')
-const expected = ['web', '--host', '127.0.0.1', '--port', '3080']
+const args = process.argv.slice(2)
+const expectedTail = ['--host', '127.0.0.1', '--port', '3080']
 record('argv:' + JSON.stringify(process.argv.slice(2)))
-if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expected)) process.exit(64)
+if (args[0] !== 'web' || args[1] !== '--patch' || path.basename(args[2] ?? '') !== 'cordis.patch.yml' || JSON.stringify(args.slice(3)) !== JSON.stringify(expectedTail)) process.exit(64)
 ${options.stdoutFlood ? "for (let index = 0; index < 256; index += 1) process.stdout.write('x'.repeat(65536))" : ''}
 const server = createServer((_request, response) => {
   record('http-request')
@@ -249,6 +256,7 @@ describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TI
     ['CLI entry', path.join('@deepseek-ai', 'dsh', 'lib', 'bin.js')],
     ['CLI configuration', path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'standard', 'preset.yml')],
     ['frontend', path.join('@deepseek-ai', 'dsh-web-frontend', 'dist', 'index.html')],
+    ['Desktop update client', path.join('@cyunlab', 'dsh-desktop-update-client', 'lib', 'client.js')],
     ['native dependency', path.join('node-pty', 'prebuilds', 'win32-x64', 'pty.node')],
     ['helper', path.join('node-pty', 'build', 'Release', 'conpty', 'OpenConsole.exe')]
   ])('rejects an artifact missing its %s', async (_label, relative) => {
@@ -297,7 +305,7 @@ describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TI
       process.env.DSH_FIXTURE_EVENTS = fixture.eventsFile
       await expect(probeBundledRuntime(fixture.contentRoot, fixture.platformName, fixture.runtimeArch)).resolves.toBeUndefined()
       const events = await readFile(fixture.eventsFile, 'utf8')
-      expect(events).toContain('argv:["web","--host","127.0.0.1","--port","3080"]\n')
+      expect(events).toContain(`argv:${JSON.stringify(directDshWebArgs(await realpath(fixture.nodeModulesRoot)))}\n`)
       expect(events).toContain('http-request\n')
       expect(events).toContain('listener-closed\n')
       await expect(waitForListenerClosed()).resolves.toBeUndefined()

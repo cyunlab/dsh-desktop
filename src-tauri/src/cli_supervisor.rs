@@ -59,6 +59,7 @@ use windows_sys::Win32::System::Threading::{
 pub(crate) const HOST_ADDRESS: &str = "127.0.0.1";
 pub(crate) const HOST_PORT: u16 = 3080;
 pub(crate) const HOST_ORIGIN: &str = "http://127.0.0.1:3080/";
+const DESKTOP_UPDATE_PATCH: &str = "@cyunlab/dsh-desktop-update-client/cordis.patch.yml";
 const PINNED_DSH_VERSION: &str = "0.1.0-rc.6";
 #[cfg(windows)]
 const CREATE_NEW_CONSOLE_FLAG: u32 = 0x0000_0010;
@@ -422,6 +423,7 @@ fn windows_startup_handles() -> Result<WindowsStartupHandles, String> {
 pub(crate) struct CliCommandPlan {
     node_executable: PathBuf,
     cli_entry: PathBuf,
+    desktop_patch: PathBuf,
     harness_home: PathBuf,
     working_directory: PathBuf,
     path: OsString,
@@ -433,7 +435,9 @@ impl CliCommandPlan {
         let mut command = Command::new(&self.node_executable);
         command
             .arg(&self.cli_entry)
-            .args(["web", "--host", HOST_ADDRESS, "--port"])
+            .args(["web", "--patch"])
+            .arg(&self.desktop_patch)
+            .args(["--host", HOST_ADDRESS, "--port"])
             .arg(HOST_PORT.to_string())
             .current_dir(&self.working_directory)
             .env("DSH_HOME", &self.harness_home)
@@ -571,6 +575,28 @@ fn resolve_dsh_cli_entry(runtime_root: &Path) -> Result<PathBuf, String> {
         return Err("@deepseek-ai/dsh package.json#bin.dsh escapes its package".into());
     }
     Ok(entry)
+}
+
+/// 解析并约束 Desktop 自有的临时 Web composition patch。
+fn resolve_desktop_update_patch(runtime_root: &Path) -> Result<PathBuf, String> {
+    let runtime_root = runtime_root
+        .canonicalize()
+        .map_err(|error| format!("runtime closure is unavailable: {error}"))?;
+    let patch = runtime_root.join(DESKTOP_UPDATE_PATCH);
+    if fs::symlink_metadata(&patch)
+        .map_err(|error| format!("Desktop update patch is unavailable: {error}"))?
+        .file_type()
+        .is_symlink()
+    {
+        return Err("Desktop update patch must not be a symbolic link".into());
+    }
+    let patch = patch
+        .canonicalize()
+        .map_err(|error| format!("Desktop update patch is unavailable: {error}"))?;
+    if !patch.starts_with(&runtime_root) || !patch.is_file() {
+        return Err("Desktop update patch escapes the runtime closure".into());
+    }
+    Ok(patch)
 }
 
 /// 将官方 Node 目录放在继承 PATH 的第一项。
@@ -844,10 +870,12 @@ pub(crate) fn build_command_plan(
     working_directory: PathBuf,
 ) -> Result<CliCommandPlan, String> {
     let cli_entry = resolve_dsh_cli_entry(runtime_root)?;
+    let desktop_patch = resolve_desktop_update_patch(runtime_root)?;
     let path = prepend_node_path(&node_executable, inherited_path())?;
     Ok(CliCommandPlan {
         node_executable,
         cli_entry,
+        desktop_patch,
         harness_home,
         working_directory,
         path,

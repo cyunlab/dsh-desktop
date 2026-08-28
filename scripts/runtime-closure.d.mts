@@ -44,6 +44,9 @@ export function runtimeTarget(runtimePlatform?: string, runtimeArch?: string): R
 /** 返回需要随应用发布的原生运行时文件清单。 */
 export function requiredRuntimeAssets(target: RuntimeTarget): RuntimeAsset[]
 
+/** 计算 Runtime closure 的 workspace 输入指纹。 */
+export function runtimeInputHash(root: string, target: RuntimeTarget): Promise<string>
+
 /** 按发布包的 package.json#bin.dsh 契约解析 CLI 入口。 */
 export function resolveDshCliEntry(root: string): Promise<string>
 
