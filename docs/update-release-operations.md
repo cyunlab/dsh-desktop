@@ -10,8 +10,9 @@ Repository automation owns these steps after the external resources exist:
 
 - builds the four updater targets and their mandatory Tauri signatures;
 - creates a GitHub Draft Release for a tag without changing Stable;
-- on the GitHub Release `published` event, exchanges GitHub OIDC identity for short-lived Alibaba Cloud STS credentials;
-- uploads and validates immutable release objects before writing the Stable manifest last;
+- on the GitHub Release `published` event, first exchanges GitHub OIDC identity only to upload and verify immutable candidate objects and an isolated candidate manifest;
+- runs the previous-Stable-to-candidate smoke workflow on all four native targets and rejects missing, duplicate, failed, stale, mock, or candidate-mismatched evidence;
+- only after aggregate evidence admission, exchanges a second short-lived OIDC identity and writes the Stable manifest last;
 - copies release notes only from the published GitHub Release body.
 
 An Alibaba Cloud administrator and a GitHub repository administrator must manually create and verify:
@@ -26,7 +27,7 @@ Do not put private business data in this bucket. It is a shared public-release b
 
 ## Required GitHub Environment configuration
 
-Create an Environment named exactly `production`. Configure required reviewers or other deployment protection appropriate to the organization. Build matrix jobs may reference `production` only to read the two `TAURI_SIGNING_*` secrets required to sign updater artifacts. The promotion job is the only job granted `permissions: id-token: write` and the only job that consumes the OIDC provider, RAM role, OSS, and update-origin variables below. Build jobs must not consume or pass OIDC provider/role variables, request an ID token, or receive Alibaba Cloud credentials; unrelated test jobs should not reference `production` at all.
+Create an Environment named exactly `production`. Configure required reviewers or other deployment protection appropriate to the organization. Build matrix jobs may reference `production` only to read updater signing material and embed the trusted Stable endpoint/public key. Exactly two OSS jobs consume Alibaba Cloud OIDC provider/role variables: `prepare-candidate` may write only content-addressed immutable objects and the isolated candidate manifest, while `promote-stable` runs only after aggregate evidence admission and may replace the Stable pointer. Native smoke jobs receive no ID token. The aggregate evidence job may request a GitHub OIDC token only to attest the already verified evidence set; it must not consume Alibaba Cloud OIDC variables or receive Alibaba Cloud credentials.
 
 Set these Environment variables exactly as shown:
 
@@ -143,6 +144,7 @@ The object layout is fixed:
 ```text
 dsh-desktop/
   releases/<semver>/<target>/<sha256-prefix>-<artifact-basename>
+  candidates/<semver>/<candidate-commit>/<manifest-sha256>-latest.json
   channels/stable/latest.json
 ```
 
@@ -156,12 +158,44 @@ Release procedure:
 2. Confirm every updater package has a matching non-empty signature and that existing macOS signing/notarization checks remain green.
 3. Confirm the workflow created a GitHub **Draft Release**. A Draft does not promote and must not change `dsh-desktop/channels/stable/latest.json`.
 4. Review the Draft asset set and release body. The body is the sole source of Stable release notes; correct it before publication.
-5. Publish the GitHub Release. Before any OSS write, promotion uses minisign and `TAURI_SIGNING_PUBLIC_KEY` to cryptographically verify all four updater packages against their literal signature files. This public key must exactly match the public key embedded in Desktop. A missing package, missing signature, invalid signature, or public-key mismatch stops the job before it can write OSS.
-6. Publication obtains short-lived STS credentials through OIDC and uploads content-addressed immutable objects only after the local verification gate has passed. Before upload it derives each `<sha256-prefix>-<artifact-basename>` from the local bytes. If that key already exists, promotion downloads or otherwise verifies the complete remote bytes and may reuse it only when it is byte-for-byte identical; a mismatch is a collision or corruption and fails promotion. Changed bytes naturally select a different key and never overwrite the prior object.
-7. Automation writes `dsh-desktop/channels/stable/latest.json` only after all four targets pass. If any upload or validation fails, the job must fail and the previous manifest must remain current.
-8. Independently fetch the manifest and all target URLs through `https://updates.cyunlab.com`. Verify HTTPS, version, release notes, RFC 3339 publication timestamp, literal signatures, cache headers, and a real update path on every target before recording production readiness.
+5. Publish the GitHub Release. Candidate preparation verifies the exact Windows `.exe`, Linux `.AppImage`, and two macOS `.app.tar.gz` updater files, their platform magic, and their minisign signatures before uploading them. The embedded public key must be identical to `TAURI_SIGNING_PUBLIC_KEY`.
+6. Candidate preparation reads the authoritative current OSS Stable manifest, records its URL, version, and SHA-256 in candidate metadata, then uses its first short-lived OIDC session only to upload and remotely re-read content-addressed release objects and an isolated immutable candidate manifest. It never calls the Stable replacement operation.
+7. The reusable native smoke workflow consumes that isolated OSS manifest once and runs its internal four-target matrix on Windows x64, Linux x64 AppImage, macOS arm64, and macOS x64. Its aggregate verifier requires exactly those four real-native evidence documents, matching candidate tag, commit, manifest digest, previous Stable identity, and freshness. Fixture or mock evidence is never production admission evidence.
+8. `aggregate-evidence` runs the verifier with `--require-real-native`. `promote-stable` downloads and reverifies the same evidence before its second OIDC exchange; therefore any missing, duplicate, failed, stale, or mismatched evidence prevents final credential exchange and Stable mutation.
+9. Immediately before replacement, final promotion re-reads both the immutable candidate manifest and the authoritative Stable pointer. Either digest changing after candidate preparation fails closed. The byte-identical candidate manifest is then written to `dsh-desktop/channels/stable/latest.json` as the final OSS mutation with `Cache-Control: no-cache`.
+10. Independently fetch the manifest and all target URLs through `https://updates.cyunlab.com`. Verify HTTPS, version, release notes, RFC 3339 publication timestamp, literal signatures, cache headers, and a real update path on every target before recording production readiness.
+
+### First updater-capable release blocker
+
+The current 2.0.15 Stable application was not built with the automatic updater. It cannot produce truthful previous-Stable-to-candidate native evidence, so the fail-closed workflow cannot promote the first updater-capable release as currently designed. There is intentionally no bootstrap bypass in repository automation. Production remains blocked until a separate, explicitly reviewed bootstrap policy is approved and implemented; local fixtures, package presence, or a candidate-to-itself test must never be recorded as real evidence.
 
 Never manually edit Stable to point at a partly uploaded release. Never reuse a version path or overwrite an immutable package.
+
+## Native automatic-update smoke evidence
+
+Stable promotion must consume the versioned contract in `docs/update-smoke-evidence-v1.schema.json` through the public verifier `scripts/verify-update-smoke-evidence.mjs --require-real-native`. Exactly one document is required for Windows x64, Linux x64 AppImage, macOS arm64, and macOS x64. Every JSON file has a byte-exact `.sha256` companion. The checksum detects accidental or later byte changes; it is not by itself a signature. The reusable `.github/workflows/update-smoke.yml` additionally binds uploaded evidence to the trusted workflow identity with GitHub artifact attestations and retains the aggregate artifact for 30 days.
+
+The authoritative previous Stable is the version and target entry fetched from the configured OSS Stable `latest.json`, not GitHub's latest-release selection. Evidence binds that manifest digest, its exact immutable package URL, literal paired updater signature digest, package digest, previous tag/version, and the Git commit resolved for that tag. Candidate evidence independently binds the isolated manifest digest, tag, version, commit, package digest, and signature digest. Missing, duplicate, stale, failed, mismatched, oversized, or tampered evidence fails closed.
+
+`real-native` means a matching hosted runner installed the exact package selected by the OSS Stable manifest and obtained every checkpoint from repository-owned observation of the real process, filesystem, network, and application surfaces. A source rebuild with an isolated compile-time endpoint is useful development evidence but is labelled `source-rebuild`; fixture adapters are labelled `local-fixture`. Neither is accepted by `--require-real-native`.
+
+The required native observations include both update exit modes and all guard paths:
+
+- available → downloaded → staged → user-opened → explicit restart → confirmed Host cleanup → install → relaunch → candidate version and fixed Host origin ready;
+- normal operating-system close with a staged update → confirmed Host cleanup → install without automatic relaunch, followed by a separately observed manual launch;
+- bad and missing signatures, missing target, unreachable immutable object, tampered staged package, and failed Host cleanup all block installation;
+- manual check and background-download-off remain functional;
+- the installed candidate contains the Official Node executable, complete published CLI Runtime closure, both private Desktop packages, composition patch, and a working trusted updater configuration.
+
+Windows evidence additionally requires an NSIS EXE installed under the current user (`HKCU` and a user-profile location), no MSI, and no assumption that Authenticode exists. Linux requires executable AppImage replacement at the same path with a changed package digest. macOS requires a native-architecture application archive; when production Apple credentials are configured, the runner must observe strict code-signature verification, Gatekeeper assessment, and notarization/stapling rather than only reading workflow configuration.
+
+### Current bootstrap limitation
+
+The current previous Stable, `2.0.15`, predates the automatic updater. Its published binary therefore cannot discover an isolated candidate manifest or exercise either install path. The updater endpoint is also compiled into the binary. Rebuilding the `2.0.15` source with another endpoint would be `source-rebuild` evidence, not evidence for the published Stable artifact.
+
+The repository-owned native driver currently stops after verifying the real runner identity and reports this limitation. It does not emit evidence. This is an unimplemented internal test capability, not an external credential or runner configuration problem. Normal close can be automated through operating-system close plus process, staging, port, replacement, and manual-relaunch observations, but that observation code is not yet implemented in the production driver. The packaged explicit Restart action also has no durable native automation entry. Rust unit tests and debug-only WDIO hooks do not satisfy this production evidence contract.
+
+Before the first automatic-update release can pass the gate, maintainers must approve and implement a bootstrap strategy and a production-safe, repository-owned automation entry for the explicit Restart flow. That decision must receive its own review because it changes the trust/test surface. Do not add a first-release exception, temporarily point Stable at an unvalidated candidate, accept a source rebuild, or synthesize the missing checkpoint. Until a previously published updater-capable Stable exists and all four real runners emit valid evidence, Stable promotion must remain blocked.
 
 ## Failure handling and recovery
 
@@ -193,8 +227,14 @@ Disable the `production` Environment or publishing role first. Revoke or tighten
 - [ ] All six Environment variables and both Environment secrets use the exact names in this runbook.
 - [ ] `TAURI_SIGNING_PUBLIC_KEY` matches both the protected private key and the public key embedded in Desktop; offline encrypted restore has been tested.
 - [ ] Promotion verifies all four updater packages with minisign before writing OSS.
-- [ ] Draft creation leaves Stable unchanged; publication failure also leaves Stable unchanged.
+- [ ] Windows builds explicitly use NSIS `currentUser`; all four binaries embed the production Stable endpoint and the same updater public key used by promotion.
+- [ ] Candidate preparation binds the authoritative previous Stable URL/version/digest, uploads only immutable objects, and leaves Stable unchanged.
+- [ ] Aggregate and final admission both require exact fresh real-native evidence before final OIDC exchange.
+- [ ] Draft creation leaves Stable unchanged; every candidate, smoke, evidence, credential, or revalidation failure also leaves Stable unchanged.
 - [ ] A successful published-release smoke has passed on all four targets and its evidence is recorded.
+- [ ] A separately reviewed bootstrap policy has resolved the 2.0.15 no-updater predecessor blocker without fabricating real evidence.
+- [ ] The four evidence documents pass `verify-update-smoke-evidence.mjs --require-real-native`, and their GitHub artifact attestations verify against this repository and workflow run.
+- [ ] The evidence baseline is the exact OSS Stable manifest target, not a source rebuild, fixture, or GitHub latest-release guess.
 
 Until every checkbox is complete, production automatic updates remain not configured or not verified.
 

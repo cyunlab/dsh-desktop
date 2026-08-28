@@ -44,6 +44,7 @@ describe('Tauri resource layout', () => {
     expect(linux.bundle.targets).toEqual(['appimage'])
     expect(macos.bundle.targets).toEqual(['dmg'])
     expect(windows.bundle.targets).toEqual(['nsis'])
+    expect(windows.bundle.windows.nsis.installMode).toBe('currentUser')
   })
 
   /** 验证 dev hook 会准备完整资源并等待结束，避免 Cargo 在 dist 重建期间扫描资源。 */

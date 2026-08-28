@@ -13,7 +13,7 @@ describe('Stable promotion workflow contract', () => {
   })
 
   /** 确保所有可执行代码来自可信默认分支，Release tag 只作为待验证数据读取。 */
-  it('validates the release tag with trusted default-branch code before requesting OIDC', () => {
+  it('validates the release tag with trusted default-branch code before candidate preparation', () => {
     expect(workflow).toContain('ref: ${{ github.event.repository.default_branch }}')
     expect(workflow).toContain('fetch-depth: 0')
     expect(workflow).not.toContain('ref: ${{ github.event.release.tag_name }}')
@@ -27,17 +27,55 @@ describe('Stable promotion workflow contract', () => {
     expect(credentials).toBeGreaterThan(validation)
   })
 
-  /** 确保 production job 独占最小 OIDC 和 Release 读取权限。 */
-  it('scopes OIDC to the production promotion job', () => {
+  /** 确保只有 candidate preparation 与最终 promotion 两个 production job 可交换 OIDC。 */
+  it('scopes OIDC to the two production OSS jobs', () => {
     expect(workflow).toMatch(/^permissions:\n  contents: read$/m)
+    expect(workflow).toMatch(/prepare-candidate:[\s\S]*environment: production[\s\S]*permissions:\n      contents: read\n      id-token: write/)
     expect(workflow).toMatch(/promote-stable:[\s\S]*environment: production[\s\S]*permissions:\n      contents: read\n      id-token: write/)
-    expect(workflow.match(/id-token: write/g)).toHaveLength(1)
+    expect(workflow.match(/id-token: write/g)).toHaveLength(2)
+  })
+
+  /** 确保四个真实原生目标消费隔离 candidate，聚合 gate 严格先于最终 OIDC。 */
+  it('requires exact four-target native evidence before final OIDC and Stable mutation', () => {
+    expect(workflow).toContain('uses: ./.github/workflows/update-smoke.yml')
+    expect(workflow.match(/uses: \.\/\.github\/workflows\/update-smoke\.yml/g)).toHaveLength(1)
+    expect(workflow).toContain('manifest_url: ${{ needs.prepare-candidate.outputs.manifest_url }}')
+    expect(workflow).toContain('manifest_sha256: ${{ needs.prepare-candidate.outputs.manifest_sha256 }}')
+    expect(workflow).toContain('stable_manifest_url: ${{ needs.prepare-candidate.outputs.previous_stable_url }}')
+    expect(workflow).toContain('previous_stable_manifest_sha256: ${{ needs.prepare-candidate.outputs.previous_stable_manifest_sha256 }}')
+    expect(workflow).toContain('node scripts/verify-update-smoke-evidence.mjs')
+    expect(workflow).toContain('--require-real-native')
+    expect(workflow).toContain('--max-age-hours 24')
+    expect(workflow).toContain('--baseline-manifest-sha256')
+    expect(workflow.match(/gh attestation verify evidence\/\* --repo "\$GITHUB_REPOSITORY"/g)).toHaveLength(2)
+    expect(workflow).toMatch(/aggregate-evidence:\n[\s\S]*needs: \[prepare-candidate, native-update-smoke\]/)
+    expect(workflow).toMatch(/promote-stable:\n[\s\S]*needs: \[prepare-candidate, aggregate-evidence\]/)
+    const aggregate = workflow.indexOf('aggregate-evidence:')
+    const finalJob = workflow.indexOf('promote-stable:')
+    const finalCredentials = workflow.indexOf('Exchange final promotion OIDC identity', finalJob)
+    const candidateBinding = workflow.indexOf('candidate artifact ${key} mismatch', finalJob)
+    const stableWrite = workflow.indexOf('--finalize-candidate', finalJob)
+    expect(aggregate).toBeGreaterThan(-1)
+    expect(finalJob).toBeGreaterThan(aggregate)
+    expect(finalCredentials).toBeGreaterThan(finalJob)
+    expect(candidateBinding).toBeGreaterThan(finalJob)
+    expect(finalCredentials).toBeGreaterThan(candidateBinding)
+    expect(stableWrite).toBeGreaterThan(finalCredentials)
+  })
+
+  /** 确保 release.published 先生成 candidate，且 candidate 阶段没有 Stable 写入入口。 */
+  it('prepares immutable candidate objects before smoke without exposing a Stable write', () => {
+    const candidateJob = workflow.slice(workflow.indexOf('prepare-candidate:'), workflow.indexOf('native-update-smoke:'))
+    expect(candidateJob).toContain('--prepare-candidate')
+    expect(candidateJob).not.toContain('--finalize-candidate')
+    expect(candidateJob).not.toContain('channels/stable/latest.json')
+    expect(candidateJob).toContain('candidate.json')
   })
 
   /** 确保所有外部 action 固定到可审计的完整提交。 */
   it('pins every third-party action to a reviewed commit', () => {
     const actions = [...workflow.matchAll(/uses:\s+([^\s#]+@[^\s#]+)(?:\s+#\s+(v\S+))?/g)]
-    expect(actions).toHaveLength(3)
+    expect(actions.length).toBeGreaterThanOrEqual(3)
     for (const [, action, version] of actions) {
       expect(action).toMatch(/^[\w-]+\/[\w-]+@[0-9a-f]{40}$/)
       expect(version).toMatch(/^v\d+\.\d+\.\d+$/)
@@ -78,7 +116,6 @@ describe('Stable promotion workflow contract', () => {
   it('passes the published release and downloaded assets to the publisher', () => {
     expect(workflow).toContain('github.event.release.tag_name')
     expect(workflow).toContain('github.event.release.body')
-    expect(workflow).toContain('github.event.release.upload_url')
     expect(workflow).toContain('node scripts/promote-stable-release.mjs')
     expect(workflow).toContain('--assets artifacts')
     expect(workflow).toContain('--prefix dsh-desktop')
