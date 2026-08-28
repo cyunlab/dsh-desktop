@@ -54,7 +54,7 @@ Before enabling promotion, confirm that Environment variables are not secrets an
 
 1. Create or select a bucket in `cn-shenzhen`. The bucket may serve multiple public applications, but reserve the complete `dsh-desktop/` namespace for this repository.
 2. Enable **OSS Versioning** before the first promotion. Do not configure lifecycle rules that delete or expire `dsh-desktop/releases/` objects or historical versions of `dsh-desktop/channels/stable/latest.json`.
-3. Enable a prevent-overwrite rule for `dsh-desktop/releases/`. Promotion also issues conditional writes that refuse overwrite and compares any existing object's bytes before reuse. The Stable manifest is the only overwrite exception because promotion and recovery intentionally create new Versioning-backed versions of `dsh-desktop/channels/stable/latest.json`.
+3. Do not configure an OSS prevent-overwrite rule or `x-oss-forbid-overwrite`. OSS ignores these protections when bucket Versioning is enabled or suspended, so they cannot enforce release immutability here. Versioning remains enabled because promotion and recovery intentionally create recoverable versions of `dsh-desktop/channels/stable/latest.json`; release immutability instead comes from the content-addressed object keys described below.
 4. Keep writes private. Grant anonymous users read-only access only to `dsh-desktop/releases/*` and `dsh-desktop/channels/stable/latest.json`; never grant public write. A bucket-level `public-read` ACL is broader than required, so prefer a prefix-scoped bucket policy.
 5. Bind the ICP-filed domain `updates.cyunlab.com` to the bucket and add its DNS CNAME to the OSS public endpoint for `cn-shenzhen`. Upload and bind a valid TLS certificate in OSS. CDN is not required for the first release.
 6. Test anonymous HTTPS `GET` and `HEAD` for a disposable object under `dsh-desktop/releases/`, then remove only that disposable object. Confirm anonymous listing of the bucket is denied and anonymous writes are denied.
@@ -142,12 +142,13 @@ The object layout is fixed:
 
 ```text
 dsh-desktop/
-  releases/<semver>/<target>/<immutable updater package>
-  releases/<semver>/<target>/<signature>
+  releases/<semver>/<target>/<sha256-prefix>-<artifact-basename>
   channels/stable/latest.json
 ```
 
-Immutable release objects use a long immutable cache policy. The Stable manifest uses `Cache-Control: no-cache`. Its platform entries contain public HTTPS URLs and the literal contents of each `.sig` file, not a signature filename or URL.
+Every updater package and signature object uses a basename prefixed with the lowercase SHA-256 digest of that object's complete bytes. Different bytes therefore always produce a different OSS key under the same `releases/<semver>/<target>/` directory. The implementation may use the documented fixed-length `<sha256-prefix>` rather than the entire digest, but it must derive that prefix from the complete object bytes and use the same deterministic length for every object.
+
+Immutable release objects use a long immutable cache policy and are retained permanently. The publishing RAM role has no delete permission. The Stable manifest uses `Cache-Control: no-cache`. Its platform entries contain public HTTPS URLs for the content-addressed packages and the literal contents of each `.sig` file, not a signature filename or URL.
 
 Release procedure:
 
@@ -156,7 +157,7 @@ Release procedure:
 3. Confirm the workflow created a GitHub **Draft Release**. A Draft does not promote and must not change `dsh-desktop/channels/stable/latest.json`.
 4. Review the Draft asset set and release body. The body is the sole source of Stable release notes; correct it before publication.
 5. Publish the GitHub Release. Before any OSS write, promotion uses minisign and `TAURI_SIGNING_PUBLIC_KEY` to cryptographically verify all four updater packages against their literal signature files. This public key must exactly match the public key embedded in Desktop. A missing package, missing signature, invalid signature, or public-key mismatch stops the job before it can write OSS.
-6. Publication obtains short-lived STS credentials through OIDC and uploads immutable objects only after the local verification gate has passed. It forbids overwrite, then checks remote availability and bytes. A rerun of the same semantic version may reuse an existing release object only when it is byte-for-byte identical to the expected object; any difference fails promotion and requires a higher semantic version.
+6. Publication obtains short-lived STS credentials through OIDC and uploads content-addressed immutable objects only after the local verification gate has passed. Before upload it derives each `<sha256-prefix>-<artifact-basename>` from the local bytes. If that key already exists, promotion downloads or otherwise verifies the complete remote bytes and may reuse it only when it is byte-for-byte identical; a mismatch is a collision or corruption and fails promotion. Changed bytes naturally select a different key and never overwrite the prior object.
 7. Automation writes `dsh-desktop/channels/stable/latest.json` only after all four targets pass. If any upload or validation fails, the job must fail and the previous manifest must remain current.
 8. Independently fetch the manifest and all target URLs through `https://updates.cyunlab.com`. Verify HTTPS, version, release notes, RFC 3339 publication timestamp, literal signatures, cache headers, and a real update path on every target before recording production readiness.
 
@@ -166,7 +167,7 @@ Never manually edit Stable to point at a partly uploaded release. Never reuse a 
 
 ### Failure before the manifest write
 
-Leave the previous Stable manifest untouched. Diagnose and rerun the same immutable publication only if every already-uploaded object is byte-for-byte identical to the expected object and its signature verifies. If any byte differs, publish a higher semantic version; do not overwrite a released object path.
+Leave the previous Stable manifest untouched. Diagnose and rerun the same immutable publication only if every existing content-addressed object is byte-for-byte identical to the expected object and its signature verifies. Different bytes use a different content-addressed key, but changing release contents after publication still requires a higher semantic version. Never overwrite or delete a released object.
 
 ### Bad release after promotion
 
@@ -181,12 +182,14 @@ Disable the `production` Environment or publishing role first. Revoke or tighten
 
 ## Go-live checklist
 
-- [ ] Bucket exists in `cn-shenzhen`; Versioning is enabled, the `dsh-desktop/releases/` prevent-overwrite rule is active, and no deletion lifecycle affects `dsh-desktop/`.
+- [ ] Bucket exists in `cn-shenzhen`; Versioning is enabled for Stable manifest recovery, no incompatible prevent-overwrite rule/header is configured, and no deletion lifecycle affects `dsh-desktop/`.
 - [ ] Anonymous `GET`/`HEAD` works only for public release objects; anonymous list/write fails.
 - [ ] `updates.cyunlab.com` CNAME and TLS certificate are valid; HTTP is not used by Desktop.
 - [ ] CORS is empty unless an exact browser origin has a documented need for read-only `GET`/`HEAD`.
 - [ ] RAM trust matches the observed `iss`, `aud`, and exact `production` Environment `sub` claim.
 - [ ] RAM permissions cannot read, write, list, delete, or administer outside the required `dsh-desktop/` scope.
+- [ ] The publishing RAM role has no object delete permission and immutable release objects are retained permanently.
+- [ ] Every package and signature basename starts with its deterministic SHA-256 prefix; same-key retries verify byte-for-byte identity before reuse.
 - [ ] All six Environment variables and both Environment secrets use the exact names in this runbook.
 - [ ] `TAURI_SIGNING_PUBLIC_KEY` matches both the protected private key and the public key embedded in Desktop; offline encrypted restore has been tested.
 - [ ] Promotion verifies all four updater packages with minisign before writing OSS.
@@ -204,6 +207,8 @@ Until every checkbox is complete, production automatic updates remain not config
 - [Alibaba Cloud: AssumeRoleWithOIDC](https://www.alibabacloud.com/help/en/ram/developer-reference/api-sts-2015-04-01-assumerolewithoidc)
 - [Alibaba Cloud: Control OSS access with RAM policies](https://www.alibabacloud.com/help/en/oss/user-guide/access-control-base-on-ram-policy)
 - [Alibaba Cloud: OSS custom domains](https://www.alibabacloud.com/help/en/oss/user-guide/access-buckets-via-custom-domain-names)
+- [Alibaba Cloud: OSS Versioning and mutually exclusive features](https://www.alibabacloud.com/help/en/oss/user-guide/overview-78/)
+- [Alibaba Cloud: PutObject and `x-oss-forbid-overwrite`](https://www.alibabacloud.com/help/en/oss/developer-reference/putobject)
 - [Alibaba Cloud: Manage versioned objects](https://www.alibabacloud.com/help/en/oss/user-guide/manage-objects-in-a-versioning-enabled-bucket)
 - [Alibaba Cloud: Configure OSS CORS](https://www.alibabacloud.com/help/en/oss/user-guide/configure-cross-origin-resource-sharing)
 - [Tauri updater documentation](https://v2.tauri.app/plugin/updater/)
