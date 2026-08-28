@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -77,13 +77,26 @@ export function createOssutilStorage(options) {
   if (!credentials?.accessKeyId || !credentials.accessKeySecret || !credentials.securityToken) {
     throw new Error('short-lived Alibaba Cloud STS credentials are required')
   }
-  const commandEnvironment = {
-    PATH: process.env.PATH,
-    SystemRoot: process.env.SystemRoot,
-    OSS_ACCESS_KEY_ID: credentials.accessKeyId,
-    OSS_ACCESS_KEY_SECRET: credentials.accessKeySecret,
-    OSS_SESSION_TOKEN: credentials.securityToken,
-    OSS_REGION: options.region
+  const commandEnvironment = { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot }
+  /** 为单次 ossutil 调用创建最小权限配置，并在调用结束后销毁。 */
+  async function withOssutilConfig(run) {
+    const directory = await mkdtemp(path.join(tmpdir(), 'dsh-ossutil-config-'))
+    const configFile = path.join(directory, 'ossutilconfig')
+    try {
+      await chmod(directory, 0o700)
+      await writeFile(configFile, [
+        '[Credentials]',
+        `endpoint=oss-${options.region}.aliyuncs.com`,
+        `accessKeyID=${credentials.accessKeyId}`,
+        `accessKeySecret=${credentials.accessKeySecret}`,
+        `stsToken=${credentials.securityToken}`,
+        ''
+      ].join('\n'), { mode: 0o600 })
+      await chmod(configFile, 0o600)
+      return await run(configFile)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
   }
   /** 构造限定在已配置 bucket 内的 OSS URI。 */
   function objectUri(key) {
@@ -100,15 +113,21 @@ export function createOssutilStorage(options) {
         await writeFile(source, body, { mode: 0o600 })
         const objectMetadata = [`Cache-Control:${metadata.cacheControl}`]
         if (metadata.contentType) objectMetadata.push(`Content-Type:${metadata.contentType}`)
-        const args = ['cp', source, objectUri(key), '--region', options.region, '--force', '--meta', objectMetadata.join('#')]
-        await runOssutil(args, { env: commandEnvironment })
+        const args = ['cp', source, objectUri(key), '--force', '--meta', objectMetadata.join('#')]
+        await withOssutilConfig(configFile => runOssutil(
+          [...args, '--config-file', configFile],
+          { env: commandEnvironment }
+        ))
       } finally {
         await rm(temporaryDirectory, { recursive: true, force: true })
       }
     },
     /** 下载远端对象并进行逐字节校验。 */
     async verifyObject(key, body) {
-      const result = await runOssutil(['cat', objectUri(key), '--region', options.region], { env: commandEnvironment })
+      const result = await withOssutilConfig(configFile => runOssutil(
+        ['cat', objectUri(key), '--config-file', configFile],
+        { env: commandEnvironment }
+      ))
       if (!Buffer.from(result.stdout).equals(body)) throw new Error(`remote OSS object differs from uploaded bytes: ${key}`)
     }
   }
