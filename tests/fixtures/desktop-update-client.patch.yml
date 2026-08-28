@@ -1,3 +1,4 @@
+# Desktop-owned overlay mounted by the native shell through `dsh web --patch`.
 - insert:
     - id: dsh-desktop-update-client
       name: '@cyunlab/dsh-desktop-update-client'

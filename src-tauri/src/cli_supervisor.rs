@@ -63,7 +63,7 @@ const DESKTOP_UPDATE_PATCH: &str = "@cyunlab/dsh-desktop-update-client/cordis.pa
 const DESKTOP_UPDATE_CLIENT_ENTRY: &str = "@cyunlab/dsh-desktop-update-client/lib/index.js";
 const DESKTOP_UPDATE_CLIENT_SPECIFIER: &str = "@cyunlab/dsh-desktop-update-client";
 const MATERIALIZED_PATCH_DIRECTORY: &str = ".dsh-desktop/runtime";
-const EXPECTED_DESKTOP_UPDATE_PATCH: &str = "- insert:\n    - id: dsh-desktop-update-client\n      name: '@cyunlab/dsh-desktop-update-client'\n";
+const EXPECTED_DESKTOP_UPDATE_PATCH: &str = "# Desktop-owned overlay mounted by the native shell through `dsh web --patch`.\n- insert:\n    - id: dsh-desktop-update-client\n      name: '@cyunlab/dsh-desktop-update-client'\n";
 const PINNED_DSH_VERSION: &str = "0.1.0-rc.6";
 #[cfg(windows)]
 const CREATE_NEW_CONSOLE_FLAG: u32 = 0x0000_0010;

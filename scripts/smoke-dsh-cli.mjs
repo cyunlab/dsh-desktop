@@ -19,7 +19,7 @@ const DESKTOP_UPDATE_PACKAGE = '@cyunlab/dsh-desktop-update-client'
 const DESKTOP_UPDATE_PATCH = path.join(DESKTOP_UPDATE_PACKAGE, 'cordis.patch.yml')
 const DESKTOP_UPDATE_ENTRY = path.join(DESKTOP_UPDATE_PACKAGE, 'lib', 'index.js')
 const MATERIALIZED_PATCH_DIRECTORY = path.join('.dsh-desktop', 'runtime')
-const EXPECTED_DESKTOP_UPDATE_PATCH = "- insert:\n    - id: dsh-desktop-update-client\n      name: '@cyunlab/dsh-desktop-update-client'\n"
+const EXPECTED_DESKTOP_UPDATE_PATCH = "# Desktop-owned overlay mounted by the native shell through `dsh web --patch`.\n- insert:\n    - id: dsh-desktop-update-client\n      name: '@cyunlab/dsh-desktop-update-client'\n"
 
 /** 解析 verified runtime closure 内不经过 symlink 的普通文件。 */
 function resolveClosureFile(nodeModulesRoot, relativePath, label) {

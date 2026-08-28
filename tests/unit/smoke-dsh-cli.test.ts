@@ -9,8 +9,13 @@ import { describe, expect, it } from 'vitest'
 import { directDshWebArgs, formatWindowsControllerExitError, ownProcessTree, processTreeHasExited, readPositiveMilliseconds, stopCliProcess, terminateProcessTree, waitForListenerClosed, windowsJobControllerArguments } from '../../scripts/smoke-dsh-cli.mjs'
 
 const trustedDesktopPatch = readFileSync(new URL('../fixtures/desktop-update-client.patch.yml', import.meta.url), 'utf8')
+const packagedDesktopPatch = readFileSync(new URL('../../packages/desktop-update-client/cordis.patch.yml', import.meta.url), 'utf8')
 
 describe('published dsh CLI smoke cleanup', () => {
+  /** 测试共享契约必须逐字节绑定 package-owned 生产 patch。 */
+  it('keeps the shared trusted patch contract identical to the package source', () => {
+    expect(trustedDesktopPatch).toBe(packagedDesktopPatch)
+  })
   /** 创建包含 package-owned patch 与 canonical Client entry 的最小 runtime closure。 */
   async function writeDesktopPatchFixture(root: string, patch = trustedDesktopPatch) {
     const packageRoot = path.join(root, '@cyunlab', 'dsh-desktop-update-client')
@@ -36,7 +41,7 @@ describe('published dsh CLI smoke cleanup', () => {
     ])
     expect(materializedPatch.startsWith(await realpath(harnessHome) + path.sep)).toBe(true)
     expect(await readFile(materializedPatch, 'utf8')).toBe(
-      `- insert:\n    - id: dsh-desktop-update-client\n      name: '${pathToFileURL(await realpath(path.join(packageRoot, 'lib', 'index.js'))).href}'\n`
+      `# Desktop-owned overlay mounted by the native shell through \`dsh web --patch\`.\n- insert:\n    - id: dsh-desktop-update-client\n      name: '${pathToFileURL(await realpath(path.join(packageRoot, 'lib', 'index.js'))).href}'\n`
     )
   })
 
