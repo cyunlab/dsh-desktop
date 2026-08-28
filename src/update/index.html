@@ -5,15 +5,24 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self' data:">
     <title>Desktop Update</title>
-    <link rel="stylesheet" href="./index.css">
+    <link rel="stylesheet" href="./update.css">
   </head>
   <body>
     <main>
       <p class="eyebrow">DeepSeek Harness Desktop</p>
       <h1 id="update-state">Checking for updates…</h1>
+      <p id="update-current-version"></p>
       <p id="update-message" aria-live="polite"></p>
-      <div id="update-actions" hidden>
-        <button id="update-restart" type="button">Restart to update</button>
+      <progress id="update-progress" hidden aria-describedby="update-progress-label"></progress>
+      <p id="update-progress-label" aria-live="polite"></p>
+      <section aria-labelledby="update-release-notes-heading">
+        <h2 id="update-release-notes-heading">What’s new</h2>
+        <p id="update-release-notes"></p>
+      </section>
+      <div id="actions">
+        <button id="update-retry" type="button" hidden>Retry</button>
+        <button id="update-later" type="button">Later</button>
+        <button id="update-restart" type="button" hidden>Restart and update</button>
       </div>
     </main>
     <script type="module" src="./update.js"></script>

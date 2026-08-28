@@ -154,6 +154,23 @@ fn is_packaged_update_url(target: &tauri::Url) -> bool {
         && target.fragment().is_none()
 }
 
+/// 统一校验更新界面的固定标签与精确打包来源。
+fn trusted_update_command_source(label: &str, target: &tauri::Url) -> bool {
+    label == "app-update" && is_packaged_update_url(target)
+}
+
+/// 只从 Rust 当前可重试失败快照生成无参数用户 retry 意图。
+fn retry_input_for_snapshot(snapshot: &UpdateSnapshot) -> Option<UpdateInput> {
+    matches!(
+        snapshot.state,
+        desktop_capabilities::app_update::UpdateState::Failed {
+            retryable: true,
+            ..
+        }
+    )
+    .then_some(UpdateInput::UserRetry)
+}
+
 /// 判断 URL 是否属于 Tauri CLI 在 debug 模式提供的固定本地启动页 origin。
 fn is_development_startup_origin(target: &tauri::Url) -> bool {
     cfg!(debug_assertions)
@@ -1891,8 +1908,9 @@ fn app_update_restart(
     window: tauri::WebviewWindow,
     lifecycle: State<'_, Arc<RuntimeState>>,
 ) -> Result<(), String> {
-    let trusted_surface = window.label() == "app-update"
-        && window.url().is_ok_and(|url| is_packaged_update_url(&url));
+    let trusted_surface = window
+        .url()
+        .is_ok_and(|url| trusted_update_command_source(window.label(), &url));
     if !trusted_surface {
         return Err("Update confirmation requires the Desktop update surface.".into());
     }
@@ -1903,6 +1921,25 @@ fn app_update_restart(
         return Err("No staged update is available.".into());
     }
     request_shutdown(&app, lifecycle.inner(), ShutdownSource::UpdateRestart);
+    Ok(())
+}
+
+/// 接受打包来源界面的无参数 retry，并只重放 Rust 当前记录的可重试操作。
+#[tauri::command]
+fn app_update_retry(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    updater: State<'_, Arc<TauriUpdateRuntime>>,
+) -> Result<(), String> {
+    let trusted_surface = window
+        .url()
+        .is_ok_and(|url| trusted_update_command_source(window.label(), &url));
+    if !trusted_surface {
+        return Err("Update retry requires the Desktop update surface.".into());
+    }
+    let input = retry_input_for_snapshot(&updater.snapshot())
+        .ok_or_else(|| "No retryable update operation is available.".to_string())?;
+    updater.inner().dispatch(&app, input);
     Ok(())
 }
 
@@ -2122,7 +2159,8 @@ fn main() {
         startup_copy_diagnostics,
         app_update_snapshot,
         app_update_open_surface,
-        app_update_restart
+        app_update_restart,
+        app_update_retry
     ]);
     #[cfg(feature = "wdio")]
     let builder = builder
