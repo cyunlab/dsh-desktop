@@ -9,6 +9,22 @@ describe('Stable promotion workflow contract', () => {
     expect(workflow).toMatch(/^on:\n  release:\n    types: \[published\]/m)
     expect(workflow).not.toContain('workflow_dispatch')
     expect(workflow).not.toContain('push:')
+    expect(workflow).toMatch(/concurrency:\n  group: stable-promotion\n  cancel-in-progress: false/)
+  })
+
+  /** 确保所有可执行代码来自可信默认分支，Release tag 只作为待验证数据读取。 */
+  it('validates the release tag with trusted default-branch code before requesting OIDC', () => {
+    expect(workflow).toContain('ref: ${{ github.event.repository.default_branch }}')
+    expect(workflow).toContain('fetch-depth: 0')
+    expect(workflow).not.toContain('ref: ${{ github.event.release.tag_name }}')
+    expect(workflow).toContain('git merge-base --is-ancestor "refs/tags/${RELEASE_TAG}^{}" refs/remotes/origin/main')
+    expect(workflow).toContain('for manifest in package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock; do')
+    expect(workflow).toContain('git show "refs/tags/${RELEASE_TAG}^{}:${manifest}" > "$MANIFEST_ROOT/${manifest}"')
+    expect(workflow).toContain('node scripts/verify-release-version.mjs "$RELEASE_TAG" "$MANIFEST_ROOT"')
+    const validation = workflow.indexOf('node scripts/verify-release-version.mjs')
+    const credentials = workflow.indexOf('aliyun/configure-aliyun-credentials-action@')
+    expect(validation).toBeGreaterThan(-1)
+    expect(credentials).toBeGreaterThan(validation)
   })
 
   /** 确保 production job 独占最小 OIDC 和 Release 读取权限。 */
@@ -49,6 +65,13 @@ describe('Stable promotion workflow contract', () => {
     expect(workflow).toContain('OSSUTIL_BIN_DIR="$RUNNER_TEMP/bin"')
     expect(workflow).toContain('echo "$OSSUTIL_BIN_DIR" >> "$GITHUB_PATH"')
     expect(workflow).not.toMatch(/curl[^\n]*\|\s*(?:ba)?sh/)
+  })
+
+  /** 确保默认 publisher verifier 获得固定 minisign 工具和公开验证密钥。 */
+  it('provides minisign and the updater public key to the trusted publisher', () => {
+    expect(workflow).toContain('minisign=0.11-1')
+    expect(workflow).toContain('minisign -v')
+    expect(workflow).toContain('TAURI_SIGNING_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}')
   })
 
   /** 确保 publisher 接收 published Release 的 tag、正文和全部下载资产。 */

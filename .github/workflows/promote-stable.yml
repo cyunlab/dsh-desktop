@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: stable-promotion
+  cancel-in-progress: false
+
 jobs:
   promote-stable:
     name: Promote published release to OSS Stable
@@ -19,10 +23,31 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
+      - name: Validate the release tag without executing its code
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "refs/tags/${RELEASE_TAG}^{}" refs/remotes/origin/main
+          MANIFEST_ROOT="$RUNNER_TEMP/release-manifests"
+          mkdir -p "$MANIFEST_ROOT/src-tauri"
+          for manifest in package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock; do
+            git show "refs/tags/${RELEASE_TAG}^{}:${manifest}" > "$MANIFEST_ROOT/${manifest}"
+          done
+          node scripts/verify-release-version.mjs "$RELEASE_TAG" "$MANIFEST_ROOT"
+      - name: Install pinned minisign verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y minisign=0.11-1
+          minisign -v
       - name: Install checksum-verified ossutil
         shell: bash
         run: |
@@ -72,6 +97,7 @@ jobs:
           OSS_BUCKET: ${{ vars.OSS_BUCKET }}
           OSS_REGION: ${{ vars.OSS_REGION }}
           UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+          TAURI_SIGNING_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           RELEASE_NOTES: ${{ github.event.release.body }}
           PUBLISHED_AT: ${{ github.event.release.published_at }}
