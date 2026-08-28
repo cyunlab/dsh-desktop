@@ -5,7 +5,7 @@ import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { detachMountedDmg, inspectMountedDmg, probeBundledRuntime, removeInspectionRoot, verifyExtractedBundleContents, verifyTauriArtifact } from '../../scripts/verify-tauri-artifact.mjs'
 import { requiredRuntimeAssets, runtimeTarget } from '../../scripts/runtime-closure.mjs'
-import { directDshWebArgs, probeDirectDshWeb, waitForListenerClosed } from '../../scripts/smoke-dsh-cli.mjs'
+import { probeDirectDshWeb, waitForListenerClosed } from '../../scripts/smoke-dsh-cli.mjs'
 
 const desktopManifest = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'))
 const pinnedDshVersion = desktopManifest.dependencies['@deepseek-ai/dsh'] as string
@@ -120,8 +120,10 @@ async function createRuntimeFixture(cliSource: string): Promise<{ root: string; 
   }))
   await writeFile(cliEntry, cliSource)
   const desktopPatch = path.join(nodeModulesRoot, '@cyunlab', 'dsh-desktop-update-client', 'cordis.patch.yml')
-  await mkdir(path.dirname(desktopPatch), { recursive: true })
-  await writeFile(desktopPatch, '- insert: []\n')
+  const desktopEntry = path.join(path.dirname(desktopPatch), 'lib', 'index.js')
+  await mkdir(path.dirname(desktopEntry), { recursive: true })
+  await writeFile(desktopPatch, "- insert:\n    - id: dsh-desktop-update-client\n      name: '@cyunlab/dsh-desktop-update-client'\n")
+  await writeFile(desktopEntry, 'export function apply() {}\n')
   return { root, contentRoot, eventsFile: path.join(root, 'events.log'), nodeExecutable, nodeModulesRoot, platformName: target.platformName, runtimeArch: target.runtimeArch }
 }
 
@@ -306,7 +308,12 @@ describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TI
       process.env.DSH_FIXTURE_EVENTS = fixture.eventsFile
       await expect(probeBundledRuntime(fixture.contentRoot, fixture.platformName, fixture.runtimeArch)).resolves.toBeUndefined()
       const events = await readFile(fixture.eventsFile, 'utf8')
-      expect(events).toContain(`argv:${JSON.stringify(directDshWebArgs(await realpath(fixture.nodeModulesRoot)))}\n`)
+      const argv = events.split('\n').find(line => line.startsWith('argv:'))
+      expect(argv).toBeDefined()
+      const argumentsList = JSON.parse(argv!.slice('argv:'.length)) as string[]
+      expect(argumentsList.slice(0, 2)).toEqual(['web', '--patch'])
+      expect(argumentsList[2]).toContain(`${path.sep}.dsh-desktop${path.sep}runtime${path.sep}cordis.patch.yml`)
+      expect(argumentsList.slice(3)).toEqual(['--host', '127.0.0.1', '--port', '3080'])
       expect(events).toContain('http-request\n')
       expect(events).toContain('listener-closed\n')
       await expect(waitForListenerClosed()).resolves.toBeUndefined()

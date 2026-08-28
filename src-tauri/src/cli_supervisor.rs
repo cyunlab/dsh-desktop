@@ -4,7 +4,7 @@ use crate::lifecycle::{stop_process, ProcessControl, StopOutcome};
 use serde::Deserialize;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -60,6 +60,9 @@ pub(crate) const HOST_ADDRESS: &str = "127.0.0.1";
 pub(crate) const HOST_PORT: u16 = 3080;
 pub(crate) const HOST_ORIGIN: &str = "http://127.0.0.1:3080/";
 const DESKTOP_UPDATE_PATCH: &str = "@cyunlab/dsh-desktop-update-client/cordis.patch.yml";
+const DESKTOP_UPDATE_CLIENT_ENTRY: &str = "@cyunlab/dsh-desktop-update-client/lib/index.js";
+const DESKTOP_UPDATE_CLIENT_SPECIFIER: &str = "@cyunlab/dsh-desktop-update-client";
+const MATERIALIZED_PATCH_DIRECTORY: &str = ".dsh-desktop/runtime";
 const PINNED_DSH_VERSION: &str = "0.1.0-rc.6";
 #[cfg(windows)]
 const CREATE_NEW_CONSOLE_FLAG: u32 = 0x0000_0010;
@@ -578,25 +581,158 @@ fn resolve_dsh_cli_entry(runtime_root: &Path) -> Result<PathBuf, String> {
 }
 
 /// 解析并约束 Desktop 自有的临时 Web composition patch。
-fn resolve_desktop_update_patch(runtime_root: &Path) -> Result<PathBuf, String> {
+fn resolve_closure_file(
+    runtime_root: &Path,
+    relative_path: &Path,
+    label: &str,
+) -> Result<PathBuf, String> {
     let runtime_root = runtime_root
         .canonicalize()
         .map_err(|error| format!("runtime closure is unavailable: {error}"))?;
-    let patch = runtime_root.join(DESKTOP_UPDATE_PATCH);
-    if fs::symlink_metadata(&patch)
-        .map_err(|error| format!("Desktop update patch is unavailable: {error}"))?
-        .file_type()
-        .is_symlink()
-    {
-        return Err("Desktop update patch must not be a symbolic link".into());
+    let mut candidate = runtime_root.clone();
+    for component in relative_path.components() {
+        candidate.push(component);
+        let metadata = fs::symlink_metadata(&candidate)
+            .map_err(|error| format!("{label} is unavailable: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("{label} must not be a symbolic link"));
+        }
     }
-    let patch = patch
+    let candidate = candidate
         .canonicalize()
-        .map_err(|error| format!("Desktop update patch is unavailable: {error}"))?;
-    if !patch.starts_with(&runtime_root) || !patch.is_file() {
-        return Err("Desktop update patch escapes the runtime closure".into());
+        .map_err(|error| format!("{label} is unavailable: {error}"))?;
+    if !candidate.starts_with(&runtime_root) {
+        return Err(format!("{label} escapes the runtime closure"));
     }
-    Ok(patch)
+    if !candidate.is_file() {
+        return Err(format!("{label} must be a regular file"));
+    }
+    Ok(candidate)
+}
+
+/// 在 isolated Harness Home 中创建并约束 Desktop 私有物化目录。
+fn resolve_materialized_patch_directory(harness_home: &Path) -> Result<PathBuf, String> {
+    if harness_home.exists()
+        && fs::symlink_metadata(harness_home)
+            .map_err(|error| format!("Harness Home is unavailable: {error}"))?
+            .file_type()
+            .is_symlink()
+    {
+        return Err("Harness Home must not be a symbolic link".into());
+    }
+    fs::create_dir_all(harness_home)
+        .map_err(|error| format!("Harness Home cannot be created: {error}"))?;
+    let harness_home = harness_home
+        .canonicalize()
+        .map_err(|error| format!("Harness Home is unavailable: {error}"))?;
+    let mut directory = harness_home.clone();
+    for component in Path::new(MATERIALIZED_PATCH_DIRECTORY).components() {
+        directory.push(component);
+        if directory.exists() {
+            let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+                format!("Desktop materialized patch directory is unavailable: {error}")
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(
+                    "Desktop materialized patch directory must not be a symbolic link".into(),
+                );
+            }
+            if !metadata.is_dir() {
+                return Err("Desktop materialized patch directory must be a directory".into());
+            }
+        } else {
+            fs::create_dir(&directory).map_err(|error| {
+                format!("Desktop materialized patch directory cannot be created: {error}")
+            })?;
+        }
+    }
+    let directory = directory
+        .canonicalize()
+        .map_err(|error| format!("Desktop materialized patch directory is unavailable: {error}"))?;
+    if !directory.starts_with(&harness_home) || directory == harness_home {
+        return Err("Desktop materialized patch directory escapes Harness Home".into());
+    }
+    Ok(directory)
+}
+
+/// 只替换 package-owned patch 中唯一精确的 Desktop Client bare specifier。
+fn materialize_desktop_update_patch(
+    runtime_root: &Path,
+    harness_home: &Path,
+) -> Result<PathBuf, String> {
+    let source_patch = resolve_closure_file(
+        runtime_root,
+        Path::new(DESKTOP_UPDATE_PATCH),
+        "Desktop update patch",
+    )?;
+    let client_entry = resolve_closure_file(
+        runtime_root,
+        Path::new(DESKTOP_UPDATE_CLIENT_ENTRY),
+        "Desktop update client entry",
+    )?;
+    let source = fs::read_to_string(source_patch)
+        .map_err(|error| format!("Desktop update patch cannot be read: {error}"))?;
+    let single_quoted = format!("'{DESKTOP_UPDATE_CLIENT_SPECIFIER}'");
+    let double_quoted = format!("\"{DESKTOP_UPDATE_CLIENT_SPECIFIER}\"");
+    let occurrences =
+        source.matches(&single_quoted).count() + source.matches(&double_quoted).count();
+    if occurrences != 1 {
+        return Err(format!(
+            "Desktop update patch must contain exactly one {DESKTOP_UPDATE_CLIENT_SPECIFIER} specifier"
+        ));
+    }
+    let client_url = tauri::Url::from_file_path(&client_entry)
+        .map_err(|_| "Desktop update client entry cannot be represented as a file URL".to_string())?
+        .to_string();
+    let materialized = if source.contains(&single_quoted) {
+        source.replacen(&single_quoted, &format!("'{client_url}'"), 1)
+    } else {
+        source.replacen(&double_quoted, &format!("\"{client_url}\""), 1)
+    };
+    let directory = resolve_materialized_patch_directory(harness_home)?;
+    let output = directory.join("cordis.patch.yml");
+    if output.exists() {
+        let metadata = fs::symlink_metadata(&output).map_err(|error| {
+            format!("Desktop materialized patch output is unavailable: {error}")
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("Desktop materialized patch output must be a regular file".into());
+        }
+        fs::remove_file(&output).map_err(|error| {
+            format!("Desktop materialized patch output cannot be replaced: {error}")
+        })?;
+    }
+    let temporary = directory.join(format!(".desktop-update-client.{}.tmp", std::process::id()));
+    if temporary.exists() {
+        let metadata = fs::symlink_metadata(&temporary).map_err(|error| {
+            format!("Desktop materialized patch temporary file is unavailable: {error}")
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("Desktop materialized patch temporary file must be a regular file".into());
+        }
+        fs::remove_file(&temporary).map_err(|error| {
+            format!("Desktop materialized patch temporary file cannot be replaced: {error}")
+        })?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("Desktop materialized patch cannot be created: {error}"))?;
+    if let Err(error) = file
+        .write_all(materialized.as_bytes())
+        .and_then(|_| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "Desktop materialized patch cannot be written: {error}"
+        ));
+    }
+    drop(file);
+    fs::rename(&temporary, &output)
+        .map_err(|error| format!("Desktop materialized patch cannot be committed: {error}"))?;
+    Ok(output)
 }
 
 /// 将官方 Node 目录放在继承 PATH 的第一项。
@@ -870,7 +1006,7 @@ pub(crate) fn build_command_plan(
     working_directory: PathBuf,
 ) -> Result<CliCommandPlan, String> {
     let cli_entry = resolve_dsh_cli_entry(runtime_root)?;
-    let desktop_patch = resolve_desktop_update_patch(runtime_root)?;
+    let desktop_patch = materialize_desktop_update_patch(runtime_root, &harness_home)?;
     let path = prepend_node_path(&node_executable, inherited_path())?;
     Ok(CliCommandPlan {
         node_executable,
