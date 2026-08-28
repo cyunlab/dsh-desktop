@@ -19,6 +19,8 @@ futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 tempfile = "3"
 tokio = { version = "1", features = ["time"] }
+flate2 = "1"
+tar = "0.4"
 tauri = { version = "2", features = [] }
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-single-instance = "2.4.3"
@@ -37,6 +39,7 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Threading",
   "Win32_Security",
 ] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
