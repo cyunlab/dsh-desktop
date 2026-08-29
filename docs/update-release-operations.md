@@ -115,6 +115,11 @@ Attach a custom permission policy to the role. Replace `<bucket-name>` and keep 
     },
     {
       "Effect": "Allow",
+      "Action": ["oss:DeleteObject"],
+      "Resource": ["acs:oss:*:*:<bucket-name>/dsh-desktop/channels/stable/promotion.lock"]
+    },
+    {
+      "Effect": "Allow",
       "Action": ["oss:ListObjects"],
       "Resource": ["acs:oss:*:*:<bucket-name>"],
       "Condition": {
@@ -127,7 +132,7 @@ Attach a custom permission policy to the role. Replace `<bucket-name>` and keep 
 }
 ```
 
-Do not grant `oss:*`, bucket administration, object deletion, lifecycle administration, RAM administration, or access to another top-level prefix. The role needs no long-lived credential. The official `aliyun/configure-aliyun-credentials-action` exchanges the GitHub token using `ALIBABA_CLOUD_OIDC_PROVIDER_ARN` and `ALIBABA_CLOUD_ROLE_ARN`, then exports temporary STS credentials for the OSS tooling.
+Do not grant `oss:*`, bucket administration, general object deletion, lifecycle administration, RAM administration, or access to another top-level prefix. `oss:DeleteObject` is allowed only for the exact global promotion lock key shown above; release packages, manifests, receipts, evidence, and every other key remain undeletable by the role. The role needs no long-lived credential. The official `aliyun/configure-aliyun-credentials-action` exchanges the GitHub token using `ALIBABA_CLOUD_OIDC_PROVIDER_ARN` and `ALIBABA_CLOUD_ROLE_ARN`, then exports temporary STS credentials for the OSS tooling.
 
 ## Create and protect the updater signing key
 
@@ -166,7 +171,7 @@ Release procedure:
 6. Candidate preparation reads the authoritative current OSS Stable manifest, records its URL, version, and SHA-256 in candidate metadata, then uses its first short-lived OIDC session only to upload and remotely re-read content-addressed release objects and an isolated immutable candidate manifest. It never calls the Stable replacement operation.
 7. The reusable native smoke workflow consumes that isolated OSS manifest once and runs its internal four-target matrix on Windows x64, Linux x64 AppImage, macOS arm64, and macOS x64. Its aggregate verifier requires exactly those four real-native evidence documents, matching candidate tag, commit, manifest digest, previous Stable identity, and freshness. Fixture or mock evidence is never production admission evidence.
 8. `aggregate-evidence` runs the verifier with `--require-real-native`. `promote-stable` downloads and reverifies the same evidence before its second OIDC exchange; therefore any missing, duplicate, failed, stale, or mismatched evidence prevents final credential exchange and Stable mutation.
-9. Immediately before replacement, final promotion re-reads both the immutable candidate manifest and the authoritative Stable pointer. Either digest changing after candidate preparation fails closed. The byte-identical candidate manifest is then written to `dsh-desktop/channels/stable/latest.json` as the final OSS mutation with `Cache-Control: no-cache`.
+9. Final promotion atomically acquires `dsh-desktop/channels/stable/promotion.lock` through OSS `AppendObject(position=0)`. Its body binds the workflow run/attempt, candidate identity, and previously observed Stable digest. A 409 or 412 means another owner won and fails closed. While holding the lock, promotion re-reads both the immutable candidate manifest and authoritative Stable pointer. Either digest changing after candidate preparation fails closed and preserves the lock for investigation. The byte-identical candidate manifest is then written to `dsh-desktop/channels/stable/latest.json` after every other release mutation, read back byte-for-byte, and only then may the byte-identical lock owner delete the current lock marker.
 10. Independently fetch the manifest and all target URLs through `https://updates.cyunlab.com`. Verify HTTPS, version, release notes, RFC 3339 publication timestamp, literal signatures, cache headers, and a real update path on every target before recording production readiness.
 
 ### One-time first updater bootstrap
@@ -178,6 +183,8 @@ After the four official candidate packages exist on one published GitHub Release
 The reusable bootstrap smoke workflow fresh-installs and launches the official published Windows x64 current-user NSIS EXE, Linux x64 AppImage, macOS arm64 archive, and macOS x64 archive. Its distinct `bootstrap-fresh-install` evidence proves package/signature/manifest identity, updater configuration, installed version, launch, Runtime closure, Official Node, Desktop capability package, update client, and composition patch. It explicitly records `claims_previous_stable_upgrade: false`. This evidence cannot pass `verify-update-smoke-evidence.mjs --require-real-native` and must never be described as 2.0.15 upgrade evidence.
 
 Finalization downloads and re-verifies the attested four-target evidence, then exchanges the final OIDC identity. The publisher re-reads the byte-exact candidate, legacy Stable pointer, evidence set, and absence of any receipt before its first mutation. It writes `dsh-desktop/bootstrap/receipts/<receipt-sha256>-first-updater-stable.json` with immutable caching, reads it back byte-for-byte, re-reads all admission inputs, and replaces `channels/stable/latest.json` last. The receipt binds the approved tag/version/commit, candidate and legacy manifest digests, and an exact evidence-set digest.
+
+Bootstrap finalization participates in the same global promotion lock as normal Stable promotion. It acquires the lock only after evidence admission and before receipt creation, then re-reads all admission inputs while holding it. Stable is the last release-content mutation; the owner verifies the resulting Stable bytes before releasing the lock.
 
 This workflow is used exactly once. Once Stable is updater-capable, all later releases use normal previous-Stable real-native validation. Never change the configured approved identity during a run, manually edit Stable, delete a receipt, or reuse bootstrap for a later release.
 
@@ -217,6 +224,12 @@ Leave the previous Stable manifest untouched. Diagnose and rerun the same immuta
 
 For the first-updater bootstrap, the rule is stricter. A failure before the receipt write may be retried only with the same approved tag, version, commit, byte-identical candidate, unchanged 2.0.15 Stable pointer, and newly admitted complete evidence. A failure during or after receipt creation is a partial bootstrap record and must not be retried. Preserve the receipt, candidate, evidence artifacts, workflow logs, and current Stable version for investigation. Do not delete or rename the receipt. If Stable was not changed, repair the release process and publish a higher version through a separately reviewed recovery decision; if Stable was changed, follow bad-release recovery below.
 
+### Stale promotion lock
+
+Any promotion error or runner crash intentionally leaves `dsh-desktop/channels/stable/promotion.lock` current. Do not automatically expire or overwrite it. Inspect its owner run/attempt, mode, candidate identity, observed Stable digest, workflow status, current and historical Stable versions, candidate/evidence artifacts, and any bootstrap receipt. Confirm no writer is still active. If the attempted Stable write completed, follow bad-release recovery or complete the audit decision before unlocking. Only an authorized administrator may remove the current lock marker after documenting the finding; bucket Versioning preserves its historical version. Never delete another release object as part of lock recovery.
+
+OSS does not support destination `If-Match` on `PutObject`; `CopyObject` conditions bind only the source, and Versioning ignores `x-oss-forbid-overwrite`. The append lock is therefore the actual storage-side atomic primitive, not a simulated read-then-write CAS. Its guarantee covers the two repository workflows that exclusively receive Stable write authority. Alibaba Cloud account-owner actions can bypass this protocol and must be separately restricted and audited.
+
 ### Bad release after promotion
 
 1. Stop further uptake by restoring the prior version of `dsh-desktop/channels/stable/latest.json` using OSS Versioning. Preserve the bad release's immutable objects and the overwritten manifest version for investigation.
@@ -243,6 +256,7 @@ Disable the `production` Environment or publishing role first. Revoke or tighten
 - [ ] Promotion verifies all four updater packages with minisign before writing OSS.
 - [ ] Windows builds explicitly use NSIS `currentUser`; all four binaries embed the production Stable endpoint and the same updater public key used by promotion.
 - [ ] Candidate preparation binds the authoritative previous Stable URL/version/digest, uploads only immutable objects, and leaves Stable unchanged.
+- [ ] Both normal and bootstrap finalizers use the same OSS `AppendObject(position=0)` promotion lock; conflicts fail closed and successful owners verify Stable before releasing it.
 - [ ] Aggregate and final admission both require exact fresh real-native evidence before final OIDC exchange.
 - [ ] Draft creation leaves Stable unchanged; every candidate, smoke, evidence, credential, or revalidation failure also leaves Stable unchanged.
 - [ ] A successful published-release smoke has passed on all four targets and its evidence is recorded.
@@ -266,6 +280,8 @@ Until every checkbox is complete, production automatic updates remain not config
 - [Alibaba Cloud: OSS custom domains](https://www.alibabacloud.com/help/en/oss/user-guide/access-buckets-via-custom-domain-names)
 - [Alibaba Cloud: OSS Versioning and mutually exclusive features](https://www.alibabacloud.com/help/en/oss/user-guide/overview-78/)
 - [Alibaba Cloud: PutObject and `x-oss-forbid-overwrite`](https://www.alibabacloud.com/help/en/oss/developer-reference/putobject)
+- [Alibaba Cloud: PutObject conditional headers are unsupported](https://www.alibabacloud.com/help/en/oss/user-guide/0017-00000245)
+- [Alibaba Cloud: AppendObject and position conflicts](https://www.alibabacloud.com/help/en/oss/developer-reference/appendobject)
 - [Alibaba Cloud: Manage versioned objects](https://www.alibabacloud.com/help/en/oss/user-guide/manage-objects-in-a-versioning-enabled-bucket)
 - [Alibaba Cloud: Configure OSS CORS](https://www.alibabacloud.com/help/en/oss/user-guide/configure-cross-origin-resource-sharing)
 - [Tauri updater documentation](https://v2.tauri.app/plugin/updater/)

@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -132,6 +132,7 @@ export function createOssutilStorage(options) {
     throw new Error('short-lived Alibaba Cloud STS credentials are required')
   }
   const commandEnvironment = { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot }
+  const request = options.fetch ?? globalThis.fetch
   /** 为单次 ossutil 调用创建最小权限配置，并在调用结束后销毁。 */
   async function withOssutilConfig(run) {
     const directory = await mkdtemp(path.join(tmpdir(), 'dsh-ossutil-config-'))
@@ -157,6 +158,28 @@ export function createOssutilStorage(options) {
     if (key.startsWith('/') || key.split('/').some(segment => segment === '..')) throw new Error('unsafe OSS object key')
     if (!key.startsWith(`${prefix}/`)) throw new Error(`OSS object is outside the configured application prefix: ${key}`)
     return `oss://${options.bucket}/${key}`
+  }
+  /** 使用 OSS Signature V1 和现有 STS 凭据执行不经 shell 的对象请求。 */
+  async function signedObjectRequest(method, key, body = Buffer.alloc(0), query = '') {
+    objectUri(key)
+    const date = (options.now?.() ?? new Date()).toUTCString()
+    const contentType = body.length > 0 ? 'application/json; charset=utf-8' : ''
+    const canonicalQuery = query ? `?${query}` : ''
+    const canonicalResource = `/${options.bucket}/${key}${canonicalQuery}`
+    const canonicalHeaders = `x-oss-security-token:${credentials.securityToken}\n`
+    const stringToSign = `${method}\n\n${contentType}\n${date}\n${canonicalHeaders}${canonicalResource}`
+    const signature = createHmac('sha1', credentials.accessKeySecret).update(stringToSign).digest('base64')
+    const encodedKey = key.split('/').map(encodeURIComponent).join('/')
+    return request(`https://${options.bucket}.oss-${options.region}.aliyuncs.com/${encodedKey}${canonicalQuery}`, {
+      method,
+      body: body.length > 0 ? body : undefined,
+      headers: {
+        ...(contentType ? { 'Content-Type': contentType } : {}),
+        Date: date,
+        'x-oss-security-token': credentials.securityToken,
+        Authorization: `OSS ${credentials.accessKeyId}:${signature}`
+      }
+    })
   }
   /** 读取 OSS 对象的原始字节。 */
   async function readObject(key) {
@@ -212,6 +235,21 @@ export function createOssutilStorage(options) {
         .map(value => value.slice(bucketPrefix.length))
         .filter(key => key.startsWith(keyPrefix))
         .sort()
+    },
+    /** 以 AppendObject position=0 原子获取全局 promotion lock；竞争者由 OSS 拒绝。 */
+    async acquirePromotionLock(key, ownerBody) {
+      const response = await signedObjectRequest('POST', key, ownerBody, 'append&position=0')
+      if (response.status === 409 || response.status === 412) throw new Error('promotion lock acquisition conflict')
+      if (!response.ok) throw new Error(`promotion lock acquisition failed with OSS status ${response.status}`)
+      const remote = await readObject(key)
+      if (!remote.equals(ownerBody)) throw new Error('promotion lock owner bytes differ after acquisition')
+    },
+    /** 仅在远端 owner bytes 仍匹配时释放 promotion lock；异常路径不调用。 */
+    async releasePromotionLock(key, ownerBody) {
+      const remote = await readObject(key)
+      if (!remote.equals(ownerBody)) throw new Error('promotion lock ownership changed')
+      const response = await signedObjectRequest('DELETE', key)
+      if (!response.ok) throw new Error(`promotion lock release failed with OSS status ${response.status}`)
     },
     readObject
   }
@@ -335,6 +373,29 @@ async function publishImmutableObjects(objects, storage) {
   }
 }
 
+/** 构造绑定 run、candidate 与最终观测 Stable identity 的全局 promotion lock。 */
+function createPromotionLock(prefix, mode, candidate, stableDigest, lockOwner) {
+  if (!String(lockOwner ?? '').trim()) throw new Error('a unique promotion lock owner is required')
+  const key = `${prefix}/channels/stable/promotion.lock`
+  const body = Buffer.from(`${JSON.stringify({
+    schema_version: 1,
+    owner: lockOwner,
+    mode,
+    candidate_tag: candidate.candidate_tag,
+    candidate_commit: candidate.candidate_commit,
+    candidate_manifest_sha256: candidate.manifest_sha256,
+    observed_stable_manifest_sha256: stableDigest
+  }, null, 2)}\n`)
+  return { key, body }
+}
+
+/** 要求 storage 提供 OSS 服务端原子锁，而不允许退回 read-then-write。 */
+function requirePromotionLockStorage(storage) {
+  if (typeof storage.acquirePromotionLock !== 'function' || typeof storage.releasePromotionLock !== 'function') {
+    throw new Error('OSS atomic promotion lock support is required')
+  }
+}
+
 /** 准备供四个原生 smoke 使用的不可变 candidate，但不修改 Stable pointer。 */
 export async function prepareStableCandidate(options, storage, dependencies = {}) {
   if (!/^[0-9a-f]{40}$/.test(options.candidateCommit ?? '')) {
@@ -389,6 +450,15 @@ export async function finalizeStableCandidate(candidate, storage, options = {}) 
   if (!/^[0-9a-f]{64}$/.test(candidate.previous_stable_manifest_sha256 ?? '')) {
     throw new Error('previous Stable manifest digest is invalid')
   }
+  requirePromotionLockStorage(storage)
+  const promotionLock = createPromotionLock(
+    prefix,
+    'normal-stable-promotion',
+    candidate,
+    candidate.previous_stable_manifest_sha256,
+    options.lockOwner
+  )
+  await storage.acquirePromotionLock(promotionLock.key, promotionLock.body)
   const stableKey = `${prefix}/channels/stable/latest.json`
   const stableUrl = new URL(candidate.previous_stable_url)
   if (stableUrl.protocol !== 'https:' || !stableUrl.pathname.endsWith(`/${stableKey}`)) {
@@ -413,6 +483,9 @@ export async function finalizeStableCandidate(candidate, storage, options = {}) 
     remoteManifest,
     { cacheControl: 'no-cache', contentType: 'application/json; charset=utf-8' }
   )
+  const promotedStable = await storage.readObject(stableKey)
+  if (!promotedStable.equals(remoteManifest)) throw new Error('Stable manifest differs after promotion write')
+  await storage.releasePromotionLock(promotionLock.key, promotionLock.body)
   return candidate.manifest
 }
 
@@ -606,7 +679,16 @@ export async function finalizeBootstrapStableCandidate(candidate, storage, optio
   const receiptSha256 = createHash('sha256').update(receiptBody).digest('hex')
   const receiptKey = `${prefix}/bootstrap/receipts/${receiptSha256}-first-updater-stable.json`
 
-  // receipt 是第一次 OSS mutation；此前再次读取全部 admission 状态并拒绝任何漂移。
+  // lock 后 receipt 是第一次 release-content mutation；此前再次读取全部 admission 状态并拒绝漂移。
+  requirePromotionLockStorage(storage)
+  const promotionLock = createPromotionLock(
+    prefix,
+    'first-updater-bootstrap',
+    candidate,
+    legacy.digest,
+    options.lockOwner
+  )
+  await storage.acquirePromotionLock(promotionLock.key, promotionLock.body)
   const finalLegacy = await readLegacyStable(storage, prefix)
   if (!finalLegacy.body.equals(legacy.body)) throw new Error('legacy Stable changed before bootstrap receipt write')
   await requireBootstrapReceiptAbsent(storage, prefix)
@@ -633,6 +715,9 @@ export async function finalizeBootstrapStableCandidate(candidate, storage, optio
     cacheControl: 'no-cache',
     contentType: 'application/json; charset=utf-8'
   })
+  const promotedStable = await storage.readObject(legacy.stableKey)
+  if (!promotedStable.equals(remoteCandidate.body)) throw new Error('Stable manifest differs after bootstrap write')
+  await storage.releasePromotionLock(promotionLock.key, promotionLock.body)
   return { manifest: candidate.manifest, receipt_key: receiptKey, receipt_sha256: receiptSha256 }
 }
 
@@ -693,7 +778,10 @@ export async function runCandidateFinalizationCli(environment = process.env, dep
   if (!values.candidate) throw new Error('--candidate is required for final promotion')
   const candidate = JSON.parse(await readFile(values.candidate, 'utf8'))
   const storage = createProductionStorage(environment, dependencies, prefix)
-  return (dependencies.finalize ?? finalizeStableCandidate)(candidate, storage, { prefix })
+  return (dependencies.finalize ?? finalizeStableCandidate)(candidate, storage, {
+    prefix,
+    lockOwner: `${environment.GITHUB_RUN_ID ?? 'local'}:${environment.GITHUB_RUN_ATTEMPT ?? '0'}:${candidate.candidate_commit}`
+  })
 }
 
 /** 解析一次性 bootstrap preparation CLI 并持久化不可变 candidate identity。 */
@@ -747,6 +835,7 @@ export async function runBootstrapFinalizationCli(environment = process.env, dep
     prefix,
     evidenceDirectory: values.evidence,
     maxAgeHours: Number(values['max-age-hours']),
+    lockOwner: `${environment.GITHUB_RUN_ID ?? 'local'}:${environment.GITHUB_RUN_ATTEMPT ?? '0'}:${candidate.candidate_commit}`,
     ...approval
   }, { verifyEvidence: dependencies.verifyEvidence })
 }
