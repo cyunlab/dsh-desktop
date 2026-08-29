@@ -62,10 +62,10 @@ describe('automatic update release operations guide', () => {
   it('separates build signing access from promotion cloud identity', () => {
     const guide = readFileSync(operationsGuideUrl, 'utf8')
 
-    expect(guide).toContain('Exactly two OSS jobs consume Alibaba Cloud OIDC provider/role variables')
+    expect(guide).toContain('In the normal path, exactly two OSS jobs consume Alibaba Cloud OIDC provider/role variables')
     expect(guide).toContain('`prepare-candidate` may write only content-addressed immutable objects')
-    expect(guide).toContain('Native smoke jobs receive no ID token')
-    expect(guide).toContain('aggregate evidence job may request a GitHub OIDC token only to attest')
+    expect(guide).toContain('Native smoke jobs receive no id-token permission')
+    expect(guide).toContain('Evidence admission jobs may use GitHub\'s token to verify artifact attestations')
     expect(guide).not.toContain('Only the promotion job may reference this Environment')
   })
 
