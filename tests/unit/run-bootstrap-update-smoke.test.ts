@@ -30,6 +30,8 @@ async function inputs() {
     candidateSignature,
     candidatePackageUrl: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/windows-x86_64/placeholder-package.exe',
     candidateReleaseUrl: 'https://github.com/cyunlab/dsh-desktop/releases/tag/v2.1.0',
+    expectedUpdaterEndpoint: 'https://updates.cyunlab.com/dsh-desktop/channels/stable/latest.json',
+    expectedUpdaterPublicKey: Buffer.from('untrusted comment: minisign public key fixture\nRWQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA').toString('base64'),
     outputDirectory: directory
   }
 }
@@ -46,8 +48,8 @@ describe('bootstrap update smoke producer public seam', () => {
     await expect(readFile(path.join(options.outputDirectory, 'windows-x86_64.json'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  /** production producer 只允许固定 repo-owned driver，且未实现 driver 必须明确 fail closed。 */
-  it('rejects external drivers and emits nothing from the intentionally unimplemented native driver', async () => {
+  /** production producer 只允许固定 repo-owned driver，错误 runner 必须在产证前 fail closed。 */
+  it('rejects external drivers and emits nothing on a mismatched native runner', async () => {
     const external = await inputs()
     await expect(runBootstrapUpdateSmoke(external, { DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER: '/tmp/untrusted-bootstrap-driver' }))
       .rejects.toThrow('fixed repository-owned native driver')
@@ -55,7 +57,7 @@ describe('bootstrap update smoke producer public seam', () => {
     await expect(runBootstrapUpdateSmoke(repositoryOwned, {
       DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER: 'scripts/bootstrap-update-smoke-driver.mjs',
       PATH: process.env.PATH
-    })).rejects.toThrow('native bootstrap fresh-install automation is not implemented')
+    })).rejects.toThrow('hosted runner does not match bootstrap target')
     await expect(readFile(path.join(repositoryOwned.outputDirectory, 'windows-x86_64.json'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
@@ -74,13 +76,30 @@ describe('bootstrap update smoke producer public seam', () => {
       observations: Object.fromEntries([
         'updater_endpoint_enabled', 'updater_public_key_enabled', 'updater_signature_verified', 'immutable_object_identity_verified',
         'official_node', 'cli_runtime_closure', 'desktop_capabilities_package', 'desktop_update_client_package', 'composition_patch'
-      ].map(key => [key, true]))
+      ].map(key => [key, true])),
+      observation_sources: {
+        configuration_identity: 'runtime-jsonl', signature_identity: 'node-ed25519-minisign', package_identity: 'immutable-manifest-sha256',
+        installation_identity: 'native-platform', host_readiness: 'fixed-origin-http', runtime_closure: 'installed-filesystem'
+      }
     }
-    const result = await runBootstrapUpdateSmoke(options, { DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER: '/test/adapter' }, {
-      runDriver: async () => ({ stdout: Buffer.from(JSON.stringify(observation)), stderr: '' })
+    let invocation: { args?: string[]; environment?: Record<string, string> } = {}
+    const result = await runBootstrapUpdateSmoke(options, { DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER: '/test/adapter', PATH: '/trusted/bin', HOME: '/home/runner', TMPDIR: '/tmp' }, {
+      runDriver: async (_executable: string, args: string[], environment: Record<string, string>) => {
+        invocation = { args, environment }
+        return { stdout: Buffer.from(JSON.stringify(observation)), stderr: '' }
+      }
     })
     expect(result.evidence.evidence_kind).toBe('bootstrap-local-fixture')
     expect(result.evidence.claims_previous_stable_upgrade).toBe(false)
     expect(await readFile(result.checksumPath, 'utf8')).toMatch(/^[0-9a-f]{64}  windows-x86_64\.json\n$/)
+    expect(invocation.args).toEqual(expect.arrayContaining([
+      '--candidate-manifest-url', options.candidateManifestUrl,
+      '--candidate-package-url', options.candidatePackageUrl,
+      '--expected-updater-endpoint', options.expectedUpdaterEndpoint,
+      '--expected-updater-public-key', options.expectedUpdaterPublicKey,
+      '--expected-manifest-sha256', createHash('sha256').update('{"version":"2.1.0"}\n').digest('hex'),
+      '--expected-package-sha256', digest
+    ]))
+    expect(invocation.environment).toEqual({ PATH: '/trusted/bin', HOME: '/home/runner', TMPDIR: '/tmp', DSH_BOOTSTRAP_UPDATE_SMOKE_OUTPUT: 'json' })
   })
 })

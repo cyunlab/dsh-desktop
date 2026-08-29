@@ -10,6 +10,9 @@ export interface BootstrapUpdateSmokeOptions {
   readonly candidateSignature: string
   readonly candidatePackageUrl: string
   readonly candidateReleaseUrl: string
+  readonly expectedUpdaterEndpoint: string
+  readonly expectedUpdaterPublicKey: string
+  readonly signingConfigured?: 'true' | 'false'
   readonly outputDirectory: string
 }
 

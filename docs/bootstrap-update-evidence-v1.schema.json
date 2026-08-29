@@ -4,7 +4,7 @@
   "title": "DSH Desktop first-updater bootstrap fresh-install evidence v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "evidence_kind", "claims_previous_stable_upgrade", "target", "runner", "candidate", "installation", "started_at", "completed_at", "platform", "observations"],
+  "required": ["schema_version", "evidence_kind", "claims_previous_stable_upgrade", "target", "runner", "candidate", "installation", "started_at", "completed_at", "platform", "observations", "observation_sources"],
   "properties": {
     "schema_version": { "const": 1 },
     "evidence_kind": { "enum": ["bootstrap-fresh-install", "bootstrap-local-fixture"] },
@@ -56,6 +56,19 @@
         "desktop_capabilities_package": { "const": true },
         "desktop_update_client_package": { "const": true },
         "composition_patch": { "const": true }
+      }
+    },
+    "observation_sources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configuration_identity", "signature_identity", "package_identity", "installation_identity", "host_readiness", "runtime_closure"],
+      "properties": {
+        "configuration_identity": { "const": "runtime-jsonl" },
+        "signature_identity": { "const": "node-ed25519-minisign" },
+        "package_identity": { "const": "immutable-manifest-sha256" },
+        "installation_identity": { "const": "native-platform" },
+        "host_readiness": { "const": "fixed-origin-http" },
+        "runtime_closure": { "const": "installed-filesystem" }
       }
     },
     "diagnostics": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^\\r\\n\\u0000]+$" }
