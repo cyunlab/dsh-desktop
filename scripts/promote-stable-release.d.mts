@@ -7,6 +7,10 @@ export interface PromotionStorage {
   readObject(key: string): Promise<Buffer>
   /** 列出指定应用前缀下的对象键。 */
   listObjects?(prefix: string): Promise<readonly string[]>
+  /** 使用 OSS AppendObject(position=0) 原子获取全局 Stable promotion lock。 */
+  acquirePromotionLock?(key: string, ownerBody: Buffer): Promise<void>
+  /** 仅在 owner bytes 仍一致时释放全局 Stable promotion lock。 */
+  releasePromotionLock?(key: string, ownerBody: Buffer): Promise<void>
 }
 
 export interface BootstrapStableCandidate {
@@ -69,6 +73,8 @@ export interface OssutilStorageOptions {
     readonly securityToken: string
   }
   readonly runOssutil?: (args: string[], options: { readonly env: NodeJS.ProcessEnv }) => Promise<OssutilResult>
+  readonly fetch?: typeof globalThis.fetch
+  readonly now?: () => Date
 }
 
 /** 创建使用短期 STS 环境变量的 OSS 存储适配器。 */
@@ -99,7 +105,7 @@ export function prepareStableCandidate(
 export function finalizeStableCandidate(
   candidate: StableCandidate,
   storage: PromotionStorage,
-  options?: { readonly prefix?: string }
+  options: { readonly prefix?: string; readonly lockOwner: string }
 ): Promise<StableManifest>
 
 /** 准备一次性首个 updater Stable candidate，但不创建 receipt 或写 Stable。 */
@@ -132,6 +138,7 @@ export function finalizeBootstrapStableCandidate(
     readonly approvedVersion?: string
     readonly approvedCommit?: string
     readonly approvedLegacyManifestSha256?: string
+    readonly lockOwner: string
   },
   dependencies?: Readonly<Record<string, unknown>>
 ): Promise<{ readonly manifest: StableManifest; readonly receipt_key: string; readonly receipt_sha256: string }>

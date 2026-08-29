@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 import {
   finalizeBootstrapStableCandidate,
   prepareBootstrapStableCandidate,
+  createOssutilStorage,
   runBootstrapFinalizationCli,
   type BootstrapStableCandidate,
   type PromotionStorage
@@ -45,6 +46,16 @@ function createBootstrapStorage(): PromotionStorage & {
     async listObjects(prefix) {
       events.push(`list:${prefix}`)
       return [...objects.keys()].filter(key => key.startsWith(prefix)).sort()
+    },
+    async acquirePromotionLock(key, body) {
+      events.push(`lock:${key}`)
+      if (objects.has(key)) throw new Error('promotion lock acquisition conflict')
+      objects.set(key, Buffer.from(body))
+    },
+    async releasePromotionLock(key, ownerBody) {
+      events.push(`unlock:${key}`)
+      if (!objects.get(key)?.equals(ownerBody)) throw new Error('promotion lock ownership changed')
+      objects.delete(key)
     }
   }
 }
@@ -162,7 +173,8 @@ describe('one-time first-updater Stable bootstrap', () => {
       const result = await finalizeBootstrapStableCandidate(candidate, storage, {
         prefix: 'dsh-desktop',
         evidenceDirectory: evidence,
-        maxAgeHours: 24
+        maxAgeHours: 24,
+        lockOwner: `test-run:1:${COMMIT}`
       }, {
         verifyEvidence: async (_directory: string, expectations: Readonly<Record<string, unknown>>) => {
           expect(expectations).toMatchObject({
@@ -179,14 +191,70 @@ describe('one-time first-updater Stable bootstrap', () => {
       const receiptEnsure = storage.events.findIndex(event => event === `ensure:${result.receipt_key}`)
       const receiptRead = storage.events.findIndex(event => event === `read:${result.receipt_key}`)
       const stableWrite = storage.events.findIndex(event => event === 'replace:dsh-desktop/channels/stable/latest.json')
+      const lock = storage.events.findIndex(event => event === 'lock:dsh-desktop/channels/stable/promotion.lock')
+      const unlock = storage.events.findIndex(event => event === 'unlock:dsh-desktop/channels/stable/promotion.lock')
+      expect(lock).toBeGreaterThan(-1)
       expect(receiptEnsure).toBeGreaterThan(-1)
       expect(receiptRead).toBeGreaterThan(receiptEnsure)
       expect(stableWrite).toBeGreaterThan(receiptRead)
+      expect(unlock).toBeGreaterThan(stableWrite)
       expect(storage.objects.get('dsh-desktop/channels/stable/latest.json'))
         .toEqual(storage.objects.get(new URL(candidate.manifest_url).pathname.slice(1)))
     } finally {
       await rm(evidence, { recursive: true, force: true })
     }
+  })
+
+  /** OSS AppendObject position=0 的 409 竞争失败必须映射为 fail-closed lock 冲突。 */
+  it.each([409, 412])('maps OSS append-lock conflict status %s to a rejected promotion', async status => {
+    const storage = createOssutilStorage({
+      bucket: 'release-bucket',
+      region: 'cn-shenzhen',
+      prefix: 'dsh-desktop',
+      credentials: { accessKeyId: 'temporary-id', accessKeySecret: 'temporary-secret', securityToken: 'temporary-token' },
+      fetch: async () => new Response('<Error><Code>PositionNotEqualToLength</Code></Error>', { status })
+    })
+    await expect(storage.acquirePromotionLock!(
+      'dsh-desktop/channels/stable/promotion.lock',
+      Buffer.from('{"owner":"run-1"}\n')
+    )).rejects.toThrow('promotion lock acquisition conflict')
+  })
+
+  /** lock adapter 使用服务端 position=0 条件请求，并只由 byte-identical owner 删除。 */
+  it('acquires and releases the global lock through signed OSS requests', async () => {
+    const owner = Buffer.from('{"owner":"run-1"}\n')
+    const requests: Array<{ url: string; init: RequestInit }> = []
+    const storage = createOssutilStorage({
+      bucket: 'release-bucket',
+      region: 'cn-shenzhen',
+      prefix: 'dsh-desktop',
+      credentials: { accessKeyId: 'temporary-id', accessKeySecret: 'temporary-secret', securityToken: 'temporary-token' },
+      now: () => new Date('2026-08-29T07:00:00Z'),
+      fetch: async (url, init) => {
+        requests.push({ url: String(url), init: init! })
+        return new Response(init?.method === 'DELETE' ? null : '', { status: init?.method === 'DELETE' ? 204 : 200 })
+      },
+      runOssutil: async args => {
+        expect(args[0]).toBe('cat')
+        return { stdout: owner, stderr: '' }
+      }
+    })
+    const key = 'dsh-desktop/channels/stable/promotion.lock'
+
+    await storage.acquirePromotionLock!(key, owner)
+    await storage.releasePromotionLock!(key, owner)
+
+    expect(requests).toHaveLength(2)
+    expect(requests[0]).toMatchObject({
+      url: 'https://release-bucket.oss-cn-shenzhen.aliyuncs.com/dsh-desktop/channels/stable/promotion.lock?append&position=0',
+      init: { method: 'POST', body: owner }
+    })
+    expect(new Headers(requests[0].init.headers).get('authorization')).toMatch(/^OSS temporary-id:/)
+    expect(new Headers(requests[0].init.headers).get('x-oss-security-token')).toBe('temporary-token')
+    expect(requests[1]).toMatchObject({
+      url: 'https://release-bucket.oss-cn-shenzhen.aliyuncs.com/dsh-desktop/channels/stable/promotion.lock',
+      init: { method: 'DELETE' }
+    })
   })
 
   /** 任一前置状态漂移或 evidence 缺失都会在 receipt/Stable 写入前失败。 */
@@ -199,7 +267,7 @@ describe('one-time first-updater Stable bootstrap', () => {
       if (mutation === 'receipt') storage.objects.set('dsh-desktop/bootstrap/receipts/partial.json', Buffer.from('partial'))
       try {
         await expect(finalizeBootstrapStableCandidate(candidate, storage, {
-          prefix: 'dsh-desktop', evidenceDirectory: evidence, maxAgeHours: 24
+          prefix: 'dsh-desktop', evidenceDirectory: evidence, maxAgeHours: 24, lockOwner: `test-run:1:${COMMIT}`
         }, {
           verifyEvidence: async () => {
             if (mutation === 'evidence') throw new Error('missing bootstrap target evidence')
@@ -222,7 +290,7 @@ describe('one-time first-updater Stable bootstrap', () => {
     storage.objects.set(new URL(candidate.manifest_url).pathname.slice(1), Buffer.from('{"tampered":true}\n'))
     try {
       await expect(finalizeBootstrapStableCandidate(candidate, storage, {
-        prefix: 'dsh-desktop', evidenceDirectory: evidence, maxAgeHours: 24
+        prefix: 'dsh-desktop', evidenceDirectory: evidence, maxAgeHours: 24, lockOwner: `test-run:1:${COMMIT}`
       }, { verifyEvidence: async () => ({ schemaVersion: 1, targets: [] }) }))
         .rejects.toThrow('bootstrap candidate manifest digest mismatch')
       expect(storage.events.some(event => event.startsWith('ensure:dsh-desktop/bootstrap/receipts/'))).toBe(false)
@@ -247,7 +315,7 @@ describe('one-time first-updater Stable bootstrap', () => {
     }
     try {
       await expect(finalizeBootstrapStableCandidate(candidate, storage, {
-        prefix: 'dsh-desktop', evidenceDirectory: evidence, maxAgeHours: 24
+        prefix: 'dsh-desktop', evidenceDirectory: evidence, maxAgeHours: 24, lockOwner: `test-run:1:${COMMIT}`
       }, { verifyEvidence: async () => ({ schemaVersion: 1, targets: [] }) }))
         .rejects.toThrow('bootstrap receipt set changed')
       expect(storage.events.some(event => event.startsWith('replace:'))).toBe(false)

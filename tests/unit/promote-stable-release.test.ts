@@ -60,7 +60,19 @@ function createStorage(): PromotionStorage & {
     /** 记录远端验证边界的调用顺序。 */
     async readObject(key) {
       events.push(`read:${key}`)
-      return writes.find(write => write.key === key)?.body ?? Buffer.alloc(0)
+      for (let index = writes.length - 1; index >= 0; index -= 1) {
+        if (writes[index].key === key) return writes[index].body
+      }
+      return Buffer.alloc(0)
+    },
+    /** 原子获取全局 Stable promotion lock。 */
+    async acquirePromotionLock(key, body) {
+      events.push(`lock:${key}`)
+      writes.push({ key, body, cacheControl: 'no-cache' })
+    },
+    /** 仅由持有者释放全局 Stable promotion lock。 */
+    async releasePromotionLock(key) {
+      events.push(`unlock:${key}`)
     }
   }
 }
@@ -138,13 +150,16 @@ describe('Stable update promotion', () => {
       }, storage, { verifySignature: async () => {} })
       storage.events.length = 0
 
-      const manifest = await finalizeStableCandidate(candidate, storage, { prefix: 'dsh-desktop' })
+      const manifest = await finalizeStableCandidate(candidate, storage, { prefix: 'dsh-desktop', lockOwner: `test-run:1:${candidate.candidate_commit}` })
 
       expect(manifest).toEqual(candidate.manifest)
       expect(storage.events).toEqual([
+        'lock:dsh-desktop/channels/stable/promotion.lock',
         'read:dsh-desktop/channels/stable/latest.json',
         expect.stringMatching(/^read:dsh-desktop\/candidates\/2\.1\.0\//),
-        'replace:dsh-desktop/channels/stable/latest.json'
+        'replace:dsh-desktop/channels/stable/latest.json',
+        'read:dsh-desktop/channels/stable/latest.json',
+        'unlock:dsh-desktop/channels/stable/promotion.lock'
       ])
       expect(storage.writes.at(-1)).toMatchObject({
         key: 'dsh-desktop/channels/stable/latest.json',
@@ -179,7 +194,7 @@ describe('Stable update promotion', () => {
         return Buffer.from('{"tampered":true}\n')
       }
 
-      await expect(finalizeStableCandidate(candidate, storage, { prefix: 'dsh-desktop' }))
+      await expect(finalizeStableCandidate(candidate, storage, { prefix: 'dsh-desktop', lockOwner: `test-run:1:${candidate.candidate_commit}` }))
         .rejects.toThrow('candidate manifest digest mismatch')
       expect(storage.events.some(event => event.startsWith('replace:'))).toBe(false)
     } finally {
@@ -205,8 +220,10 @@ describe('Stable update promotion', () => {
       storage.events.length = 0
       storage.writes[0].body = Buffer.from(JSON.stringify({ version: '2.0.16', platforms: {} }))
 
-      await expect(finalizeStableCandidate(candidate, storage, { prefix: 'dsh-desktop' }))
+      await expect(finalizeStableCandidate(candidate, storage, { prefix: 'dsh-desktop', lockOwner: `test-run:1:${candidate.candidate_commit}` }))
         .rejects.toThrow('previous Stable manifest changed after candidate preparation')
+      expect(storage.events).toContain('lock:dsh-desktop/channels/stable/promotion.lock')
+      expect(storage.events).not.toContain('unlock:dsh-desktop/channels/stable/promotion.lock')
       expect(storage.events.some(event => event.startsWith('replace:'))).toBe(false)
     } finally {
       await rm(directory, { recursive: true, force: true })
