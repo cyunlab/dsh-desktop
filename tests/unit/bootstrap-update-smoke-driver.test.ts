@@ -49,9 +49,11 @@ describe('native bootstrap runtime configuration observation seam', () => {
   /** 启动日志必须精确绑定 endpoint、公钥摘要、平台、PID 与本次启动时间窗。 */
   it('admits only the configuration identity emitted by this Desktop launch', () => {
     const launchedAt = Date.now() - 1_000
-    const event = { event: 'updater-configuration-identity', correlation_id: 'updater-configuration', endpoint: 'https://updates.cyunlab.com/dsh-desktop/channels/stable/latest.json', public_key_sha256: 'a'.repeat(64), platform: 'linux-x86_64', process_id: 1234, recorded_at: new Date().toISOString() }
-    expect(verifyConfigurationIdentityEvent(event, { endpoint: event.endpoint, publicKeySha256: 'a'.repeat(64), platform: 'linux-x86_64', processId: 1234, launchedAt })).toBe(true)
-    expect(() => verifyConfigurationIdentityEvent({ ...event, process_id: 99 }, { endpoint: event.endpoint, publicKeySha256: 'a'.repeat(64), platform: 'linux-x86_64', processId: 1234, launchedAt })).toThrow('process')
+    const event = { event: 'updater-configuration-identity', app_version: '2.1.0', correlation_id: 'updater-configuration', endpoint: 'https://updates.cyunlab.com/dsh-desktop/channels/stable/latest.json', public_key_sha256: 'a'.repeat(64), platform: 'linux-x86_64', process_id: 1234, recorded_at: new Date().toISOString() }
+    const expectations = { endpoint: event.endpoint, publicKeySha256: 'a'.repeat(64), appVersion: '2.1.0', platform: 'linux-x86_64', processId: 1234, launchedAt }
+    expect(verifyConfigurationIdentityEvent(event, expectations)).toBe(true)
+    expect(() => verifyConfigurationIdentityEvent({ ...event, process_id: 99 }, expectations)).toThrow('process')
+    expect(() => verifyConfigurationIdentityEvent({ ...event, app_version: '9.9.9' }, expectations)).toThrow('version')
   })
 })
 

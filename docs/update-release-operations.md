@@ -43,6 +43,7 @@ Set these Environment variables exactly as shown:
 | `UPDATER_BOOTSTRAP_VERSION` | Exact semantic version matching `UPDATER_BOOTSTRAP_TAG` |
 | `UPDATER_BOOTSTRAP_COMMIT` | Exact 40-character lowercase Git commit resolved by the approved tag |
 | `UPDATER_BOOTSTRAP_LEGACY_MANIFEST_SHA256` | Lowercase SHA-256 of the byte-exact authoritative 2.0.15 OSS Stable manifest captured during approval |
+| `UPDATER_BOOTSTRAP_MACOS_SIGNING_CONFIGURED` | Literal `true` requires Apple trust checks; literal `false` explicitly approves unsigned macOS; missing or any other value fails closed |
 
 Set these Environment secrets exactly as shown:
 
@@ -251,7 +252,7 @@ Disable the `production` Environment or publishing role first. Revoke or tighten
 - [ ] RAM permissions cannot read, write, list, delete, or administer outside the required `dsh-desktop/` scope.
 - [ ] The publishing RAM role has no object delete permission and immutable release objects are retained permanently.
 - [ ] Every package and signature basename starts with its deterministic SHA-256 prefix; same-key retries verify byte-for-byte identity before reuse.
-- [ ] All normal Environment variables, the four fixed `UPDATER_BOOTSTRAP_*` approval variables, and both Environment secrets use the exact names in this runbook.
+- [ ] All normal Environment variables, the five fixed `UPDATER_BOOTSTRAP_*` approval variables, and both Environment secrets use the exact names in this runbook.
 - [ ] `TAURI_SIGNING_PUBLIC_KEY` matches both the protected private key and the public key embedded in Desktop; offline encrypted restore has been tested.
 - [ ] Promotion verifies all four updater packages with minisign before writing OSS.
 - [ ] Windows builds explicitly use NSIS `currentUser`; all four binaries embed the production Stable endpoint and the same updater public key used by promotion.

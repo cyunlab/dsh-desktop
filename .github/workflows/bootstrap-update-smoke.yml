@@ -24,11 +24,6 @@ on:
         required: false
         default: dsh-desktop
         type: string
-      signing_configured:
-        description: Require macOS signing and notarization observations
-        required: false
-        default: false
-        type: boolean
     secrets:
       APPLE_SIGNING_IDENTITY:
         required: false
@@ -156,13 +151,14 @@ jobs:
           TARGET: ${{ matrix.target }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          SIGNING_CONFIGURED: ${{ inputs.signing_configured }}
+          SIGNING_CONFIGURED: ${{ vars.UPDATER_BOOTSTRAP_MACOS_SIGNING_CONFIGURED }}
           UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
           TAURI_SIGNING_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
         run: |
           set -euo pipefail
           test -n "$UPDATE_BASE_URL"
           test -n "$TAURI_SIGNING_PUBLIC_KEY"
+          test "$SIGNING_CONFIGURED" = true || test "$SIGNING_CONFIGURED" = false
           expected_updater_endpoint="${UPDATE_BASE_URL%/}/dsh-desktop/channels/stable/latest.json"
           candidate_artifact="$(node -p "require('./bootstrap-assets/candidate/asset.json').artifactPath")"
           candidate_signature="$(node -p "require('./bootstrap-assets/candidate/asset.json').signaturePath")"

@@ -160,7 +160,6 @@ jobs:
       manifest_url: ${{ needs.prepare-bootstrap.outputs.manifest_url }}
       manifest_sha256: ${{ needs.prepare-bootstrap.outputs.manifest_sha256 }}
       artifact_name_prefix: dsh-desktop
-      signing_configured: true
 
   admit-bootstrap-evidence:
     name: Admit exact bootstrap evidence

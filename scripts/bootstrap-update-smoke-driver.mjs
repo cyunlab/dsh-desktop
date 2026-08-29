@@ -140,6 +140,7 @@ function requireHostPortFree() {
 export function verifyConfigurationIdentityEvent(event, expectations) {
   if (event?.event !== 'updater-configuration-identity' || event.correlation_id !== 'updater-configuration') throw new Error('invalid updater configuration identity event')
   if (event.endpoint !== expectations.endpoint || event.public_key_sha256 !== expectations.publicKeySha256 || event.platform !== expectations.platform) throw new Error('updater configuration identity mismatch')
+  if (event.app_version !== expectations.appVersion) throw new Error('updater configuration app version mismatch')
   if (!Number.isSafeInteger(event.process_id) || event.process_id <= 0 || (expectations.processId && event.process_id !== expectations.processId)) throw new Error('updater configuration process mismatch')
   const recordedAt = Date.parse(event.recorded_at)
   if (!Number.isFinite(recordedAt) || recordedAt < expectations.launchedAt - 5_000 || recordedAt > Date.now() + 5_000) throw new Error('updater configuration timestamp is outside this launch')
@@ -282,6 +283,7 @@ export async function runNativeBootstrapDriver(options, environment = process.en
   if (!contract || process.platform !== contract.platform || process.arch !== contract.arch) throw new Error('hosted runner does not match bootstrap target')
   for (const name of ['candidatePackage', 'candidateSignature', 'candidateManifest', 'candidateManifestUrl', 'candidatePackageUrl', 'expectedCandidateVersion', 'expectedManifestSha256', 'expectedPackageSha256', 'expectedSignatureSha256', 'expectedUpdaterEndpoint', 'expectedUpdaterPublicKey', 'expectedUpdaterPublicKeySha256']) if (!options[name]) throw new Error(`bootstrap driver option is required: ${name}`)
   if (options.freshInstallOnly !== 'true') throw new Error('bootstrap driver only supports fresh install')
+  if (!['true', 'false'].includes(options.signingConfigured)) throw new Error('bootstrap driver signing policy must be true or false')
   const startedAt = new Date().toISOString()
   const [packageBytes, signatureText, manifestBytes] = await Promise.all([readFile(options.candidatePackage), readFile(options.candidateSignature, 'utf8'), readFile(options.candidateManifest)])
   const digest = bytes => createHash('sha256').update(bytes).digest('hex')
@@ -359,9 +361,10 @@ export async function runNativeBootstrapDriver(options, environment = process.en
     launchedAt = Date.now()
     pid = launchApplication(launchExecutable, launchArguments, launchEnvironment)
     await waitForHostReady()
-    await waitForConfigurationIdentity(configurationLogPath(options.target, isolatedHome, launchEnvironment), {
+    const configurationIdentity = await waitForConfigurationIdentity(configurationLogPath(options.target, isolatedHome, launchEnvironment), {
       endpoint: options.expectedUpdaterEndpoint,
       publicKeySha256: options.expectedUpdaterPublicKeySha256,
+      appVersion: options.expectedCandidateVersion,
       platform: `${contract.platform === 'win32' ? 'windows' : contract.platform === 'darwin' ? 'macos' : 'linux'}-${contract.arch === 'arm64' ? 'aarch64' : 'x86_64'}`,
       processId: options.target === 'linux-x86_64' ? undefined : pid,
       launchedAt
@@ -369,7 +372,7 @@ export async function runNativeBootstrapDriver(options, environment = process.en
     await cleanupProcess(pid, commandEnvironment)
     pid = undefined
     return {
-      runner: contract.runner, started_at: startedAt, completed_at: new Date().toISOString(), installation: { mode: 'fresh-install', installed_version: options.expectedCandidateVersion, launched: true }, platform,
+      runner: contract.runner, started_at: startedAt, completed_at: new Date().toISOString(), installation: { mode: 'fresh-install', installed_version: configurationIdentity.app_version, launched: true }, platform,
       observations: { ...observations, updater_signature_verified: true, immutable_object_identity_verified: true },
       observation_sources: { configuration_identity: 'runtime-jsonl', signature_identity: 'node-ed25519-minisign', package_identity: 'immutable-manifest-sha256', installation_identity: 'native-platform', host_readiness: 'fixed-origin-http', runtime_closure: 'installed-filesystem' }
     }

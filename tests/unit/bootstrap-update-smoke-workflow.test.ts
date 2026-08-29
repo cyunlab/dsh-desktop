@@ -20,6 +20,8 @@ describe('bootstrap update smoke reusable workflow contract', () => {
     expect(workflow).toContain('test "$CANDIDATE_TAG" = "$APPROVED_TAG"')
     expect(workflow).toContain('test "${CANDIDATE_TAG#v}" = "$APPROVED_VERSION"')
     expect(workflow).toContain('test "$CANDIDATE_COMMIT" = "$APPROVED_COMMIT"')
+    expect(workflow).toContain('test "$SIGNING_CONFIGURED" = true || test "$SIGNING_CONFIGURED" = false')
+    expect(workflow).toContain('SIGNING_CONFIGURED: ${{ vars.UPDATER_BOOTSTRAP_MACOS_SIGNING_CONFIGURED }}')
   })
 
   /** 产证必须调用 fail-closed producer，聚合只接受真实 bootstrap evidence。 */
