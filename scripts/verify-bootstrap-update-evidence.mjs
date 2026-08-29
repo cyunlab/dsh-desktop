@@ -99,11 +99,10 @@ function requirePublishedReleaseUrl(value, tag) {
 function requireImmutableManifestUrl(value, candidate) {
   let url
   try { url = new URL(value) } catch { throw new Error('candidate manifest_url must be an HTTPS URL') }
-  const prefix = `/dsh-desktop/candidates/${candidate.version}/${candidate.commit}/`
-  if (url.protocol !== 'https:' || url.hostname !== 'updates.cyunlab.com' || url.username || url.password || url.search || url.hash || !url.pathname.startsWith(prefix)) {
+  const expectedPath = `/dsh-desktop/candidates/${candidate.version}/${candidate.commit}/${candidate.manifest_sha256}-latest.json`
+  if (url.protocol !== 'https:' || url.hostname !== 'updates.cyunlab.com' || url.username || url.password || url.search || url.hash || url.pathname !== expectedPath) {
     throw new Error('candidate manifest_url must identify the approved immutable OSS candidate')
   }
-  if (!path.posix.basename(url.pathname).startsWith(candidate.manifest_sha256)) throw new Error('candidate manifest_url digest does not match manifest_sha256')
 }
 
 /** 校验一份单目标 bootstrap fresh-install evidence。 */

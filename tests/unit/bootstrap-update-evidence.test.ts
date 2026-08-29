@@ -110,12 +110,24 @@ describe('bootstrap update evidence verifier public seam', () => {
     })).toThrow('package_url digest prefix')
   })
 
-  /** candidate manifest URL 必须同时绑定 version、commit 和 manifest digest。 */
-  it('rejects a candidate manifest URL with a changed immutable identity', () => {
-    const documents = REQUIRED_BOOTSTRAP_TARGETS.map(validEvidence)
-    documents[0]!.candidate.manifest_url = `https://updates.cyunlab.com/dsh-desktop/candidates/2.1.0/${candidate.commit}/${'f'.repeat(64)}-latest.json`
-    expect(() => verifyBootstrapUpdateEvidenceSet(documents, { ...candidate, now: new Date('2026-08-29T09:00:00.000Z'), maxAgeHours: 24, requireRealBootstrap: true }))
-      .toThrow('manifest_url digest')
+  /** candidate manifest URL 必须精确绑定 publisher 的 host、version、commit、digest 和唯一 key。 */
+  it('rejects candidate manifest URLs with a wrong host, path, digest, or commit', () => {
+    const expectedPath = `/dsh-desktop/candidates/2.1.0/${candidate.commit}/${candidate.manifest_sha256}-latest.json`
+    const invalidUrls = [
+      `https://example.com${expectedPath}`,
+      `https://updates.cyunlab.com/dsh-desktop/candidates/2.1.0/${candidate.commit}/extra/${candidate.manifest_sha256}-latest.json`,
+      `https://updates.cyunlab.com/dsh-desktop/candidates/2.1.0/${candidate.commit}/${'f'.repeat(64)}-latest.json`,
+      `https://updates.cyunlab.com/dsh-desktop/candidates/2.1.0/${'9'.repeat(40)}/${candidate.manifest_sha256}-latest.json`,
+      `https://user:password@updates.cyunlab.com${expectedPath}`,
+      `https://updates.cyunlab.com${expectedPath}?candidate=changed`,
+      `https://updates.cyunlab.com${expectedPath}#fragment`
+    ]
+    for (const manifestUrl of invalidUrls) {
+      const documents = REQUIRED_BOOTSTRAP_TARGETS.map(validEvidence)
+      documents[0]!.candidate.manifest_url = manifestUrl
+      expect(() => verifyBootstrapUpdateEvidenceSet(documents, { ...candidate, now: new Date('2026-08-29T09:00:00.000Z'), maxAgeHours: 24, requireRealBootstrap: true }))
+        .toThrow('manifest_url')
+    }
   })
 
   /** 发布的 JSON Schema 必须与 verifier 的版本、类型和四目标保持一致。 */
