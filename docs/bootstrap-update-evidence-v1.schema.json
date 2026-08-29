@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cyunlab.com/schemas/dsh-desktop/bootstrap-update-evidence-v1.schema.json",
+  "title": "DSH Desktop first-updater bootstrap fresh-install evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "evidence_kind", "claims_previous_stable_upgrade", "target", "runner", "candidate", "installation", "started_at", "completed_at", "platform", "observations"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "evidence_kind": { "enum": ["bootstrap-fresh-install", "bootstrap-local-fixture"] },
+    "claims_previous_stable_upgrade": { "const": false },
+    "target": { "enum": ["windows-x86_64", "linux-x86_64", "darwin-aarch64", "darwin-x86_64"] },
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "arch"],
+      "properties": { "os": { "enum": ["windows", "linux", "macos"] }, "arch": { "enum": ["x86_64", "aarch64"] } }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag", "version", "commit", "provenance", "release_url", "manifest_url", "manifest_sha256", "package_url", "package_sha256", "signature_sha256"],
+      "properties": {
+        "tag": { "$ref": "#/$defs/boundedString" },
+        "version": { "$ref": "#/$defs/boundedString" },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "provenance": { "enum": ["published-release", "local-fixture"] },
+        "release_url": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/cyunlab/dsh-desktop/releases/tag/" },
+        "manifest_url": { "type": "string", "format": "uri", "pattern": "^https://updates\\.cyunlab\\.com/dsh-desktop/candidates/" },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "package_url": { "type": "string", "format": "uri", "pattern": "^https://updates\\.cyunlab\\.com/dsh-desktop/releases/" },
+        "package_sha256": { "$ref": "#/$defs/sha256" },
+        "signature_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "installation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "installed_version", "launched"],
+      "properties": { "mode": { "const": "fresh-install" }, "installed_version": { "$ref": "#/$defs/boundedString" }, "launched": { "const": true } }
+    },
+    "started_at": { "type": "string", "format": "date-time" },
+    "completed_at": { "type": "string", "format": "date-time" },
+    "platform": { "type": "object" },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["updater_endpoint_enabled", "updater_public_key_enabled", "updater_signature_verified", "immutable_object_identity_verified", "official_node", "cli_runtime_closure", "desktop_capabilities_package", "desktop_update_client_package", "composition_patch"],
+      "properties": {
+        "updater_endpoint_enabled": { "const": true },
+        "updater_public_key_enabled": { "const": true },
+        "updater_signature_verified": { "const": true },
+        "immutable_object_identity_verified": { "const": true },
+        "official_node": { "const": true },
+        "cli_runtime_closure": { "const": true },
+        "desktop_capabilities_package": { "const": true },
+        "desktop_update_client_package": { "const": true },
+        "composition_patch": { "const": true }
+      }
+    },
+    "diagnostics": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^\\r\\n\\u0000]+$" }
+  },
+  "$defs": {
+    "boundedString": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\r\\n\\u0000]+$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}
