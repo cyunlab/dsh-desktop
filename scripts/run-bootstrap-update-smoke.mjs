@@ -43,8 +43,9 @@ export async function runBootstrapUpdateSmoke(options, environment = process.env
   const driver = environment.DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER
   if (!driver) throw new Error('DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER is required; bootstrap evidence cannot be synthesized')
   if (!dependencies.runDriver && path.resolve(driver) !== TRUSTED_BOOTSTRAP_DRIVER) throw new Error('bootstrap evidence requires the fixed repository-owned native driver')
-  const required = ['target', 'candidateTag', 'candidateCommit', 'candidateManifest', 'candidateManifestUrl', 'candidatePackage', 'candidateSignature', 'candidatePackageUrl', 'candidateReleaseUrl', 'expectedUpdaterEndpoint', 'expectedUpdaterPublicKey', 'outputDirectory']
+  const required = ['target', 'candidateTag', 'candidateCommit', 'candidateManifest', 'candidateManifestUrl', 'candidatePackage', 'candidateSignature', 'candidatePackageUrl', 'candidateReleaseUrl', 'expectedUpdaterEndpoint', 'expectedUpdaterPublicKey', 'signingConfigured', 'outputDirectory']
   for (const name of required) if (!options[name]) throw new Error(`bootstrap update smoke option is required: ${name}`)
+  if (!['true', 'false'].includes(options.signingConfigured)) throw new Error('bootstrap signingConfigured must be explicitly true or false')
   const [manifestSha256, packageSha256, signatureSha256] = await Promise.all([
     sha256File(options.candidateManifest), sha256File(options.candidatePackage), sha256File(options.candidateSignature)
   ])
@@ -66,7 +67,7 @@ export async function runBootstrapUpdateSmoke(options, environment = process.env
     '--expected-updater-endpoint', options.expectedUpdaterEndpoint,
     '--expected-updater-public-key', options.expectedUpdaterPublicKey,
     '--expected-updater-public-key-sha256', createHash('sha256').update(options.expectedUpdaterPublicKey).digest('hex'),
-    '--signing-configured', options.signingConfigured ?? 'false',
+    '--signing-configured', options.signingConfigured,
     '--fresh-install-only', 'true'
   ]
   const driverEnvironment = { DSH_BOOTSTRAP_UPDATE_SMOKE_OUTPUT: 'json' }

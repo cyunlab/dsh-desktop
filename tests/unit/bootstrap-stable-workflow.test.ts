@@ -21,6 +21,7 @@ describe('first-updater bootstrap promotion workflow', () => {
     expect(workflow).toContain('--require-real-bootstrap')
     expect(workflow).not.toContain('verify-update-smoke-evidence.mjs')
     expect(workflow).not.toContain('--require-real-native')
+    expect(workflow).not.toContain('signing_configured: true')
   })
 
   /** 显式输入贯穿 candidate preparation、evidence 和 finalization，Stable 仍是最后写入。 */

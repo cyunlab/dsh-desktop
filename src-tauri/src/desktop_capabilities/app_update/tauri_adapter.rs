@@ -659,7 +659,11 @@ impl TauriUpdateRuntime {
             .app_cache_dir()
             .map_err(|_| "update cache directory unavailable")?;
         let log_path = config_dir.join("logs").join("updater.jsonl");
-        record_configuration_identity(&log_path, config.as_ref().ok());
+        record_configuration_identity(
+            &log_path,
+            config.as_ref().ok(),
+            &app.package_info().version.to_string(),
+        );
         let preference_path = config_dir.join("updater-preference.json");
         let preferences = FilePreferenceStore::new(preference_path);
         let preference_warning = preferences.warning();
@@ -1187,6 +1191,7 @@ pub struct SafeUpdateLog {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SafeUpdaterConfigurationLog {
     pub event: &'static str,
+    pub app_version: String,
     pub endpoint: String,
     pub public_key_sha256: String,
     pub platform: String,
@@ -1197,9 +1202,15 @@ pub struct SafeUpdaterConfigurationLog {
 
 impl SafeUpdaterConfigurationLog {
     /// 从实际请求使用的已验证配置构造脱敏身份。
-    fn from_config(config: &AdapterConfig, recorded_at: &str, process_id: u32) -> Self {
+    fn from_config(
+        config: &AdapterConfig,
+        app_version: &str,
+        recorded_at: &str,
+        process_id: u32,
+    ) -> Self {
         Self {
             event: "updater-configuration-identity",
+            app_version: app_version.into(),
             endpoint: config.endpoint.clone(),
             public_key_sha256: format!("{:x}", Sha256::digest(config.public_key.as_bytes())),
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -1216,17 +1227,28 @@ impl SafeUpdaterConfigurationLog {
 }
 
 /// 使用生产时钟和进程身份追加已验证配置诊断，任何记录失败都不阻断启动。
-fn record_configuration_identity(log_path: &Path, config: Option<&AdapterConfig>) {
+fn record_configuration_identity(
+    log_path: &Path,
+    config: Option<&AdapterConfig>,
+    app_version: &str,
+) {
     let Ok(recorded_at) = OffsetDateTime::now_utc().format(&Rfc3339) else {
         return;
     };
-    record_configuration_identity_with_context(log_path, config, &recorded_at, std::process::id());
+    record_configuration_identity_with_context(
+        log_path,
+        config,
+        app_version,
+        &recorded_at,
+        std::process::id(),
+    );
 }
 
 /// 将注入的时间与进程身份写入固定 updater JSON Lines 边界。
 fn record_configuration_identity_with_context(
     log_path: &Path,
     config: Option<&AdapterConfig>,
+    app_version: &str,
     recorded_at: &str,
     process_id: u32,
 ) {
@@ -1239,7 +1261,8 @@ fn record_configuration_identity_with_context(
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    let record = SafeUpdaterConfigurationLog::from_config(config, recorded_at, process_id);
+    let record =
+        SafeUpdaterConfigurationLog::from_config(config, app_version, recorded_at, process_id);
     if let (Ok(line), Ok(mut file)) = (
         record.to_json(),
         OpenOptions::new().create(true).append(true).open(log_path),
@@ -1375,6 +1398,7 @@ mod tests {
         record_configuration_identity_with_context(
             &log_path,
             Some(&config),
+            "2.1.0",
             "2026-08-29T02:03:04Z",
             4242,
         );
@@ -1385,6 +1409,7 @@ mod tests {
             value,
             serde_json::json!({
                 "event": "updater-configuration-identity",
+                "app_version": "2.1.0",
                 "endpoint": "https://updates.example/dsh-desktop/channels/stable/latest.json",
                 "public_key_sha256": "98bc2519dc9034c5a0bfbc5dbb808404cfc4db8e957783124c128a3732ed913a",
                 "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -1411,6 +1436,7 @@ mod tests {
         record_configuration_identity_with_context(
             &log_path,
             config.as_ref().ok(),
+            "2.1.0",
             "2026-08-29T02:03:04Z",
             4242,
         );

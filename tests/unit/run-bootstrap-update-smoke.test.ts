@@ -32,6 +32,7 @@ async function inputs() {
     candidateReleaseUrl: 'https://github.com/cyunlab/dsh-desktop/releases/tag/v2.1.0',
     expectedUpdaterEndpoint: 'https://updates.cyunlab.com/dsh-desktop/channels/stable/latest.json',
     expectedUpdaterPublicKey: Buffer.from('untrusted comment: minisign public key fixture\nRWQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA').toString('base64'),
+    signingConfigured: 'false' as const,
     outputDirectory: directory
   }
 }
@@ -46,6 +47,16 @@ describe('bootstrap update smoke producer public seam', () => {
     const options = await inputs()
     await expect(runBootstrapUpdateSmoke(options, {})).rejects.toThrow('DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER is required')
     await expect(readFile(path.join(options.outputDirectory, 'windows-x86_64.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  /** macOS signing 决策必须由 production 显式给出合法布尔文本。 */
+  it('rejects a missing or invalid signing decision before invoking the driver', async () => {
+    const missing = await inputs()
+    delete (missing as Partial<typeof missing>).signingConfigured
+    await expect(runBootstrapUpdateSmoke(missing, { DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER: '/test/adapter' }, { runDriver: async () => { throw new Error('must not run') } })).rejects.toThrow('signingConfigured')
+    const invalid = await inputs()
+    ;(invalid as { signingConfigured: string }).signingConfigured = 'auto'
+    await expect(runBootstrapUpdateSmoke(invalid, { DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER: '/test/adapter' }, { runDriver: async () => { throw new Error('must not run') } })).rejects.toThrow('true or false')
   })
 
   /** production producer 只允许固定 repo-owned driver，错误 runner 必须在产证前 fail closed。 */
