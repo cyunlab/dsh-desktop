@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -199,6 +199,20 @@ export function createOssutilStorage(options) {
     },
     /** 覆盖 Stable manifest，并依赖 bucket versioning 保留历史版本。 */
     async replaceObject(key, body, metadata) { await copyObject(key, body, metadata, true) },
+    /** 列出应用前缀下的对象键，用于检测一次性 bootstrap 的任何部分记录。 */
+    async listObjects(keyPrefix) {
+      const result = await withOssutilConfig(configFile => runOssutil(
+        ['ls', objectUri(keyPrefix), '--config-file', configFile],
+        { env: commandEnvironment }
+      ))
+      const bucketPrefix = `oss://${options.bucket}/`
+      return result.stdout.toString('utf8').split(/\r?\n/)
+        .flatMap(line => line.split(/\s+/))
+        .filter(value => value.startsWith(bucketPrefix))
+        .map(value => value.slice(bucketPrefix.length))
+        .filter(key => key.startsWith(keyPrefix))
+        .sort()
+    },
     readObject
   }
 }
@@ -402,6 +416,226 @@ export async function finalizeStableCandidate(candidate, storage, options = {}) 
   return candidate.manifest
 }
 
+/** 要求一次性 bootstrap 的审批身份完整、规范且互相一致。 */
+function validateBootstrapApproval(options) {
+  const version = releaseVersion(options.approvedTag)
+  if (version !== options.approvedVersion) throw new Error('approved tag and version must identify the same semantic version')
+  if (!/^[0-9a-f]{40}$/.test(options.approvedCommit ?? '')) {
+    throw new Error('approved commit must be a full lowercase Git commit SHA')
+  }
+  if (!/^[0-9a-f]{64}$/.test(options.approvedLegacyManifestSha256 ?? '')) {
+    throw new Error('approved legacy Stable manifest digest must be a lowercase SHA-256')
+  }
+  return version
+}
+
+/** 要求持久化 candidate 与 protected bootstrap approval 四元组逐字一致。 */
+function requireBootstrapCandidateApproval(candidate, options) {
+  const version = validateBootstrapApproval(options)
+  if (
+    candidate?.candidate_tag !== options.approvedTag ||
+    candidate?.candidate_version !== version ||
+    candidate?.candidate_commit !== options.approvedCommit ||
+    candidate?.legacy_stable_manifest_sha256 !== options.approvedLegacyManifestSha256
+  ) throw new Error('bootstrap candidate does not match the approved identity')
+}
+
+/** 读取并验证 bootstrap 唯一允许的 legacy Stable 2.0.15 pointer。 */
+async function readLegacyStable(storage, prefix) {
+  const stableKey = `${prefix}/channels/stable/latest.json`
+  let body
+  let manifest
+  try {
+    body = await storage.readObject(stableKey)
+    manifest = JSON.parse(body.toString('utf8'))
+  } catch {
+    throw new Error('legacy Stable 2.0.15 manifest is required')
+  }
+  if (manifest?.version !== '2.0.15') throw new Error('legacy Stable must be exactly 2.0.15')
+  return { stableKey, body, digest: createHash('sha256').update(body).digest('hex') }
+}
+
+/** 拒绝 receipt 前缀下的任何完整或部分 bootstrap 审计记录。 */
+async function requireBootstrapReceiptAbsent(storage, prefix) {
+  if (typeof storage.listObjects !== 'function') throw new Error('bootstrap promotion requires receipt-prefix listing support')
+  const receiptPrefix = `${prefix}/bootstrap/receipts/`
+  const receipts = await storage.listObjects(receiptPrefix)
+  if (receipts.length !== 0) throw new Error(`bootstrap receipt already exists: ${receipts[0]}`)
+  return receiptPrefix
+}
+
+/** receipt 写入后要求前缀内恰好只有预期的完整不可变记录。 */
+async function requireExactBootstrapReceipt(storage, prefix, receiptKey) {
+  if (typeof storage.listObjects !== 'function') throw new Error('bootstrap promotion requires receipt-prefix listing support')
+  const receipts = await storage.listObjects(`${prefix}/bootstrap/receipts/`)
+  if (receipts.length !== 1 || receipts[0] !== receiptKey) throw new Error('bootstrap receipt set changed after receipt write')
+}
+
+/** 计算 evidence 目录所有文件名与原始字节的确定性集合摘要。 */
+async function digestEvidenceDirectory(directory) {
+  const entries = await readdir(directory, { withFileTypes: true })
+  if (entries.some(entry => !entry.isFile())) throw new Error('bootstrap evidence directory may contain files only')
+  const hash = createHash('sha256')
+  for (const name of entries.map(entry => entry.name).sort()) {
+    const file = path.join(directory, name)
+    const information = await stat(file)
+    if (information.size <= 0 || information.size > 128 * 1024) throw new Error(`bootstrap evidence file size is out of bounds: ${name}`)
+    const body = await readFile(file)
+    hash.update(Buffer.from(`${name}\0${body.length}\0`))
+    hash.update(body)
+  }
+  return hash.digest('hex')
+}
+
+/** 验证远端 bootstrap candidate 与审批身份，并返回逐字节 manifest。 */
+async function readBootstrapCandidateManifest(candidate, storage, prefix) {
+  if (candidate?.schema_version !== 1 || candidate.bootstrap_kind !== 'first-updater-stable') {
+    throw new Error('unsupported bootstrap candidate')
+  }
+  const version = releaseVersion(candidate.candidate_tag)
+  if (candidate.candidate_version !== version || candidate.manifest?.version !== version) {
+    throw new Error('bootstrap candidate tag, version, and manifest mismatch')
+  }
+  if (!/^[0-9a-f]{40}$/.test(candidate.candidate_commit ?? '')) throw new Error('bootstrap candidate commit is invalid')
+  if (!/^[0-9a-f]{64}$/.test(candidate.manifest_sha256 ?? '')) throw new Error('bootstrap candidate manifest digest is invalid')
+  if (JSON.stringify(Object.keys(candidate.manifest?.platforms ?? {})) !== JSON.stringify(TARGETS)) {
+    throw new Error('bootstrap candidate must contain exactly the four canonical targets')
+  }
+  const manifestUrl = new URL(candidate.manifest_url)
+  if (manifestUrl.protocol !== 'https:' || manifestUrl.username || manifestUrl.password || manifestUrl.search || manifestUrl.hash) {
+    throw new Error('bootstrap candidate manifest URL must be an uncredentialed HTTPS URL')
+  }
+  const suffix = `/${prefix}/candidates/${version}/${candidate.candidate_commit}/${candidate.manifest_sha256}-latest.json`
+  if (!manifestUrl.pathname.endsWith(suffix)) throw new Error('bootstrap candidate manifest URL does not match its identity')
+  const manifestKey = manifestUrl.pathname.slice(1)
+  const remote = await storage.readObject(manifestKey)
+  if (createHash('sha256').update(remote).digest('hex') !== candidate.manifest_sha256) {
+    throw new Error('bootstrap candidate manifest digest mismatch')
+  }
+  const expected = Buffer.from(`${JSON.stringify(candidate.manifest, null, 2)}\n`)
+  if (!remote.equals(expected)) throw new Error('bootstrap candidate manifest bytes do not match candidate metadata')
+  return { manifestKey, body: remote }
+}
+
+/** 准备一次性首个 updater Stable candidate，且不修改 Stable 或创建 receipt。 */
+export async function prepareBootstrapStableCandidate(options, storage, dependencies = {}) {
+  const version = validateBootstrapApproval(options)
+  const prefix = normalizePrefix(options.prefix ?? 'dsh-desktop')
+  const legacy = await readLegacyStable(storage, prefix)
+  if (legacy.digest !== options.approvedLegacyManifestSha256) {
+    throw new Error('approved legacy Stable manifest digest does not match authoritative OSS Stable')
+  }
+  await requireBootstrapReceiptAbsent(storage, prefix)
+  const prepareCandidate = dependencies.prepareCandidate ?? prepareStableCandidate
+  const prepared = await prepareCandidate({
+    tag: options.approvedTag,
+    releaseBody: options.releaseBody,
+    publishedAt: options.publishedAt,
+    candidateCommit: options.approvedCommit,
+    artifactsDirectory: options.artifactsDirectory,
+    downloadOrigin: options.downloadOrigin,
+    prefix
+  }, storage, { verifySignature: dependencies.verifySignature })
+  if (prepared.candidate_tag !== options.approvedTag || prepared.candidate_commit !== options.approvedCommit || prepared.manifest?.version !== version) {
+    throw new Error('prepared candidate does not match the explicitly approved identity')
+  }
+  if (prepared.previous_stable_version !== undefined && prepared.previous_stable_version !== '2.0.15') {
+    throw new Error('prepared candidate predecessor is not legacy Stable 2.0.15')
+  }
+  if (prepared.previous_stable_manifest_sha256 !== undefined && prepared.previous_stable_manifest_sha256 !== legacy.digest) {
+    throw new Error('legacy Stable changed during bootstrap candidate preparation')
+  }
+  const currentLegacy = await readLegacyStable(storage, prefix)
+  if (!currentLegacy.body.equals(legacy.body)) throw new Error('legacy Stable changed during bootstrap candidate preparation')
+  await requireBootstrapReceiptAbsent(storage, prefix)
+  return {
+    schema_version: 1,
+    bootstrap_kind: 'first-updater-stable',
+    candidate_tag: options.approvedTag,
+    candidate_version: version,
+    candidate_commit: options.approvedCommit,
+    legacy_stable_version: '2.0.15',
+    legacy_stable_manifest_sha256: legacy.digest,
+    manifest_url: prepared.manifest_url,
+    manifest_sha256: prepared.manifest_sha256,
+    manifest: prepared.manifest
+  }
+}
+
+/** 复核一次性 evidence 并以 receipt-first、Stable-last 顺序完成 bootstrap。 */
+export async function finalizeBootstrapStableCandidate(candidate, storage, options, dependencies = {}) {
+  const prefix = normalizePrefix(options?.prefix ?? 'dsh-desktop')
+  if (options.approvedTag !== undefined) requireBootstrapCandidateApproval(candidate, options)
+  if (!options?.evidenceDirectory) throw new Error('bootstrap evidence directory is required')
+  if (!Number.isFinite(options.maxAgeHours) || options.maxAgeHours <= 0) throw new Error('a positive bootstrap evidence max age is required')
+  const legacy = await readLegacyStable(storage, prefix)
+  if (candidate.legacy_stable_version !== '2.0.15' || candidate.legacy_stable_manifest_sha256 !== legacy.digest) {
+    throw new Error('legacy Stable changed after bootstrap candidate preparation')
+  }
+  await requireBootstrapReceiptAbsent(storage, prefix)
+  const remoteCandidate = await readBootstrapCandidateManifest(candidate, storage, prefix)
+  const verifyEvidence = dependencies.verifyEvidence ?? (await import('./verify-bootstrap-update-evidence.mjs')).verifyBootstrapUpdateEvidenceDirectory
+  const evidenceDigestBefore = await digestEvidenceDirectory(options.evidenceDirectory)
+  await verifyEvidence(options.evidenceDirectory, {
+    tag: candidate.candidate_tag,
+    version: candidate.candidate_version,
+    commit: candidate.candidate_commit,
+    manifest_sha256: candidate.manifest_sha256,
+    maxAgeHours: options.maxAgeHours,
+    now: options.now,
+    requireRealBootstrap: true
+  })
+  const evidenceDigest = await digestEvidenceDirectory(options.evidenceDirectory)
+  if (evidenceDigest !== evidenceDigestBefore) throw new Error('bootstrap evidence changed during verification')
+
+  const receipt = {
+    schema_version: 1,
+    kind: 'first-updater-stable-bootstrap',
+    candidate_tag: candidate.candidate_tag,
+    candidate_version: candidate.candidate_version,
+    candidate_commit: candidate.candidate_commit,
+    candidate_manifest_url: candidate.manifest_url,
+    candidate_manifest_sha256: candidate.manifest_sha256,
+    legacy_stable_version: '2.0.15',
+    legacy_stable_manifest_sha256: legacy.digest,
+    bootstrap_evidence_sha256: evidenceDigest,
+    evidence_kind: 'bootstrap-fresh-install',
+    claims_previous_stable_upgrade: false
+  }
+  const receiptBody = Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`)
+  const receiptSha256 = createHash('sha256').update(receiptBody).digest('hex')
+  const receiptKey = `${prefix}/bootstrap/receipts/${receiptSha256}-first-updater-stable.json`
+
+  // receipt 是第一次 OSS mutation；此前再次读取全部 admission 状态并拒绝任何漂移。
+  const finalLegacy = await readLegacyStable(storage, prefix)
+  if (!finalLegacy.body.equals(legacy.body)) throw new Error('legacy Stable changed before bootstrap receipt write')
+  await requireBootstrapReceiptAbsent(storage, prefix)
+  const finalCandidate = await readBootstrapCandidateManifest(candidate, storage, prefix)
+  if (!finalCandidate.body.equals(remoteCandidate.body)) throw new Error('bootstrap candidate changed before receipt write')
+  if (await digestEvidenceDirectory(options.evidenceDirectory) !== evidenceDigest) throw new Error('bootstrap evidence changed before receipt write')
+  await storage.ensureObject(receiptKey, receiptBody, {
+    cacheControl: 'public, max-age=31536000, immutable',
+    contentType: 'application/json; charset=utf-8'
+  })
+  const remoteReceipt = await storage.readObject(receiptKey)
+  if (!remoteReceipt.equals(receiptBody)) throw new Error('remote bootstrap receipt differs from expected bytes')
+  await requireExactBootstrapReceipt(storage, prefix, receiptKey)
+
+  // Stable 是最后一次 OSS mutation；receipt 后若发生漂移则保留部分记录并禁止重试。
+  const stableBeforeWrite = await readLegacyStable(storage, prefix)
+  if (!stableBeforeWrite.body.equals(legacy.body)) throw new Error('legacy Stable changed after bootstrap receipt write')
+  const candidateBeforeWrite = await readBootstrapCandidateManifest(candidate, storage, prefix)
+  if (!candidateBeforeWrite.body.equals(remoteCandidate.body)) throw new Error('bootstrap candidate changed after receipt write')
+  if (await digestEvidenceDirectory(options.evidenceDirectory) !== evidenceDigest) throw new Error('bootstrap evidence changed after receipt write')
+  if (!(await storage.readObject(receiptKey)).equals(receiptBody)) throw new Error('bootstrap receipt changed before Stable write')
+  await requireExactBootstrapReceipt(storage, prefix, receiptKey)
+  await storage.replaceObject(legacy.stableKey, remoteCandidate.body, {
+    cacheControl: 'no-cache',
+    contentType: 'application/json; charset=utf-8'
+  })
+  return { manifest: candidate.manifest, receipt_key: receiptKey, receipt_sha256: receiptSha256 }
+}
+
 /** 从 production 环境创建限定应用前缀的短期 OSS storage。 */
 function createProductionStorage(environment, dependencies, prefix) {
   const credentials = {
@@ -462,6 +696,61 @@ export async function runCandidateFinalizationCli(environment = process.env, dep
   return (dependencies.finalize ?? finalizeStableCandidate)(candidate, storage, { prefix })
 }
 
+/** 解析一次性 bootstrap preparation CLI 并持久化不可变 candidate identity。 */
+export async function runBootstrapPreparationCli(environment = process.env, dependencies = {}, args = process.argv.slice(2)) {
+  const values = parseArguments(args)
+  const prefix = values.prefix ?? 'dsh-desktop'
+  if (!values.output) throw new Error('--output is required for bootstrap preparation')
+  if (!environment.TAURI_SIGNING_PUBLIC_KEY) throw new Error('TAURI_SIGNING_PUBLIC_KEY is required')
+  const storage = createProductionStorage(environment, dependencies, prefix)
+  const candidate = await (dependencies.prepareBootstrap ?? prepareBootstrapStableCandidate)({
+    approvedTag: values['approved-tag'],
+    approvedVersion: values['approved-version'],
+    approvedCommit: values['approved-commit'],
+    approvedLegacyManifestSha256: values['approved-legacy-manifest-sha256'],
+    releaseBody: values.notes,
+    publishedAt: values['published-at'],
+    artifactsDirectory: values.assets ?? 'artifacts',
+    downloadOrigin: environment.UPDATE_BASE_URL,
+    prefix
+  }, storage, {
+    prepareCandidate: dependencies.prepareCandidate,
+    verifySignature: dependencies.verifySignature
+      ?? ((artifactPath, signaturePath) => verifyTauriSignature(
+        artifactPath,
+        signaturePath,
+        environment.TAURI_SIGNING_PUBLIC_KEY,
+        dependencies.runMinisign
+      ))
+  })
+  await writeFile(values.output, `${JSON.stringify(candidate, null, 2)}\n`, { mode: 0o600 })
+  return candidate
+}
+
+/** 解析一次性 bootstrap finalization CLI 并从真实四目标 evidence 完成 receipt-first promotion。 */
+export async function runBootstrapFinalizationCli(environment = process.env, dependencies = {}, args = process.argv.slice(2)) {
+  const values = parseArguments(args)
+  const prefix = values.prefix ?? 'dsh-desktop'
+  if (!values.candidate) throw new Error('--candidate is required for bootstrap finalization')
+  if (!values.evidence) throw new Error('--evidence is required for bootstrap finalization')
+  if (!values['max-age-hours']) throw new Error('--max-age-hours is required for bootstrap finalization')
+  const candidate = JSON.parse(await readFile(values.candidate, 'utf8'))
+  const approval = {
+    approvedTag: values['approved-tag'],
+    approvedVersion: values['approved-version'],
+    approvedCommit: values['approved-commit'],
+    approvedLegacyManifestSha256: values['approved-legacy-manifest-sha256']
+  }
+  requireBootstrapCandidateApproval(candidate, approval)
+  const storage = createProductionStorage(environment, dependencies, prefix)
+  return (dependencies.finalizeBootstrap ?? finalizeBootstrapStableCandidate)(candidate, storage, {
+    prefix,
+    evidenceDirectory: values.evidence,
+    maxAgeHours: Number(values['max-age-hours']),
+    ...approval
+  }, { verifyEvidence: dependencies.verifyEvidence })
+}
+
 /** 提升一个完整的四目标更新发布，并返回写入 Stable channel 的 manifest。 */
 export async function promoteStableRelease(options, storage, dependencies = {}) {
   const bundle = await buildReleaseBundle(options, dependencies)
@@ -487,7 +776,17 @@ async function main() {
     console.log(`Promoted Desktop ${manifest.version} to Stable`)
     return
   }
-  throw new Error('an explicit --prepare-candidate or --finalize-candidate mode is required')
+  if (mode === '--prepare-bootstrap') {
+    const candidate = await runBootstrapPreparationCli(process.env, {}, args)
+    console.log(`Prepared one-time Desktop ${candidate.candidate_tag} bootstrap candidate`)
+    return
+  }
+  if (mode === '--finalize-bootstrap') {
+    const result = await runBootstrapFinalizationCli(process.env, {}, args)
+    console.log(`Bootstrapped Desktop ${result.manifest.version} to Stable with receipt ${result.receipt_sha256}`)
+    return
+  }
+  throw new Error('an explicit candidate or bootstrap preparation/finalization mode is required')
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main()

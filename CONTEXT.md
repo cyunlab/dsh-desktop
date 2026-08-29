@@ -122,6 +122,14 @@ A versioned set of signed, platform-specific Desktop packages and metadata that 
 
 The admission of a validated Update release into the Stable channel. Promotion changes the release offered to Desktop installations; building or staging packages alone does not.
 
+### First-updater bootstrap
+
+The single manually approved admission path used only while authoritative Stable is the legacy `2.0.15` application that cannot run Automatic update. It fresh-installs the exact four official candidate targets, records a content-digested immutable Bootstrap receipt, and writes Stable last without claiming a previous-Stable upgrade. It cannot be reused or substitute for normal Stable promotion.
+
+### Bootstrap receipt
+
+The immutable OSS audit record written before the first-updater bootstrap changes Stable. Its content digest appears in its object key and it binds the approved candidate, legacy Stable manifest, and exact bootstrap evidence set. Any full or partial receipt closes the one-time path and must be preserved during recovery.
+
 ### Update availability indicator
 
 A non-interrupting Desktop-owned signal that a newer Update release is available. It opens the update flow only when the user activates it and never presents an unsolicited update dialog.
