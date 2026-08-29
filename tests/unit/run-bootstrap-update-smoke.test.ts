@@ -82,9 +82,9 @@ describe('bootstrap update smoke producer public seam', () => {
         installation_identity: 'native-platform', host_readiness: 'fixed-origin-http', runtime_closure: 'installed-filesystem'
       }
     }
-    let invocation: { args?: string[]; environment?: Record<string, string> } = {}
+    let invocation: { args?: string[]; environment?: NodeJS.ProcessEnv } = {}
     const result = await runBootstrapUpdateSmoke(options, { DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER: '/test/adapter', PATH: '/trusted/bin', HOME: '/home/runner', TMPDIR: '/tmp' }, {
-      runDriver: async (_executable: string, args: string[], environment: Record<string, string>) => {
+      runDriver: async (_executable: string, args: string[], environment: NodeJS.ProcessEnv) => {
         invocation = { args, environment }
         return { stdout: Buffer.from(JSON.stringify(observation)), stderr: '' }
       }
