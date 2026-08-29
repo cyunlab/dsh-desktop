@@ -5,6 +5,21 @@ export interface PromotionStorage {
   replaceObject(key: string, body: Buffer, metadata: ObjectMetadata): Promise<void>
   /** 读取远端对象的原始字节。 */
   readObject(key: string): Promise<Buffer>
+  /** 列出指定应用前缀下的对象键。 */
+  listObjects?(prefix: string): Promise<readonly string[]>
+}
+
+export interface BootstrapStableCandidate {
+  readonly schema_version: 1
+  readonly bootstrap_kind: 'first-updater-stable'
+  readonly candidate_tag: string
+  readonly candidate_version: string
+  readonly candidate_commit: string
+  readonly legacy_stable_version: '2.0.15'
+  readonly legacy_stable_manifest_sha256: string
+  readonly manifest_url: string
+  readonly manifest_sha256: string
+  readonly manifest: StableManifest
 }
 
 export interface ObjectMetadata { readonly cacheControl: string; readonly contentType?: string }
@@ -86,6 +101,54 @@ export function finalizeStableCandidate(
   storage: PromotionStorage,
   options?: { readonly prefix?: string }
 ): Promise<StableManifest>
+
+/** 准备一次性首个 updater Stable candidate，但不创建 receipt 或写 Stable。 */
+export function prepareBootstrapStableCandidate(
+  options: {
+    readonly approvedTag: string
+    readonly approvedVersion: string
+    readonly approvedCommit: string
+    readonly approvedLegacyManifestSha256: string
+    readonly releaseBody?: string
+    readonly publishedAt?: string
+    readonly artifactsDirectory?: string
+    readonly downloadOrigin?: string
+    readonly prefix: string
+  },
+  storage: PromotionStorage,
+  dependencies?: Readonly<Record<string, unknown>>
+): Promise<BootstrapStableCandidate>
+
+/** 验证真实 bootstrap evidence，先写 receipt 并复读，再最后写 Stable。 */
+export function finalizeBootstrapStableCandidate(
+  candidate: BootstrapStableCandidate,
+  storage: PromotionStorage,
+  options: {
+    readonly prefix: string
+    readonly evidenceDirectory: string
+    readonly maxAgeHours: number
+    readonly now?: Date
+    readonly approvedTag?: string
+    readonly approvedVersion?: string
+    readonly approvedCommit?: string
+    readonly approvedLegacyManifestSha256?: string
+  },
+  dependencies?: Readonly<Record<string, unknown>>
+): Promise<{ readonly manifest: StableManifest; readonly receipt_key: string; readonly receipt_sha256: string }>
+
+/** 解析一次性 bootstrap preparation CLI。 */
+export function runBootstrapPreparationCli(
+  environment?: NodeJS.ProcessEnv,
+  dependencies?: Record<string, unknown>,
+  args?: string[]
+): Promise<BootstrapStableCandidate>
+
+/** 解析一次性 bootstrap finalization CLI。 */
+export function runBootstrapFinalizationCli(
+  environment?: NodeJS.ProcessEnv,
+  dependencies?: Record<string, unknown>,
+  args?: string[]
+): Promise<{ readonly manifest: StableManifest; readonly receipt_key: string; readonly receipt_sha256: string }>
 
 /** 解析 candidate preparation CLI。 */
 export function runCandidatePreparationCli(
