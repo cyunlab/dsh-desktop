@@ -9,6 +9,7 @@ use base64::Engine;
 use futures_util::StreamExt;
 use minisign_verify::{PublicKey, Signature};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const UPDATE_SNAPSHOT_EVENT: &str = "app-update:snapshot";
 const MANIFEST_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -461,7 +463,7 @@ impl AdapterConfig {
             .ok_or(AdapterConfigError::InvalidPublicKey)?;
         PublicKey::decode(&decoded).map_err(|_| AdapterConfigError::InvalidPublicKey)?;
         Ok(Self {
-            endpoint: endpoint.into(),
+            endpoint: parsed.to_string(),
             public_key: public_key.into(),
         })
     }
@@ -657,6 +659,7 @@ impl TauriUpdateRuntime {
             .app_cache_dir()
             .map_err(|_| "update cache directory unavailable")?;
         let log_path = config_dir.join("logs").join("updater.jsonl");
+        record_configuration_identity(&log_path, config.as_ref().ok());
         let preference_path = config_dir.join("updater-preference.json");
         let preferences = FilePreferenceStore::new(preference_path);
         let preference_warning = preferences.warning();
@@ -1180,6 +1183,71 @@ pub struct SafeUpdateLog {
     pub correlation_id: String,
 }
 
+/// 已验证 updater 配置的脱敏身份，只包含原生验收所需的稳定 allowlist 字段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SafeUpdaterConfigurationLog {
+    pub event: &'static str,
+    pub endpoint: String,
+    pub public_key_sha256: String,
+    pub platform: String,
+    pub correlation_id: &'static str,
+    pub recorded_at: String,
+    pub process_id: u32,
+}
+
+impl SafeUpdaterConfigurationLog {
+    /// 从实际请求使用的已验证配置构造脱敏身份。
+    fn from_config(config: &AdapterConfig, recorded_at: &str, process_id: u32) -> Self {
+        Self {
+            event: "updater-configuration-identity",
+            endpoint: config.endpoint.clone(),
+            public_key_sha256: format!("{:x}", Sha256::digest(config.public_key.as_bytes())),
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            correlation_id: "updater-configuration",
+            recorded_at: recorded_at.into(),
+            process_id,
+        }
+    }
+
+    /// 序列化可供真实原生验收读取的配置身份记录。
+    fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// 使用生产时钟和进程身份追加已验证配置诊断，任何记录失败都不阻断启动。
+fn record_configuration_identity(log_path: &Path, config: Option<&AdapterConfig>) {
+    let Ok(recorded_at) = OffsetDateTime::now_utc().format(&Rfc3339) else {
+        return;
+    };
+    record_configuration_identity_with_context(log_path, config, &recorded_at, std::process::id());
+}
+
+/// 将注入的时间与进程身份写入固定 updater JSON Lines 边界。
+fn record_configuration_identity_with_context(
+    log_path: &Path,
+    config: Option<&AdapterConfig>,
+    recorded_at: &str,
+    process_id: u32,
+) {
+    let Some(config) = config else {
+        return;
+    };
+    let Some(parent) = log_path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let record = SafeUpdaterConfigurationLog::from_config(config, recorded_at, process_id);
+    if let (Ok(line), Ok(mut file)) = (
+        record.to_json(),
+        OpenOptions::new().create(true).append(true).open(log_path),
+    ) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 impl SafeUpdateLog {
     /// 序列化可落盘的脱敏结构化诊断记录。
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
@@ -1290,6 +1358,64 @@ mod tests {
             ),
             Err(AdapterConfigError::InvalidPublicKey)
         );
+    }
+
+    /// 已验证配置会以规范化 endpoint 和固定公钥指纹写入既有 updater 日志。
+    #[test]
+    fn validated_configuration_records_exact_safe_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("logs").join("updater.jsonl");
+        let public_key = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXkgRTc2MjBGMTg0MkI0RTgxRgpSV1FmNkxSQ0dBOWk1M21sWWVjTzRJelQ1MVRHUHB2V3VjTlNDaDFDQk0wUVRhTG43M1k3R0ZPMw==";
+        let config = AdapterConfig::parse(
+            Some("https://UPDATES.EXAMPLE:443/dsh-desktop/channels/stable/latest.json"),
+            Some(public_key),
+        )
+        .unwrap();
+
+        record_configuration_identity_with_context(
+            &log_path,
+            Some(&config),
+            "2026-08-29T02:03:04Z",
+            4242,
+        );
+
+        let line = fs::read_to_string(&log_path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "event": "updater-configuration-identity",
+                "endpoint": "https://updates.example/dsh-desktop/channels/stable/latest.json",
+                "public_key_sha256": "98bc2519dc9034c5a0bfbc5dbb808404cfc4db8e957783124c128a3732ed913a",
+                "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                "correlation_id": "updater-configuration",
+                "recorded_at": "2026-08-29T02:03:04Z",
+                "process_id": 4242
+            })
+        );
+        assert!(!line.contains(public_key));
+        assert!(!line.contains(directory.path().to_string_lossy().as_ref()));
+        assert!(!line.contains("signature"));
+    }
+
+    /// 缺失或无效配置不会产生成功的 updater 配置身份。
+    #[test]
+    fn invalid_configuration_records_no_success_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("logs").join("updater.jsonl");
+        let config = AdapterConfig::parse(
+            Some("http://updates.example/latest.json"),
+            Some("not-base64"),
+        );
+
+        record_configuration_identity_with_context(
+            &log_path,
+            config.as_ref().ok(),
+            "2026-08-29T02:03:04Z",
+            4242,
+        );
+
+        assert!(!log_path.exists());
     }
 
     /// Manifest 有总时限，大包下载只有连接和读取空闲时限。
