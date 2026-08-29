@@ -28,4 +28,3 @@ export function verifyConfigurationIdentityEvent(event: unknown, expectations: {
   readonly processId?: number
   readonly launchedAt: number
 }): true
-
