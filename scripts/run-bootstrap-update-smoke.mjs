@@ -43,7 +43,7 @@ export async function runBootstrapUpdateSmoke(options, environment = process.env
   const driver = environment.DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER
   if (!driver) throw new Error('DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER is required; bootstrap evidence cannot be synthesized')
   if (!dependencies.runDriver && path.resolve(driver) !== TRUSTED_BOOTSTRAP_DRIVER) throw new Error('bootstrap evidence requires the fixed repository-owned native driver')
-  const required = ['target', 'candidateTag', 'candidateCommit', 'candidateManifest', 'candidateManifestUrl', 'candidatePackage', 'candidateSignature', 'candidatePackageUrl', 'candidateReleaseUrl', 'outputDirectory']
+  const required = ['target', 'candidateTag', 'candidateCommit', 'candidateManifest', 'candidateManifestUrl', 'candidatePackage', 'candidateSignature', 'candidatePackageUrl', 'candidateReleaseUrl', 'expectedUpdaterEndpoint', 'expectedUpdaterPublicKey', 'outputDirectory']
   for (const name of required) if (!options[name]) throw new Error(`bootstrap update smoke option is required: ${name}`)
   const [manifestSha256, packageSha256, signatureSha256] = await Promise.all([
     sha256File(options.candidateManifest), sha256File(options.candidatePackage), sha256File(options.candidateSignature)
@@ -57,14 +57,23 @@ export async function runBootstrapUpdateSmoke(options, environment = process.env
     '--candidate-package', options.candidatePackage,
     '--candidate-signature', options.candidateSignature,
     '--candidate-manifest', options.candidateManifest,
+    '--candidate-manifest-url', options.candidateManifestUrl,
+    '--candidate-package-url', options.candidatePackageUrl,
     '--expected-candidate-version', options.candidateTag.replace(/^v/, ''),
+    '--expected-manifest-sha256', manifestSha256,
+    '--expected-package-sha256', packageSha256,
+    '--expected-signature-sha256', signatureSha256,
+    '--expected-updater-endpoint', options.expectedUpdaterEndpoint,
+    '--expected-updater-public-key', options.expectedUpdaterPublicKey,
+    '--expected-updater-public-key-sha256', createHash('sha256').update(options.expectedUpdaterPublicKey).digest('hex'),
+    '--signing-configured', options.signingConfigured ?? 'false',
     '--fresh-install-only', 'true'
   ]
-  const result = await runDriver(executable, resolvedDriver.endsWith('.mjs') ? [resolvedDriver, ...driverArguments] : driverArguments, {
-    PATH: environment.PATH,
-    SystemRoot: environment.SystemRoot,
-    DSH_BOOTSTRAP_UPDATE_SMOKE_OUTPUT: 'json'
-  })
+  const driverEnvironment = { DSH_BOOTSTRAP_UPDATE_SMOKE_OUTPUT: 'json' }
+  for (const name of ['PATH', 'SystemRoot', 'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'TMPDIR', 'DISPLAY', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_RUNTIME_DIR']) {
+    if (environment[name] !== undefined) driverEnvironment[name] = environment[name]
+  }
+  const result = await runDriver(executable, resolvedDriver.endsWith('.mjs') ? [resolvedDriver, ...driverArguments] : driverArguments, driverEnvironment)
   let observation
   try { observation = JSON.parse(result.stdout.toString('utf8')) } catch { throw new Error('bootstrap update smoke driver did not return one valid JSON observation') }
   const version = options.candidateTag.replace(/^v/, '')
@@ -91,6 +100,7 @@ export async function runBootstrapUpdateSmoke(options, environment = process.env
     completed_at: observation.completed_at,
     platform: observation.platform,
     observations: observation.observations,
+    observation_sources: observation.observation_sources,
     ...(observation.diagnostics ? { diagnostics: observation.diagnostics } : {})
   }
   verifyBootstrapUpdateEvidenceDocument(evidence, {

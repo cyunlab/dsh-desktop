@@ -95,6 +95,13 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
+      - name: Install the Linux virtual display required by the real AppImage
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y xvfb
       - name: Bind the approved tag to trusted default-branch history and a published Release
         shell: bash
         env:
@@ -150,8 +157,13 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           SIGNING_CONFIGURED: ${{ inputs.signing_configured }}
+          UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+          TAURI_SIGNING_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
         run: |
           set -euo pipefail
+          test -n "$UPDATE_BASE_URL"
+          test -n "$TAURI_SIGNING_PUBLIC_KEY"
+          expected_updater_endpoint="${UPDATE_BASE_URL%/}/dsh-desktop/channels/stable/latest.json"
           candidate_artifact="$(node -p "require('./bootstrap-assets/candidate/asset.json').artifactPath")"
           candidate_signature="$(node -p "require('./bootstrap-assets/candidate/asset.json').signaturePath")"
           candidate_url="$(node -p "require('./bootstrap-assets/candidate/asset.json').artifactUrl")"
@@ -165,6 +177,9 @@ jobs:
             --candidate-signature "$candidate_signature" \
             --candidate-package-url "$candidate_url" \
             --candidate-release-url "https://github.com/cyunlab/dsh-desktop/releases/tag/$CANDIDATE_TAG" \
+            --expected-updater-endpoint "$expected_updater_endpoint" \
+            --expected-updater-public-key "$TAURI_SIGNING_PUBLIC_KEY" \
+            --signing-configured "$SIGNING_CONFIGURED" \
             --output-directory bootstrap-evidence
       - name: Require checksummed target evidence
         shell: bash

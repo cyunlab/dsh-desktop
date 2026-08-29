@@ -24,6 +24,7 @@ export interface BootstrapUpdateEvidence {
   readonly completed_at: string
   readonly platform: Readonly<Record<string, string | boolean>>
   readonly observations: Readonly<Record<string, boolean>>
+  readonly observation_sources: Readonly<Record<string, string>>
   readonly diagnostics?: string
 }
 

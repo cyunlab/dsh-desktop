@@ -64,6 +64,10 @@ function validEvidence(target: string) {
       desktop_capabilities_package: true,
       desktop_update_client_package: true,
       composition_patch: true
+    },
+    observation_sources: {
+      configuration_identity: 'runtime-jsonl', signature_identity: 'node-ed25519-minisign', package_identity: 'immutable-manifest-sha256',
+      installation_identity: 'native-platform', host_readiness: 'fixed-origin-http', runtime_closure: 'installed-filesystem'
     }
   }
 }
@@ -96,6 +100,13 @@ describe('bootstrap update evidence verifier public seam', () => {
       requireRealBootstrap: true
     })
     expect(result).toEqual({ schemaVersion: 1, targets: REQUIRED_BOOTSTRAP_TARGETS, candidate })
+  })
+
+  /** 布尔结论缺少真实观察来源时不得进入 bootstrap admission。 */
+  it('rejects evidence whose runtime observation sources are missing', () => {
+    const documents = REQUIRED_BOOTSTRAP_TARGETS.map(validEvidence)
+    delete (documents[0] as unknown as Record<string, unknown>).observation_sources
+    expect(() => verifyBootstrapUpdateEvidenceSet(documents, { ...candidate, now: new Date('2026-08-29T09:00:00.000Z'), maxAgeHours: 24, requireRealBootstrap: true })).toThrow('observation_sources')
   })
 
   /** OSS package URL 必须由完整 package digest 的固定前缀内容寻址。 */

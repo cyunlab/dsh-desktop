@@ -26,6 +26,10 @@ const OBSERVATIONS = Object.freeze([
   'desktop_update_client_package',
   'composition_patch'
 ])
+const OBSERVATION_SOURCES = Object.freeze({
+  configuration_identity: 'runtime-jsonl', signature_identity: 'node-ed25519-minisign', package_identity: 'immutable-manifest-sha256',
+  installation_identity: 'native-platform', host_readiness: 'fixed-origin-http', runtime_closure: 'installed-filesystem'
+})
 const TARGET_CONTRACTS = Object.freeze({
   'windows-x86_64': Object.freeze({
     runner: Object.freeze({ os: 'windows', arch: 'x86_64' }),
@@ -156,6 +160,7 @@ function verifyDocument(document, expectations) {
   for (const observation of OBSERVATIONS) {
     if (observations[observation] !== true) throw new Error(`required bootstrap observation did not pass: ${observation}`)
   }
+  requireContract(document.observation_sources, OBSERVATION_SOURCES, 'observation_sources')
   if (document.diagnostics !== undefined) requireSafeText(document.diagnostics, 'bootstrap diagnostics')
   return target
 }

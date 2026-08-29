@@ -34,4 +34,13 @@ describe('bootstrap update smoke reusable workflow contract', () => {
     expect(workflow).toContain('bootstrap-update-evidence-${{ inputs.candidate_tag }}-${{ inputs.candidate_commit }}')
     expect(workflow).toContain('retention-days: 30')
   })
+
+  /** production job 把受保护的公开 updater identity 显式交给 producer。 */
+  it('passes the exact endpoint, public key, URLs and content identity to the native driver', () => {
+    expect(workflow).toContain('UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}')
+    expect(workflow).toContain('TAURI_SIGNING_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}')
+    expect(workflow).toContain('--expected-updater-endpoint "$expected_updater_endpoint"')
+    expect(workflow).toContain('--expected-updater-public-key "$TAURI_SIGNING_PUBLIC_KEY"')
+    expect(workflow).toContain('--signing-configured "$SIGNING_CONFIGURED"')
+  })
 })
