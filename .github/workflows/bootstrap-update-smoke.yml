@@ -97,7 +97,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            dbus-x11 libayatana-appindicator3-1 libwebkit2gtk-4.1-0 libxdo3 librsvg2-2 xvfb
+            dbus-x11 libayatana-appindicator3-1 libwebkit2gtk-4.1-0 libxdo3 librsvg2-2 lsof xvfb
       - name: Bind the approved tag to trusted default-branch history and a published Release
         shell: bash
         env:
@@ -147,6 +147,7 @@ jobs:
         shell: bash
         env:
           DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER: scripts/bootstrap-update-smoke-driver.mjs
+          DSH_BOOTSTRAP_MACOS_APPLICATIONS_STAGING: ${{ runner.os == 'macOS' }}
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
           TARGET: ${{ matrix.target }}

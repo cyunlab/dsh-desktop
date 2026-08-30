@@ -94,7 +94,7 @@ describe('bootstrap update smoke producer public seam', () => {
       }
     }
     let invocation: { args?: string[]; environment?: NodeJS.ProcessEnv } = {}
-    const result = await runBootstrapUpdateSmoke(options, { DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER: '/test/adapter', PATH: '/trusted/bin', HOME: '/home/runner', TMPDIR: '/tmp' }, {
+    const result = await runBootstrapUpdateSmoke(options, { DSH_BOOTSTRAP_UPDATE_SMOKE_DRIVER: '/test/adapter', DSH_BOOTSTRAP_MACOS_APPLICATIONS_STAGING: 'true', PATH: '/trusted/bin', HOME: '/home/runner', TMPDIR: '/tmp' }, {
       runDriver: async (_executable: string, args: string[], environment: NodeJS.ProcessEnv) => {
         invocation = { args, environment }
         return { stdout: Buffer.from(JSON.stringify(observation)), stderr: '' }
@@ -111,6 +111,6 @@ describe('bootstrap update smoke producer public seam', () => {
       '--expected-manifest-sha256', createHash('sha256').update('{"version":"2.1.0"}\n').digest('hex'),
       '--expected-package-sha256', digest
     ]))
-    expect(invocation.environment).toEqual({ PATH: '/trusted/bin', HOME: '/home/runner', TMPDIR: '/tmp', DSH_BOOTSTRAP_UPDATE_SMOKE_OUTPUT: 'json' })
+    expect(invocation.environment).toEqual({ PATH: '/trusted/bin', HOME: '/home/runner', TMPDIR: '/tmp', DSH_BOOTSTRAP_MACOS_APPLICATIONS_STAGING: 'true', DSH_BOOTSTRAP_UPDATE_SMOKE_OUTPUT: 'json' })
   })
 })

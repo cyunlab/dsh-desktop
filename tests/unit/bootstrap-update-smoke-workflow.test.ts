@@ -26,7 +26,8 @@ describe('bootstrap update smoke reusable workflow contract', () => {
 
   /** Linux fresh-install runner 必须具备 AppImage 的 WebKit/AppIndicator 运行库和虚拟显示。 */
   it('installs the Linux runtime libraries needed to launch the real AppImage', () => {
-    for (const dependency of ['dbus-x11', 'libayatana-appindicator3-1', 'libwebkit2gtk-4.1-0', 'libxdo3', 'librsvg2-2', 'xvfb']) expect(workflow).toContain(dependency)
+    for (const dependency of ['dbus-x11', 'libayatana-appindicator3-1', 'libwebkit2gtk-4.1-0', 'libxdo3', 'librsvg2-2', 'lsof', 'xvfb']) expect(workflow).toContain(dependency)
+    expect(workflow).toContain("DSH_BOOTSTRAP_MACOS_APPLICATIONS_STAGING: ${{ runner.os == 'macOS' }}")
   })
 
   /** 产证必须调用 fail-closed producer，聚合只接受真实 bootstrap evidence。 */

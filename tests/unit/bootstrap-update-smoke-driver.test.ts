@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildBootstrapCommandPlan, buildMacLaunchPlan, launchApplication, normalizeWindowsRegistryPath, runCommand, verifyConfigurationIdentityEvent, verifyMacArchiveListing, verifyTauriUpdaterSignature, verifyWindowsInstallationRecord } from '../../scripts/bootstrap-update-smoke-driver.mjs'
+import { buildBootstrapCommandPlan, buildMacLaunchPlan, combineBootstrapFailure, launchApplication, macApplicationsStagingPath, normalizeWindowsRegistryPath, parseListenerProcessId, runCommand, verifyConfigurationIdentityEvent, verifyMacArchiveListing, verifyTauriUpdaterSignature, verifyWindowsInstallationRecord } from '../../scripts/bootstrap-update-smoke-driver.mjs'
 
 describe('native bootstrap driver command-plan seam', () => {
   /** 原生进程静默退出时仍保留 code/signal，避免 readiness 超时丢失根因。 */
@@ -69,6 +69,23 @@ describe('native bootstrap driver command-plan seam', () => {
       executable: '/usr/bin/open',
       args: ['-n', '-W', '-g', '--stdout', '/dev/stdout', '--stderr', '/dev/stderr', '--env', 'HOME=/tmp/home', '--env', 'CFFIXED_USER_HOME=/tmp/home', '/tmp/install/Desktop.app']
     })
+  })
+
+  /** hosted macOS staging 名称唯一且固定在 `/Applications`，listener 只接受一个 PID。 */
+  it('builds a scoped macOS staging path and parses one listener process', () => {
+    expect(macApplicationsStagingPath(1234)).toBe('/Applications/DeepSeek Harness Desktop Bootstrap 1234.app')
+    expect(parseListenerProcessId('p4321\n')).toBe(4321)
+    expect(parseListenerProcessId('4321\r\n')).toBe(4321)
+    expect(() => parseListenerProcessId('p1\np2\n')).toThrow('ambiguous')
+  })
+
+  /** 清理异常必须附加到主失败，不能把真正的启动失败覆盖掉。 */
+  it('preserves the primary failure when cleanup also fails', () => {
+    const primary = new Error('Host did not start')
+    const failure = combineBootstrapFailure(primary, [new Error('uninstall record remained')])
+    expect(failure?.message).toContain('bootstrap failed: Host did not start')
+    expect(failure?.message).toContain('cleanup also failed: uninstall record remained')
+    expect(failure?.cause).toBe(primary)
   })
 
   /** 不支持的平台或 runner 架构不能生成可执行计划。 */

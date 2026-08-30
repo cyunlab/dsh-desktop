@@ -44,6 +44,12 @@ export function buildMacLaunchPlan(application, isolatedHome) {
   })
 }
 
+/** 为 hosted runner 生成不会覆盖正式安装的唯一 `/Applications` bootstrap 路径。 */
+export function macApplicationsStagingPath(pid = process.pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('invalid bootstrap staging process id')
+  return path.join('/Applications', `DeepSeek Harness Desktop Bootstrap ${pid}.app`)
+}
+
 /** 在解压前校验 macOS tar member、唯一 app 根和 symlink 目标均留在 archive 内。 */
 export function verifyMacArchiveListing(namesOutput, verboseOutput) {
   const names = namesOutput.split(/\r?\n/).filter(Boolean)
@@ -166,6 +172,23 @@ async function waitForMacApplicationProcess(executable, environment, launch) {
   throw new Error('macOS application process was not observed after LaunchServices launch')
 }
 
+/** 从 lsof 或 PowerShell 的单列输出解析唯一固定 Host listener PID。 */
+export function parseListenerProcessId(output) {
+  const pids = [...new Set(String(output).split(/\r?\n/).map(line => /^p?(\d+)$/.exec(line.trim())?.[1]).filter(Boolean).map(Number))]
+  if (pids.length !== 1 || !Number.isSafeInteger(pids[0]) || pids[0] <= 0) throw new Error('fixed Host listener PID is missing or ambiguous')
+  return pids[0]
+}
+
+/** 用平台原生端口工具绑定本次固定 Host 的唯一 listener PID。 */
+async function findFixedHostListenerProcess(target, environment) {
+  if (target === 'windows-x86_64') {
+    const script = "$pids=@(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 3080 -State Listen | Select-Object -ExpandProperty OwningProcess -Unique); [Console]::Out.Write(($pids -join \"`n\"))"
+    return parseListenerProcessId(await runCommand('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { environment }))
+  }
+  const executable = target.startsWith('darwin-') ? '/usr/sbin/lsof' : 'lsof'
+  return parseListenerProcessId(await runCommand(executable, ['-nP', '-a', '-iTCP@127.0.0.1:3080', '-sTCP:LISTEN', '-Fp'], { environment }))
+}
+
 /** 在启动或 runtime probe 前证明固定 Host 端口没有其他进程占用。 */
 function requireHostPortFree() {
   return new Promise((resolve, reject) => {
@@ -270,7 +293,27 @@ async function inspectMac(installRoot, version, signingConfigured, checks, envir
   const installedVersion = (await runCommand('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', plist], { environment })).trim()
   if (installedVersion !== version) throw new Error('installed macOS version does not match candidate')
   if (signingConfigured) for (const check of checks) await runCommand(check.executable, [...check.args, app], { environment })
-  return { root: app, executable: await realpath(path.join(app, 'Contents', 'MacOS', executable)), codeSigning: signingConfigured ? 'verified' : 'not-configured', notarization: signingConfigured ? 'verified' : 'not-configured' }
+  const canonicalApp = await realpath(app)
+  return { root: canonicalApp, executable: await realpath(path.join(canonicalApp, 'Contents', 'MacOS', executable)), codeSigning: signingConfigured ? 'verified' : 'not-configured', notarization: signingConfigured ? 'verified' : 'not-configured' }
+}
+
+/** 把已验证 app 原样复制到 hosted macOS 可由 LaunchServices 启动的唯一位置。 */
+async function stageMacApplication(application, executable, destination, environment) {
+  if ((await lstat(destination).catch(() => null)) !== null) throw new Error('bootstrap macOS staging destination already exists')
+  const relativeExecutable = path.relative(application, executable)
+  if (!relativeExecutable || relativeExecutable === '..' || relativeExecutable.startsWith(`..${path.sep}`) || path.isAbsolute(relativeExecutable)) throw new Error('macOS executable escapes application before staging')
+  await runCommand('sudo', ['/usr/bin/ditto', application, destination], { environment })
+  const stagedExecutable = await realpath(path.join(destination, relativeExecutable))
+  return { root: await realpath(destination), executable: stagedExecutable }
+}
+
+/** 精确删除本 job 创建的唯一 `/Applications` bootstrap app。 */
+async function cleanupStagedMacApplication(application, environment) {
+  if (!application) return
+  if (path.dirname(application) !== '/Applications' || !/^DeepSeek Harness Desktop Bootstrap \d+\.app$/.test(path.basename(application))) throw new Error('refusing to clean an untrusted macOS staging path')
+  if ((await lstat(application).catch(() => null)) === null) return
+  await runCommand('sudo', ['/bin/rm', '-R', '--', application], { environment })
+  if ((await lstat(application).catch(() => null)) !== null) throw new Error('bootstrap macOS staging cleanup failed')
 }
 
 /** 按 Windows 路径语义校验 NSIS 当前用户安装记录与版本。 */
@@ -310,8 +353,23 @@ async function inspectWindows(version, userRoot, environment) {
 async function uninstallWindows(installation, environment) {
   if (!installation) return
   await runCommand(installation.uninstaller, ['/S'], { environment })
-  const script = "$items=@(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' | Where-Object {$_.DisplayName -eq 'DeepSeek Harness Desktop'}); if ($items.Count -ne 0) { exit 1 }"
-  await runCommand('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { environment })
+  const script = "$items=@(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' -ErrorAction SilentlyContinue | Where-Object {$_.DisplayName -eq 'DeepSeek Harness Desktop'}); [Console]::Out.Write($items.Count)"
+  const deadline = Date.now() + 30_000
+  while (Date.now() < deadline) {
+    if ((await runCommand('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { environment })).trim() === '0') return
+    await new Promise(resolve => setTimeout(resolve, 500))
+  }
+  throw new Error('Windows bootstrap uninstall record did not disappear')
+}
+
+/** 把主流程错误与 finally 清理错误合并，避免后者覆盖真正失败原因。 */
+export function combineBootstrapFailure(primaryError, cleanupErrors) {
+  const errors = cleanupErrors.filter(Boolean)
+  if (!primaryError && errors.length === 0) return undefined
+  if (!primaryError && errors.length === 1) return errors[0]
+  const primary = primaryError ? `bootstrap failed: ${primaryError.message}` : 'bootstrap cleanup failed'
+  const cleanup = errors.length > 0 ? `; cleanup also failed: ${errors.map(error => error.message).join('; ')}` : ''
+  return new Error(`${primary}${cleanup}`, { cause: primaryError ?? errors[0] })
 }
 
 /** 尽力终止真实 Desktop 进程树并要求固定 listener 消失。 */
@@ -372,8 +430,11 @@ export async function runNativeBootstrapDriver(options, environment = process.en
   Object.keys(commandEnvironment).forEach(key => commandEnvironment[key] === undefined && delete commandEnvironment[key])
   let pid
   let applicationPid
+  let listenerPid
   let launchedAt
   let windowsInstallation
+  let stagedMacApplication
+  let primaryError
   try {
     const installRoot = path.join(temporary, 'install')
     const isolatedHome = path.join(temporary, 'home')
@@ -418,7 +479,9 @@ export async function runNativeBootstrapDriver(options, environment = process.en
       verifyMacArchiveListing(names, verbose)
       await runCommand(plan.install.executable, plan.install.args, { environment: commandEnvironment })
       const mac = await inspectMac(installRoot, options.expectedCandidateVersion, options.signingConfigured === 'true', plan.trustChecks, commandEnvironment)
-      installed = { root: mac.root, executable: mac.executable }
+      if (environment.DSH_BOOTSTRAP_MACOS_APPLICATIONS_STAGING !== 'true') throw new Error('hosted macOS bootstrap staging was not explicitly enabled')
+      stagedMacApplication = macApplicationsStagingPath()
+      installed = await stageMacApplication(mac.root, mac.executable, stagedMacApplication, commandEnvironment)
       platform = { package_kind: 'app-tar-gz', install_scope: 'user', authenticode: 'not-applicable', signing_credentials_configured: options.signingConfigured === 'true', code_signing: mac.codeSigning, notarization: mac.notarization }
       launchEnvironment = { ...commandEnvironment, HOME: isolatedHome, CFFIXED_USER_HOME: isolatedHome }
       const macLaunch = buildMacLaunchPlan(installed.root, isolatedHome)
@@ -439,6 +502,7 @@ export async function runNativeBootstrapDriver(options, environment = process.en
     pid = launch.pid
     applicationPid = options.target.startsWith('darwin-') ? await waitForMacApplicationProcess(installed.executable, commandEnvironment, launch) : pid
     await waitForHostReady(launch)
+    listenerPid = await findFixedHostListenerProcess(options.target, commandEnvironment)
     const configurationIdentity = await waitForConfigurationIdentity(configurationLogPath(options.target, isolatedHome, launchEnvironment), {
       endpoint: options.expectedUpdaterEndpoint,
       publicKeySha256: options.expectedUpdaterPublicKeySha256,
@@ -448,21 +512,27 @@ export async function runNativeBootstrapDriver(options, environment = process.en
       launchedAt
     }, applicationPid, installed.executable, options.target)
     applicationPid = configurationIdentity.process_id
-    await Promise.all([...new Set([applicationPid, pid])].map(processId => cleanupProcess(processId, commandEnvironment)))
+    await Promise.all([...new Set([listenerPid, applicationPid, pid])].map(processId => cleanupProcess(processId, commandEnvironment)))
     pid = undefined
     applicationPid = undefined
+    listenerPid = undefined
     return {
       runner: contract.runner, started_at: startedAt, completed_at: new Date().toISOString(), installation: { mode: 'fresh-install', installed_version: configurationIdentity.app_version, launched: true }, platform,
       observations: { ...observations, updater_signature_verified: true, immutable_object_identity_verified: true },
       observation_sources: { configuration_identity: 'runtime-jsonl', signature_identity: 'node-ed25519-minisign', package_identity: 'immutable-manifest-sha256', installation_identity: 'native-platform', host_readiness: 'fixed-origin-http', runtime_closure: 'installed-filesystem' }
     }
+  } catch (error) {
+    primaryError = error
   } finally {
-    try {
-      await Promise.all([...new Set([applicationPid, pid].filter(Boolean))].map(processId => cleanupProcess(processId, commandEnvironment)))
-      await uninstallWindows(windowsInstallation, commandEnvironment)
-    } finally {
-      await rm(temporary, { recursive: true, force: true })
-    }
+    const cleanupResults = await Promise.allSettled([
+      ...[...new Set([listenerPid, applicationPid, pid].filter(Boolean))].map(processId => cleanupProcess(processId, commandEnvironment)),
+      uninstallWindows(windowsInstallation, commandEnvironment),
+      cleanupStagedMacApplication(stagedMacApplication, commandEnvironment)
+    ])
+    const cleanupErrors = cleanupResults.filter(result => result.status === 'rejected').map(result => result.reason)
+    try { await rm(temporary, { recursive: true, force: true }) } catch (error) { cleanupErrors.push(error) }
+    const failure = combineBootstrapFailure(primaryError, cleanupErrors)
+    if (failure) throw failure
   }
 }
 
