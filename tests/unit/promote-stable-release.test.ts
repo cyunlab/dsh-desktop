@@ -470,16 +470,30 @@ describe('Stable update promotion', () => {
     const calls: Array<{ args: string[]; shell: boolean }> = []
     const publicKeyPacket = 'RWST3AOnSlwxKdQeGVbg9+u22K2c7niKQPaCJy4ECs9GpC6Moedx+9uf'
     const tauriPublicKey = Buffer.from(`untrusted comment: minisign public key: 29315C4AA703DC93\n${publicKeyPacket}`).toString('base64')
-    /** 记录 minisign 适配器收到的公开参数，避免执行本机二进制。 */
-    await verifyTauriSignature('/release/app.exe', '/release/app.exe.sig', tauriPublicKey, async (args, options) => {
-      calls.push({ args, shell: options.shell })
-    })
-    expect(calls).toEqual([{
-      args: ['-Vm', '/release/app.exe', '-x', '/release/app.exe.sig', '-P', publicKeyPacket],
-      shell: false
-    }])
-    await expect(verifyTauriSignature('/release/app.exe', '/release/app.exe.sig', publicKeyPacket, async () => undefined))
-      .rejects.toThrow('base64-encoded two-line minisign public key file')
+    const rawSignature = 'untrusted comment: signature from minisign secret key\nRUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=\ntrusted comment: timestamp:1556193335\tfile:test\ny/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+bHwhEBg=='
+    const directory = await mkdtemp(path.join(tmpdir(), 'dsh-tauri-signature-'))
+    const tauriSignaturePath = path.join(directory, 'app.exe.sig')
+    let decodedSignaturePath = ''
+    try {
+      await writeFile(tauriSignaturePath, Buffer.from(rawSignature).toString('base64'))
+      /** 记录并读取 minisign 适配器收到的私有临时签名文件，避免执行本机二进制。 */
+      await verifyTauriSignature('/release/app.exe', tauriSignaturePath, tauriPublicKey, async (args, options) => {
+        calls.push({ args, shell: options.shell })
+        decodedSignaturePath = args[3]
+        expect(decodedSignaturePath).not.toBe(tauriSignaturePath)
+        expect(await readFile(decodedSignaturePath, 'utf8')).toBe(`${rawSignature}\n`)
+        expect((await stat(decodedSignaturePath)).mode & 0o777).toBe(0o600)
+      })
+      expect(calls).toEqual([{
+        args: ['-Vm', '/release/app.exe', '-x', decodedSignaturePath, '-P', publicKeyPacket],
+        shell: false
+      }])
+      await expect(stat(decodedSignaturePath)).rejects.toThrow()
+      await expect(verifyTauriSignature('/release/app.exe', tauriSignaturePath, publicKeyPacket, async () => undefined))
+        .rejects.toThrow('base64-encoded two-line minisign public key file')
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
   })
 
   /** 验证非法 release tag 在上传前被拒绝。 */
