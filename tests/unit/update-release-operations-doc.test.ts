@@ -6,10 +6,11 @@ const operationsGuideUrl = new URL('../../docs/update-release-operations.md', im
 
 describe('automatic update release operations guide', () => {
   // 验证维护者能从手册中找到生产发布所需的完整外部资源清单。
-  it('documents the external production resources without claiming they already exist', () => {
+  it('documents the verified infrastructure without claiming updater rollout is complete', () => {
     const guide = readFileSync(operationsGuideUrl, 'utf8')
 
-    expect(guide).toContain('尚未实际创建或验证')
+    expect(guide).toContain('protected GitHub Actions diagnostic verified')
+    expect(guide).toContain('installed clients are not yet on the automatic-update channel')
     expect(guide).toContain('cn-shenzhen')
     expect(guide).toContain('dsh-desktop/')
     expect(guide).toContain('updates.cyunlab.com')
@@ -73,7 +74,7 @@ describe('automatic update release operations guide', () => {
   it('documents exact OIDC identity and prefix-scoped OSS authorization', () => {
     const guide = readFileSync(operationsGuideUrl, 'utf8')
 
-    expect(guide).toContain('repo:cyunlab/dsh-desktop:environment:production')
+    expect(guide).toContain('repo:cyunlab@318327647/dsh-desktop@1335996339:environment:production')
     expect(guide).toContain('https://token.actions.githubusercontent.com')
     expect(guide).toContain('sts.aliyuncs.com')
     expect(guide).toContain('acs:oss:*:*:<bucket-name>/dsh-desktop/*')

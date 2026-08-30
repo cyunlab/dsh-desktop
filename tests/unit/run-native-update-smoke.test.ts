@@ -8,6 +8,13 @@ import { REQUIRED_SMOKE_CHECKPOINTS } from '../../scripts/verify-update-smoke-ev
 
 const roots: string[] = []
 
+/** 生成验证窗口内的时间，避免测试随日历时间自然过期。 */
+function recentObservationTimes() {
+  const completedAt = new Date()
+  const startedAt = new Date(completedAt.valueOf() - 20 * 60 * 1000)
+  return { started_at: startedAt.toISOString(), completed_at: completedAt.toISOString() }
+}
+
 /** 创建单目标 runner 的固定输入。 */
 async function inputs() {
   const directory = await mkdtemp(path.join(tmpdir(), 'native-update-smoke-'))
@@ -69,8 +76,7 @@ describe('native update smoke harness public seam', () => {
     const options = await inputs()
     const observation = {
       runner: { os: 'windows', arch: 'x86_64' },
-      started_at: '2026-08-28T08:00:00.000Z',
-      completed_at: '2026-08-28T08:20:00.000Z',
+      ...recentObservationTimes(),
       platform: { package_kind: 'nsis-exe', install_scope: 'current-user', authenticode: 'not-required', code_signing: 'not-applicable', notarization: 'not-applicable', install_registry_root: 'HKCU', install_location_class: 'user-profile', msi_present: false },
       observations: {
         official_node: true,
@@ -97,8 +103,7 @@ describe('native update smoke harness public seam', () => {
     const options = { ...await inputs(), baselineProvenance: 'source-rebuild' as const }
     const observation = {
       runner: { os: 'windows', arch: 'x86_64' },
-      started_at: '2026-08-28T08:00:00.000Z',
-      completed_at: '2026-08-28T08:20:00.000Z',
+      ...recentObservationTimes(),
       platform: { package_kind: 'nsis-exe', install_scope: 'current-user', authenticode: 'not-required', code_signing: 'not-applicable', notarization: 'not-applicable', install_registry_root: 'HKCU', install_location_class: 'user-profile', msi_present: false },
       observations: Object.fromEntries(['official_node', 'cli_runtime_closure', 'desktop_capabilities_package', 'desktop_update_client_package', 'composition_patch', 'trusted_updater_configuration'].map(key => [key, true])),
       checkpoints: REQUIRED_SMOKE_CHECKPOINTS.map(id => ({ id, status: 'passed' }))

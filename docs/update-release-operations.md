@@ -2,7 +2,7 @@
 
 This runbook provisions and operates the production release path for Desktop automatic updates. It is intentionally fail-closed: immutable packages are uploaded and checked first, and `dsh-desktop/channels/stable/latest.json` is replaced only after every target passes validation.
 
-> **Current status:** the Alibaba Cloud resources, GitHub `production` Environment, DNS mapping, TLS certificate, and production updater signing key described below are **尚未实际创建或验证**. Repository automation can be reviewed and tested with its fake OSS adapter, but no real OSS promotion smoke test has succeeded yet. Do not interpret this document as evidence that production is live.
+> **Current status (2026-08-30):** the Alibaba Cloud resources, prefix-scoped OIDC role, GitHub `production` Environment, DNS mapping, TLS certificate, certificate renewal task, and production updater signing key described below have been provisioned. A protected GitHub Actions diagnostic verified the exact OIDC claims, temporary credential exchange, allowed `dsh-desktop/` access, denied bucket-root listing, and public HTTPS legacy anchor. The updater implementation is still in PR #85 and no first-updater Release/bootstrap promotion has run, so installed clients are not yet on the automatic-update channel.
 
 ## Ownership boundary
 

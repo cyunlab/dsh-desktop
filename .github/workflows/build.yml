@@ -163,8 +163,10 @@ jobs:
           pnpm tauri:build --bundles app --verbose
           version="$(node -p "require('./package.json').version")"
           app_path="src-tauri/target/release/bundle/macos/DeepSeek Harness Desktop.app"
+          app_directory="$(dirname "$app_path")"
           dmg_directory="src-tauri/target/release/bundle/dmg"
           dmg_path="${dmg_directory}/DeepSeek Harness Desktop_${version}_${{ matrix.arch }}.dmg"
+          app_notary_zip="$RUNNER_TEMP/dsh-desktop-${{ matrix.arch }}-notary.zip"
           test -d "$app_path"
 
           while IFS= read -r -d '' candidate; do
@@ -182,6 +184,27 @@ jobs:
             --timestamp \
             "$app_path"
           codesign --verify --deep --strict --verbose=2 "$app_path"
+
+          # Tauri creates the updater archive before the recursive signing above.
+          # Notarize and staple the final app, then replace and re-sign that archive.
+          ditto -c -k --keepParent "$app_path" "$app_notary_zip"
+          xcrun notarytool submit "$app_notary_zip" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --key "$APPLE_API_KEY_PATH" \
+            --wait
+          xcrun stapler staple "$app_path"
+          xcrun stapler validate "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
+
+          shopt -s nullglob
+          updater_archives=("$app_directory"/*.app.tar.gz)
+          [[ ${#updater_archives[@]} -eq 1 ]] || { echo "Expected exactly one macOS updater archive." >&2; exit 1; }
+          updater_archive="${updater_archives[0]}"
+          rm -f "$updater_archive" "$updater_archive.sig"
+          tar -czf "$updater_archive" -C "$app_directory" "$(basename "$app_path")"
+          pnpm tauri signer sign "$updater_archive"
+          test -s "$updater_archive.sig"
 
           mkdir -p "$dmg_directory"
           hdiutil create -volname "DeepSeek Harness Desktop" \
