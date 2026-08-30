@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url'
 const projectRoot = path.resolve(import.meta.dirname, '..')
 const desktopPackageManifest = JSON.parse(await readFile(path.join(projectRoot, 'package.json'), 'utf8'))
 const PINNED_DSH_VERSION = desktopPackageManifest.dependencies?.['@deepseek-ai/dsh']
-const RUNTIME_CLOSURE_VERSION = 4
+const RUNTIME_CLOSURE_VERSION = 8
 const DSH_CLI_CONFIGURATION_FILES = [
   'config/agent-presets/code/agent.cordis.yml',
   'config/agent-presets/code/preset.yml',
@@ -27,7 +27,9 @@ const RUNTIME_ENTRY_PACKAGES = [
   '@deepseek-ai/dsh-base',
   '@deepseek-ai/dsh-cmdline',
   '@deepseek-ai/dsh-launch-environment',
-  '@deepseek-ai/dsh-web-app'
+  '@deepseek-ai/dsh-web-app',
+  '@cyunlab/dsh-desktop-capabilities',
+  '@cyunlab/dsh-desktop-update-client'
 ]
 
 /** 返回当前构建平台的运行时约束。 */
@@ -48,6 +50,11 @@ export function requiredRuntimeAssets(target) {
     ...DSH_CLI_CONFIGURATION_FILES.map(relative => file('@deepseek-ai/dsh', relative, 'published CLI configuration')),
     file('@deepseek-ai/dsh-base', 'cordis.patch.yml', 'Harness bundle configuration'),
     file('@deepseek-ai/dsh-web-app', 'cordis.patch.yml', 'Harness bundle configuration'),
+    file('@cyunlab/dsh-desktop-capabilities', 'lib/index.js', 'Desktop capability bridge'),
+    file('@cyunlab/dsh-desktop-capabilities', 'lib/types/index.d.ts', 'Desktop capability types'),
+    file('@cyunlab/dsh-desktop-update-client', 'cordis.patch.yml', 'Desktop composition patch'),
+    file('@cyunlab/dsh-desktop-update-client', 'lib/index.js', 'Desktop client Host entry'),
+    file('@cyunlab/dsh-desktop-update-client', 'lib/client.js', 'Desktop client bundle'),
     file('@deepseek-ai/dsh-web-frontend', 'dist/index.html', 'Harness frontend'),
     directory('@deepseek-ai/dsh-web-frontend', 'dist/assets', 'Harness frontend'),
     file('@deepseek-ai/dsh-workflow-worker-thread', 'lib/worker.cjs', 'workflow worker'),
@@ -198,15 +205,29 @@ function isWithin(root, candidate) {
 }
 
 /** 计算构建输入指纹，确保依赖锁文件变化时不会复用旧闭包。 */
-async function runtimeInputHash(root, target) {
+export async function runtimeInputHash(root, target) {
   const hash = createHash('sha256')
   for (const fileName of ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml']) {
     hash.update(fileName)
     hash.update(await readFile(path.join(root, fileName)))
   }
+  await hashDirectory(hash, path.join(root, 'packages'))
   hash.update(JSON.stringify(target))
   hash.update(String(RUNTIME_CLOSURE_VERSION))
   return hash.digest('hex')
+}
+
+/** 按相对路径稳定哈希私有 workspace 源与生成输出。 */
+async function hashDirectory(hash, root, directory = root) {
+  const entries = await readdir(directory, { withFileTypes: true })
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    if (entry.name === 'node_modules') continue
+    const target = path.join(directory, entry.name)
+    const relative = path.relative(root, target)
+    hash.update(relative)
+    if (entry.isDirectory()) await hashDirectory(hash, root, target)
+    else if (entry.isFile()) hash.update(await readFile(target))
+  }
 }
 
 /** 返回从当前 pnpm 脚本启动 pnpm 的无 shell 命令。 */
@@ -502,6 +523,11 @@ async function ensureRuntimeCache(root, target, hash) {
   for (const fileName of ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml']) {
     await cp(path.join(root, fileName), path.join(cacheRoot, fileName))
   }
+  const workspaceSource = path.join(root, 'packages')
+  await cp(workspaceSource, path.join(cacheRoot, 'packages'), {
+    recursive: true,
+    filter: source => !path.relative(workspaceSource, source).split(path.sep).includes('node_modules')
+  })
   await runPnpm([
     'install',
     '--prod',
@@ -510,9 +536,28 @@ async function ensureRuntimeCache(root, target, hash) {
     '--dir',
     cacheRoot
   ], root)
+  await materializePrivateWorkspacePackages(cacheRoot, cacheNodeModules)
   await verifyRuntimeClosure(cacheNodeModules, target)
   await writeFile(markerPath, JSON.stringify({ hash, target, version: RUNTIME_CLOSURE_VERSION }) + '\n', 'utf8')
   return cacheNodeModules
+}
+
+/** 将 pnpm workspace 链接替换为闭包内部的普通目录，避免安装包依赖构建路径。 */
+async function materializePrivateWorkspacePackages(cacheRoot, cacheNodeModules) {
+  const packageFiles = {
+    'desktop-capabilities': ['package.json', 'lib'],
+    'desktop-update-client': ['package.json', 'cordis.patch.yml', 'lib']
+  }
+  for (const [directoryName, entries] of Object.entries(packageFiles)) {
+    const source = path.join(cacheRoot, 'packages', directoryName)
+    const manifest = JSON.parse(await readFile(path.join(source, 'package.json'), 'utf8'))
+    const destination = path.join(cacheNodeModules, packagePath(manifest.name))
+    await rm(destination, { recursive: true, force: true })
+    await mkdir(destination, { recursive: true })
+    for (const entry of entries) {
+      await cp(path.join(source, entry), path.join(destination, entry), { recursive: true, dereference: true })
+    }
+  }
 }
 
 /** 将缓存闭包原子复制到 Tauri 会打包的 dist/node_modules 目录。 */

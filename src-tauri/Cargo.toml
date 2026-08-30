@@ -11,7 +11,20 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
+sha2 = "0.10"
+time = { version = "0.3", features = ["formatting"] }
+base64 = "0.22"
+minisign-verify = "0.2"
+memmap2 = "0.9"
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+tempfile = "3"
+tokio = { version = "1", features = ["time", "sync"] }
+flate2 = "1"
+tar = "0.4"
 tauri = { version = "2", features = [] }
+tauri-plugin-updater = "2.10.1"
 tauri-plugin-single-instance = "2.4.3"
 tauri-plugin-opener = "2.5.4"
 tauri-plugin-clipboard-manager = "2.3.2"
@@ -28,6 +41,7 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Threading",
   "Win32_Security",
 ] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -37,3 +51,5 @@ signal-hook = "0.3"
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 wdio = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver"]
+
+[dev-dependencies]

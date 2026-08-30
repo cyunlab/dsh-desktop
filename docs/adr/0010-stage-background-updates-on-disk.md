@@ -1,0 +1,3 @@
+# Stage background updates on disk
+
+Desktop downloads available Stable updates in the background by default and retains each verified package on disk until installation rather than holding it in memory. Users may disable automatic download without disabling update checks. Current platform packages range from roughly 57 MB to 231 MB, and the stock Tauri updater buffers a complete package, so durable staging provides the expected download-first experience without imposing long-lived package-sized memory use. Each installation retains at most one staged package. It is verified again before installation and removed after a successful install, failed verification, or discovery of a newer Stable release.

@@ -1,9 +1,21 @@
 import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 const workflow = (await readFile(new URL('../../.github/workflows/build.yml', import.meta.url), 'utf8')).replaceAll('\r\n', '\n')
+const projectRoot = path.resolve(import.meta.dirname, '../..')
 
 describe('native build workflow contract', () => {
+  /** 根构建必须先生成 Desktop Client package，再物化 Runtime closure。 */
+  it('builds the private Desktop client before the Runtime closure', async () => {
+    const [manifest, buildScript] = await Promise.all([
+      readFile(path.join(projectRoot, 'package.json'), 'utf8'),
+      readFile(path.join(projectRoot, 'scripts', 'build.mjs'), 'utf8')
+    ])
+    const scripts = JSON.parse(manifest).scripts as Record<string, string>
+    expect(scripts.build).toContain('pnpm --filter @cyunlab/dsh-desktop-update-client build')
+    expect(buildScript).toContain('prepareRuntimeClosure')
+  })
   it('pins every third-party action to a reviewed commit', () => {
     const actions = [...workflow.matchAll(/uses:\s+([^\s#]+@[^\s#]+)(?:\s+#\s+(v\S+))?/g)]
     expect(actions).toHaveLength(7)
@@ -49,9 +61,24 @@ describe('native build workflow contract', () => {
     expect(workflow).toContain('patchelf')
   })
 
-  it('builds a Debian package without the unreliable linuxdeploy path', () => {
+  it('builds an AppImage in extraction mode for hosted runners', () => {
     expect(workflow).not.toContain('NO_STRIP')
-    expect(workflow).not.toContain('APPIMAGE_EXTRACT_AND_RUN')
+    expect(workflow).toContain('APPIMAGE_EXTRACT_AND_RUN: 1')
+  })
+
+  /** 确保所有原生构建都用生产 updater 密钥生成强制签名。 */
+  it('signs updater artifacts for every native target', () => {
+    expect(workflow).toMatch(/build:[\s\S]*runs-on: \$\{\{ matrix\.runner \}\}\n    environment: production/)
+    expect(workflow).not.toContain('id-token: write')
+    expect(workflow).toContain('TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}')
+    expect(workflow).toContain('TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}')
+    for (const updaterPath of [
+      'nsis/*.exe.sig',
+      'macos/*.app.tar.gz',
+      'macos/*.app.tar.gz.sig',
+      'appimage/*.AppImage',
+      'appimage/*.AppImage.sig'
+    ]) expect(workflow).toContain(`bundle/${updaterPath}`)
   })
 
   /** 确保两种 macOS 架构都绕过 Finder，并在封装 DMG 前递归签署原生资源。 */
@@ -61,10 +88,23 @@ describe('native build workflow contract', () => {
     expect(workflow).toContain("file -b \"$candidate\" | grep -q 'Mach-O'")
     expect(workflow).toContain('--options runtime')
     expect(workflow).toContain('codesign --verify --deep --strict --verbose=2 "$app_path"')
+    expect(workflow).toContain('xcrun notarytool submit "$app_notary_zip"')
+    expect(workflow).toContain('xcrun stapler validate "$app_path"')
+    expect(workflow).toContain('tar -czf "$updater_archive"')
+    expect(workflow).toContain('pnpm tauri signer sign "$updater_archive"')
+    expect(workflow.indexOf('codesign --verify --deep --strict --verbose=2 "$app_path"')).toBeLessThan(workflow.indexOf('tar -czf "$updater_archive"'))
+    expect(workflow.indexOf('xcrun stapler validate "$app_path"')).toBeLessThan(workflow.indexOf('tar -czf "$updater_archive"'))
     expect(workflow).toContain('hdiutil create -volname "DeepSeek Harness Desktop"')
     expect(workflow).toContain('-format UDZO "$dmg_path"')
     expect(workflow).toContain("if: matrix.platform != 'mac'")
     expect(workflow).not.toContain('pnpm package -- --verbose || pnpm package -- --verbose')
+  })
+
+  /** 确保四目标正式二进制编译进受信 Stable endpoint 与同一 updater 公钥。 */
+  it('embeds the production Stable endpoint and promotion public key in every native build', () => {
+    expect(workflow.match(/DSH_UPDATER_ENDPOINT: https:\/\/updates\.cyunlab\.com\/dsh-desktop\/channels\/stable\/latest\.json/g)).toHaveLength(2)
+    expect(workflow.match(/DSH_UPDATER_PUBLIC_KEY: \$\{\{ vars\.TAURI_SIGNING_PUBLIC_KEY \}\}/g)).toHaveLength(2)
+    expect(workflow).not.toMatch(/DSH_UPDATER_ENDPOINT:\s*\$\{\{\s*inputs\./)
   })
 
   /** 确保两个 macOS 架构都经过 Developer ID 签名、Apple 公证和装订。 */
@@ -89,7 +129,7 @@ describe('native build workflow contract', () => {
     ['windows-2025', 'win', 'x64', 'nsis/*.exe'],
     ['macos-15', 'mac', 'arm64', 'dmg/*.dmg'],
     ['macos-15-intel', 'mac', 'x64', 'dmg/*.dmg'],
-    ['ubuntu-22.04', 'linux', 'x64', 'deb/*.deb']
+    ['ubuntu-22.04', 'linux', 'x64', 'appimage/*.AppImage']
   ])('builds %s natively', (runner, platform, arch, artifactPath) => {
     expect(workflow).toContain(`runner: ${runner}`)
     expect(workflow).toContain(`platform: ${platform}`)
@@ -106,6 +146,7 @@ describe('native build workflow contract', () => {
     expect(workflow).toContain('fetch-depth: 0')
     expect(workflow).not.toMatch(/gh release (?:edit|create)[^\n]*--draft=false/)
     expect(workflow).not.toContain('gh release publish')
+    expect(workflow).not.toContain('promote-stable-release.mjs')
   })
 
   it('validates every tag candidate before allowing native builds', () => {

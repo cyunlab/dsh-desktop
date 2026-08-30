@@ -2,7 +2,8 @@ import type { ChildProcess } from 'node:child_process'
 import type { PackagedDshCliCommand } from './runtime-closure.mjs'
 
 export const FIXED_HOST_ORIGIN: 'http://127.0.0.1:3080/'
-export const DIRECT_DSH_WEB_ARGS: readonly ['web', '--host', '127.0.0.1', '--port', '3080']
+/** 构造带 Desktop 私有 composition patch 的正式 direct Web 参数。 */
+export function directDshWebArgs(nodeModulesRoot: string, harnessHome: string): readonly string[]
 
 /** 从环境变量读取正整数毫秒值。 */
 export function readPositiveMilliseconds(value: string | undefined, fallback: number, variableName: string): number

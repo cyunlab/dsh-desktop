@@ -9,7 +9,7 @@
     "node": ">=24 <25"
   },
   "scripts": {
-    "build": "node scripts/build.mjs",
+    "build": "pnpm --filter @cyunlab/dsh-desktop-capabilities build && pnpm --filter @cyunlab/dsh-desktop-update-client build && node scripts/build.mjs",
     "icons:generate": "node scripts/generate-desktop-icons.mjs",
     "package": "pnpm tauri:build",
     "package:dir": "pnpm tauri:build",
@@ -26,7 +26,7 @@
     "test:e2e:xvfb": "xvfb-run --auto-servernum pnpm test:e2e",
     "test:e2e:release-guard": "node scripts/check-wdio-release-guard.mjs",
     "test:behavior": "pnpm test && pnpm test:integration && pnpm test:e2e",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && pnpm --filter @cyunlab/dsh-desktop-capabilities typecheck && pnpm --filter @cyunlab/dsh-desktop-update-client typecheck",
     "release:tag": "node scripts/tag-release.mjs",
     "verify:release-version": "node scripts/verify-release-version.mjs"
   },
@@ -49,6 +49,8 @@
     "vitest": "4.0.18"
   },
   "dependencies": {
+    "@cyunlab/dsh-desktop-capabilities": "workspace:*",
+    "@cyunlab/dsh-desktop-update-client": "workspace:*",
     "@deepseek-ai/cordis": "4.0.1",
     "@deepseek-ai/cordis-plugin-group": "1.0.1",
     "@deepseek-ai/cordis-plugin-hmr": "1.0.16",

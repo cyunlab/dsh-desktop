@@ -1,0 +1,289 @@
+name: Native automatic update smoke evidence
+
+on:
+  workflow_dispatch:
+    inputs: &smoke_inputs
+      candidate_tag:
+        description: Candidate release tag
+        required: true
+        type: string
+      candidate_commit:
+        description: Exact 40-character candidate commit
+        required: true
+        type: string
+      manifest_url:
+        description: Isolated candidate manifest HTTPS URL; must not be Stable
+        required: true
+        type: string
+      manifest_sha256:
+        description: Expected isolated candidate manifest SHA-256
+        required: true
+        type: string
+      previous_stable_tag:
+        description: Tag expected from the current OSS Stable manifest
+        required: true
+        type: string
+      previous_stable_manifest_sha256:
+        description: SHA-256 of the authoritative Stable manifest read during candidate preparation
+        required: true
+        type: string
+      stable_manifest_url:
+        description: Authoritative OSS Stable latest.json HTTPS URL
+        required: false
+        default: https://updates.cyunlab.com/dsh-desktop/channels/stable/latest.json
+        type: string
+      artifact_name_prefix:
+        description: Artifact name prefix
+        required: false
+        default: dsh-desktop
+        type: string
+      signing_configured:
+        description: Require macOS signing and notarization observations
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs: *smoke_inputs
+    secrets:
+      APPLE_SIGNING_IDENTITY:
+        required: false
+      APPLE_API_ISSUER:
+        required: false
+    outputs:
+      evidence_artifact_name:
+        description: Verified four-target evidence artifact
+        value: ${{ jobs.aggregate.outputs.evidence_artifact_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  native-smoke:
+    name: Update smoke ${{ matrix.target }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: windows-x86_64
+            expected_os: win32
+            expected_arch: x64
+            package_kind: nsis-exe
+            install_scope: current-user
+            authenticode: not-required
+          - runner: ubuntu-22.04
+            target: linux-x86_64
+            expected_os: linux
+            expected_arch: x64
+            package_kind: appimage
+            install_scope: user
+            authenticode: not-applicable
+          - runner: macos-15
+            target: darwin-aarch64
+            expected_os: darwin
+            expected_arch: arm64
+            package_kind: app-tar-gz
+            install_scope: user
+            authenticode: not-applicable
+          - runner: macos-15-intel
+            target: darwin-x86_64
+            expected_os: darwin
+            expected_arch: x64
+            package_kind: app-tar-gz
+            install_scope: user
+            authenticode: not-applicable
+    runs-on: ${{ matrix.runner }}
+    environment: production
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 11.7.0
+          run_install: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Assert the hosted runner matches the evidence target
+        shell: bash
+        env:
+          EXPECTED_OS: ${{ matrix.expected_os }}
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        run: |
+          set -euo pipefail
+          node -e "if (process.platform !== process.env.EXPECTED_OS || process.arch !== process.env.EXPECTED_ARCH) process.exit(1)"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            test "${PROCESSOR_ARCHITECTURE:-}" = AMD64
+          else
+            machine="$(uname -m)"
+            [[ "$EXPECTED_ARCH:$machine" == "x64:x86_64" || "$EXPECTED_ARCH:$machine" == "arm64:arm64" ]]
+          fi
+      - name: Treat the candidate commit as untrusted data from the default branch
+        shell: bash
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "${CANDIDATE_COMMIT}^{commit}"
+          git merge-base --is-ancestor "$CANDIDATE_COMMIT" "refs/remotes/origin/$DEFAULT_BRANCH"
+          test "$(git rev-parse "refs/tags/${CANDIDATE_TAG}^{}")" = "$CANDIDATE_COMMIT"
+      - name: Install exact locked test harness
+        run: pnpm install --frozen-lockfile
+      - name: Verify packaged Runtime closure inputs exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f packages/desktop-capabilities/package.json
+          test -f packages/desktop-update-client/package.json
+          test -f packages/desktop-update-client/cordis.patch.yml
+          pnpm ensure:official-node
+      - name: Download exact baseline and candidate from their authoritative manifests
+        shell: bash
+        env:
+          STABLE_MANIFEST_URL: ${{ inputs.stable_manifest_url }}
+          ISOLATED_MANIFEST_URL: ${{ inputs.manifest_url }}
+          TARGET: ${{ matrix.target }}
+          PREVIOUS_STABLE_TAG: ${{ inputs.previous_stable_tag }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          EXPECTED_STABLE_MANIFEST_SHA256: ${{ inputs.previous_stable_manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          previous_version="${PREVIOUS_STABLE_TAG#v}"
+          candidate_version="${CANDIDATE_TAG#v}"
+          node scripts/prepare-update-smoke-assets.mjs \
+            --manifest-url "$STABLE_MANIFEST_URL" \
+            --target "$TARGET" \
+            --expected-version "$previous_version" \
+            --output-directory smoke-assets \
+            --label baseline
+          node scripts/prepare-update-smoke-assets.mjs \
+            --manifest-url "$ISOLATED_MANIFEST_URL" \
+            --target "$TARGET" \
+            --expected-version "$candidate_version" \
+            --output-directory smoke-assets \
+            --label candidate
+          actual_manifest_sha256="$(node -p "require('./smoke-assets/candidate/asset.json').manifestSha256")"
+          actual_stable_manifest_sha256="$(node -p "require('./smoke-assets/baseline/asset.json').manifestSha256")"
+          test "$actual_manifest_sha256" = "$EXPECTED_MANIFEST_SHA256"
+          test "$actual_stable_manifest_sha256" = "$EXPECTED_STABLE_MANIFEST_SHA256"
+      - name: Apply the fail-closed repository-owned native evidence gate
+        shell: bash
+        env:
+          DSH_UPDATE_SMOKE_DRIVER: scripts/native-update-smoke-driver.mjs
+          DSH_UPDATE_SMOKE_TARGET: ${{ matrix.target }}
+          DSH_UPDATE_SMOKE_PACKAGE_KIND: ${{ matrix.package_kind }}
+          DSH_UPDATE_SMOKE_INSTALL_SCOPE: ${{ matrix.install_scope }}
+          DSH_UPDATE_SMOKE_AUTHENTICODE: ${{ matrix.authenticode }}
+          DSH_UPDATE_SMOKE_SIGNING_CONFIGURED: ${{ inputs.signing_configured }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          PREVIOUS_STABLE_TAG: ${{ inputs.previous_stable_tag }}
+        run: |
+          set -euo pipefail
+          baseline_artifact="$(node -p "require('./smoke-assets/baseline/asset.json').artifactPath")"
+          baseline_signature="$(node -p "require('./smoke-assets/baseline/asset.json').signaturePath")"
+          baseline_url="$(node -p "require('./smoke-assets/baseline/asset.json').artifactUrl")"
+          candidate_artifact="$(node -p "require('./smoke-assets/candidate/asset.json').artifactPath")"
+          candidate_signature="$(node -p "require('./smoke-assets/candidate/asset.json').signaturePath")"
+          baseline_commit="$(git rev-parse "refs/tags/${PREVIOUS_STABLE_TAG}^{}")"
+          node scripts/run-native-update-smoke.mjs \
+            --target "$DSH_UPDATE_SMOKE_TARGET" \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --candidate-commit "$CANDIDATE_COMMIT" \
+            --candidate-manifest smoke-assets/candidate/manifest.json \
+            --candidate-package "$candidate_artifact" \
+            --candidate-signature "$candidate_signature" \
+            --baseline-tag "$PREVIOUS_STABLE_TAG" \
+            --baseline-version "${PREVIOUS_STABLE_TAG#v}" \
+            --baseline-commit "$baseline_commit" \
+            --baseline-artifact "$baseline_artifact" \
+            --baseline-signature "$baseline_signature" \
+            --baseline-stable-manifest smoke-assets/baseline/manifest.json \
+            --baseline-artifact-url "$baseline_url" \
+            --baseline-provenance published-release \
+            --output-directory smoke-evidence
+      - name: Verify target evidence before upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "smoke-evidence/${{ matrix.target }}.json"
+          test -s "smoke-evidence/${{ matrix.target }}.json.sha256"
+      - name: Upload target evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: update-smoke-evidence-${{ inputs.candidate_tag }}-${{ inputs.candidate_commit }}-${{ matrix.target }}
+          path: smoke-evidence/*
+          if-no-files-found: error
+          retention-days: 30
+
+  aggregate:
+    name: Verify four-target evidence set
+    needs: native-smoke
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      evidence_artifact_name: update-smoke-evidence-${{ inputs.candidate_tag }}-${{ inputs.candidate_commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Require the candidate commit to belong to the trusted default branch
+        shell: bash
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "${CANDIDATE_COMMIT}^{commit}"
+          git merge-base --is-ancestor "$CANDIDATE_COMMIT" "refs/remotes/origin/$DEFAULT_BRANCH"
+          test "$(git rev-parse "refs/tags/${CANDIDATE_TAG}^{}")" = "$CANDIDATE_COMMIT"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: update-smoke-evidence-${{ inputs.candidate_tag }}-${{ inputs.candidate_commit }}-*
+          path: smoke-evidence
+          merge-multiple: true
+      - name: Verify complete real-native evidence
+        run: >-
+          node scripts/verify-update-smoke-evidence.mjs
+          --evidence smoke-evidence
+          --candidate-tag "${{ inputs.candidate_tag }}"
+          --candidate-commit "${{ inputs.candidate_commit }}"
+          --manifest-sha256 "${{ inputs.manifest_sha256 }}"
+          --baseline-tag "${{ inputs.previous_stable_tag }}"
+          --baseline-manifest-sha256 "${{ inputs.previous_stable_manifest_sha256 }}"
+          --max-age-hours 24
+          --require-real-native
+      - name: Attest aggregate evidence to this workflow identity
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: smoke-evidence/*
+      - name: Upload verified four-target evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: update-smoke-evidence-${{ inputs.candidate_tag }}-${{ inputs.candidate_commit }}
+          path: smoke-evidence/*
+          if-no-files-found: error
+          retention-days: 30

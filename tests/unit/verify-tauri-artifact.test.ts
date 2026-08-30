@@ -8,6 +8,7 @@ import { requiredRuntimeAssets, runtimeTarget } from '../../scripts/runtime-clos
 import { probeDirectDshWeb, waitForListenerClosed } from '../../scripts/smoke-dsh-cli.mjs'
 
 const desktopManifest = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'))
+const trustedDesktopPatch = await readFile(new URL('../fixtures/desktop-update-client.patch.yml', import.meta.url), 'utf8')
 const pinnedDshVersion = desktopManifest.dependencies['@deepseek-ai/dsh'] as string
 const FIXED_PORT_TEST_TIMEOUT_MS = 7 * 60_000
 
@@ -22,6 +23,15 @@ function fakePe(machine: number, marker = ''): Buffer {
   return buffer
 }
 
+/** 创建带 x86_64 ELF 头和 AppImage type-2 magic 的最小测试文件。 */
+function fakeAppImage(): Buffer {
+  const buffer = Buffer.alloc(512)
+  buffer.set([0x7f, 0x45, 0x4c, 0x46, 2, 1], 0)
+  buffer.set([0x41, 0x49, 2], 8)
+  buffer.writeUInt16LE(0x3e, 18)
+  return buffer
+}
+
 /** 为 artifact 静态验证创建完整的 Windows runtime closure。 */
 async function createWindowsClosure(nodeModulesRoot: string): Promise<void> {
   const target = runtimeTarget('win32', 'x64')
@@ -30,7 +40,9 @@ async function createWindowsClosure(nodeModulesRoot: string): Promise<void> {
     '@deepseek-ai/dsh-base',
     '@deepseek-ai/dsh-cmdline',
     '@deepseek-ai/dsh-launch-environment',
-    '@deepseek-ai/dsh-web-app'
+    '@deepseek-ai/dsh-web-app',
+    '@cyunlab/dsh-desktop-capabilities',
+    '@cyunlab/dsh-desktop-update-client'
   ]) {
     const directory = path.join(nodeModulesRoot, name)
     await mkdir(directory, { recursive: true })
@@ -108,6 +120,11 @@ async function createRuntimeFixture(cliSource: string): Promise<{ root: string; 
     dependencies: {}
   }))
   await writeFile(cliEntry, cliSource)
+  const desktopPatch = path.join(nodeModulesRoot, '@cyunlab', 'dsh-desktop-update-client', 'cordis.patch.yml')
+  const desktopEntry = path.join(path.dirname(desktopPatch), 'lib', 'index.js')
+  await mkdir(path.dirname(desktopEntry), { recursive: true })
+  await writeFile(desktopPatch, trustedDesktopPatch)
+  await writeFile(desktopEntry, 'export function apply() {}\n')
   return { root, contentRoot, eventsFile: path.join(root, 'events.log'), nodeExecutable, nodeModulesRoot, platformName: target.platformName, runtimeArch: target.runtimeArch }
 }
 
@@ -116,11 +133,13 @@ function directCliSource(options: { readonly body?: string; readonly contentType
   return `
 import { appendFileSync } from 'node:fs'
 import { createServer } from 'node:http'
+import path from 'node:path'
 const eventsFile = process.env.DSH_FIXTURE_EVENTS
 const record = event => eventsFile && appendFileSync(eventsFile, event + '\\n')
-const expected = ['web', '--host', '127.0.0.1', '--port', '3080']
+const args = process.argv.slice(2)
+const expectedTail = ['--host', '127.0.0.1', '--port', '3080']
 record('argv:' + JSON.stringify(process.argv.slice(2)))
-if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expected)) process.exit(64)
+if (args[0] !== 'web' || args[1] !== '--patch' || path.basename(args[2] ?? '') !== 'cordis.patch.yml' || JSON.stringify(args.slice(3)) !== JSON.stringify(expectedTail)) process.exit(64)
 ${options.stdoutFlood ? "for (let index = 0; index < 256; index += 1) process.stdout.write('x'.repeat(65536))" : ''}
 const server = createServer((_request, response) => {
   record('http-request')
@@ -194,6 +213,24 @@ function processExists(pid: number): boolean {
 }
 
 describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TIMEOUT_MS }, () => {
+  /** 验证 Linux 发布验收使用 x86_64 AppImage 容器与运行时闭包。 */
+  it('accepts one x86_64 AppImage as the Linux release artifact', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-appimage-contract-'))
+    const artifactDirectory = path.join(root, 'src-tauri', 'target', 'release', 'bundle', 'appimage')
+    const artifact = path.join(artifactDirectory, 'DeepSeek Harness Desktop_1.1.1_amd64.AppImage')
+    try {
+      await mkdir(artifactDirectory, { recursive: true })
+      await writeFile(artifact, fakeAppImage())
+      await expect(verifyTauriArtifact('linux', {
+        projectRoot: root,
+        runtimeArch: 'x64',
+        containerInspector: async () => undefined
+      })).resolves.toBe(artifact)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('checks NSIS magic, application, official Node and the complete published CLI closure', async () => {
     const fixture = await createWindowsFixture()
     try {
@@ -222,6 +259,8 @@ describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TI
     ['CLI entry', path.join('@deepseek-ai', 'dsh', 'lib', 'bin.js')],
     ['CLI configuration', path.join('@deepseek-ai', 'dsh', 'config', 'agent-presets', 'standard', 'preset.yml')],
     ['frontend', path.join('@deepseek-ai', 'dsh-web-frontend', 'dist', 'index.html')],
+    ['Desktop capability bridge', path.join('@cyunlab', 'dsh-desktop-capabilities', 'lib', 'index.js')],
+    ['Desktop update client', path.join('@cyunlab', 'dsh-desktop-update-client', 'lib', 'client.js')],
     ['native dependency', path.join('node-pty', 'prebuilds', 'win32-x64', 'pty.node')],
     ['helper', path.join('node-pty', 'build', 'Release', 'conpty', 'OpenConsole.exe')]
   ])('rejects an artifact missing its %s', async (_label, relative) => {
@@ -270,7 +309,12 @@ describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TI
       process.env.DSH_FIXTURE_EVENTS = fixture.eventsFile
       await expect(probeBundledRuntime(fixture.contentRoot, fixture.platformName, fixture.runtimeArch)).resolves.toBeUndefined()
       const events = await readFile(fixture.eventsFile, 'utf8')
-      expect(events).toContain('argv:["web","--host","127.0.0.1","--port","3080"]\n')
+      const argv = events.split('\n').find(line => line.startsWith('argv:'))
+      expect(argv).toBeDefined()
+      const argumentsList = JSON.parse(argv!.slice('argv:'.length)) as string[]
+      expect(argumentsList.slice(0, 2)).toEqual(['web', '--patch'])
+      expect(argumentsList[2]).toContain(`${path.sep}.dsh-desktop${path.sep}runtime${path.sep}cordis.patch.yml`)
+      expect(argumentsList.slice(3)).toEqual(['--host', '127.0.0.1', '--port', '3080'])
       expect(events).toContain('http-request\n')
       expect(events).toContain('listener-closed\n')
       await expect(waitForListenerClosed()).resolves.toBeUndefined()

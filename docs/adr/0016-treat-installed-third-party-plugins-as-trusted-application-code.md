@@ -1,0 +1,3 @@
+# Treat installed third-party plugins as trusted application code
+
+Desktop follows a VS Code-style trust model for third-party DSH plugins: installing a plugin means trusting its Host and Web Client code with the ambient authority of those shared runtimes. Capability declarations, native interaction, scopes, and audit records remain useful for compatibility and user understanding, but Desktop does not claim that same-process Host plugins or same-realm client plugins are isolated from one another. If untrusted plugin execution becomes a product requirement, it will require a separate sandbox or extension-host decision rather than additional checks in the existing bridge.
