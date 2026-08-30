@@ -65,7 +65,10 @@ jobs:
           ossutil="$RUNNER_TEMP/ossutil/ossutil-v1.7.19-linux-amd64/ossutil"
           endpoint="oss-${OSS_REGION}.aliyuncs.com"
           credentials=(-i "$ACCESS_KEY_ID" -k "$ACCESS_KEY_SECRET" -t "$SECURITY_TOKEN" -e "$endpoint")
-          "$ossutil" stat "oss://${OSS_BUCKET}/dsh-desktop/channels/stable/latest.json" "${credentials[@]}"
+          "$ossutil" cat "oss://${OSS_BUCKET}/dsh-desktop/channels/stable/latest.json" "${credentials[@]}" \
+            | head -c 36 \
+            | sha256sum \
+            | grep -F '90e59093c7c43001e49280468b4377020e1d7dd752752aebe3b0ecdf5f8bede5'
           "$ossutil" ls "oss://${OSS_BUCKET}/dsh-desktop/" "${credentials[@]}" --max-keys 10
           if "$ossutil" ls "oss://${OSS_BUCKET}/" "${credentials[@]}" --max-keys 1; then
             echo 'Publishing role unexpectedly listed the bucket root.' >&2
