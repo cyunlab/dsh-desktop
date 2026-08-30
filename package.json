@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-desktop",
-  "version": "2.0.17",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "productName": "DeepSeek Harness Desktop",
