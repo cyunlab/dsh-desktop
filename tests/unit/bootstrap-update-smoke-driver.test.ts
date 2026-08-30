@@ -1,8 +1,16 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildBootstrapCommandPlan, runCommand, verifyConfigurationIdentityEvent, verifyMacArchiveListing, verifyTauriUpdaterSignature, verifyWindowsInstallationRecord } from '../../scripts/bootstrap-update-smoke-driver.mjs'
+import { buildBootstrapCommandPlan, buildMacLaunchPlan, launchApplication, normalizeWindowsRegistryPath, runCommand, verifyConfigurationIdentityEvent, verifyMacArchiveListing, verifyTauriUpdaterSignature, verifyWindowsInstallationRecord } from '../../scripts/bootstrap-update-smoke-driver.mjs'
 
 describe('native bootstrap driver command-plan seam', () => {
+  /** 原生进程静默退出时仍保留 code/signal，避免 readiness 超时丢失根因。 */
+  it('records a silent native process exit in bounded diagnostics', async () => {
+    const launch = launchApplication(process.execPath, ['-e', 'process.exit(7)'], process.env)
+    for (let index = 0; index < 20 && !launch.exitStatus(); index += 1) await new Promise(resolve => setTimeout(resolve, 10))
+    expect(launch.exitStatus()).toContain('code=7')
+    expect(launch.diagnostics()).toContain('code=7')
+  })
+
   /** 大型 archive listing 可使用显式有限上限，普通命令仍受默认诊断上限保护。 */
   it('admits a multi-megabyte archive listing only under an explicit bounded allowance', async () => {
     const bytes = 4 * 1024 * 1024
@@ -29,6 +37,13 @@ describe('native bootstrap driver command-plan seam', () => {
     expect(() => verifyWindowsInstallationRecord({ ...record, WindowsInstaller: 1 }, '2.1.5', 'C:\\Users\\RunnerAdmin\\AppData\\Local\\Desktop', 'C:\\Users\\RunnerAdmin\\AppData\\Local')).toThrow('windows_installer=1')
   })
 
+  /** Windows 注册表路径只剥离完整外层引号，仍要求绝对路径。 */
+  it('normalizes a quoted absolute Windows registry install path', () => {
+    expect(normalizeWindowsRegistryPath('  "C:\\Users\\runneradmin\\AppData\\Local\\DeepSeek Harness Desktop"  ')).toBe('C:\\Users\\runneradmin\\AppData\\Local\\DeepSeek Harness Desktop')
+    expect(() => normalizeWindowsRegistryPath('"C:\\Users\\runneradmin')).toThrow('invalid absolute')
+    expect(() => normalizeWindowsRegistryPath('DeepSeek Harness Desktop')).toThrow('invalid absolute')
+  })
+
   /** Linux fresh install 直接执行 exact AppImage，并保留原路径写入与执行资格。 */
   it('plans the exact executable AppImage under xvfb', () => {
     const plan = buildBootstrapCommandPlan({ target: 'linux-x86_64', packagePath: '/tmp/candidate.AppImage', installRoot: '/tmp/install' })
@@ -46,6 +61,14 @@ describe('native bootstrap driver command-plan seam', () => {
       { executable: 'spctl', args: ['--assess', '--type', 'execute'], appendApplication: true },
       { executable: 'xcrun', args: ['stapler', 'validate'], appendApplication: true }
     ])
+  })
+
+  /** macOS GUI app 通过 LaunchServices 启动，并把隔离 HOME 显式传给真实 app。 */
+  it('plans a waiting background LaunchServices launch for the extracted app', () => {
+    expect(buildMacLaunchPlan('/tmp/install/Desktop.app', '/tmp/home')).toEqual({
+      executable: '/usr/bin/open',
+      args: ['-n', '-W', '-g', '--stdout', '/dev/stdout', '--stderr', '/dev/stderr', '--env', 'HOME=/tmp/home', '--env', 'CFFIXED_USER_HOME=/tmp/home', '/tmp/install/Desktop.app']
+    })
   })
 
   /** 不支持的平台或 runner 架构不能生成可执行计划。 */

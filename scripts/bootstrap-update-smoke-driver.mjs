@@ -36,6 +36,14 @@ export function buildBootstrapCommandPlan(options) {
   })
 }
 
+/** 为已解压的 macOS app 生成 LaunchServices 启动计划并传入隔离用户目录。 */
+export function buildMacLaunchPlan(application, isolatedHome) {
+  return Object.freeze({
+    executable: '/usr/bin/open',
+    args: ['-n', '-W', '-g', '--stdout', '/dev/stdout', '--stderr', '/dev/stderr', '--env', `HOME=${isolatedHome}`, '--env', `CFFIXED_USER_HOME=${isolatedHome}`, application]
+  })
+}
+
 /** 在解压前校验 macOS tar member、唯一 app 根和 symlink 目标均留在 archive 内。 */
 export function verifyMacArchiveListing(namesOutput, verboseOutput) {
   const names = namesOutput.split(/\r?\n/).filter(Boolean)
@@ -108,23 +116,31 @@ export function runCommand(executable, args, options = {}) {
 }
 
 /** 启动真实 Desktop 主进程并保留有界诊断，不使用 shell 或测试 hook。 */
-function launchApplication(executable, args, environment) {
+export function launchApplication(executable, args, environment) {
   const child = spawn(executable, args, { env: environment, shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] })
   const output = []
   let bytes = 0
+  let exitStatus
   for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => {
     const remaining = OUTPUT_BOUND - bytes
     if (remaining > 0) output.push(chunk.subarray(0, remaining))
     bytes += chunk.length
   })
+  child.once('error', error => { exitStatus = `spawn error: ${error.code ?? error.message}` })
+  child.once('exit', (code, signal) => { exitStatus = `process exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})` })
   child.unref()
-  return { pid: child.pid, diagnostics: () => `${Buffer.concat(output).toString('utf8').trim().slice(0, OUTPUT_BOUND)}${bytes > OUTPUT_BOUND ? '\n[diagnostics truncated]' : ''}` }
+  return {
+    pid: child.pid,
+    exitStatus: () => exitStatus,
+    diagnostics: () => [Buffer.concat(output).toString('utf8').trim().slice(0, OUTPUT_BOUND), bytes > OUTPUT_BOUND ? '[diagnostics truncated]' : '', exitStatus ?? ''].filter(Boolean).join('\n')
+  }
 }
 
 /** 在超时内要求固定 Host origin 返回非空 HTML。 */
-async function waitForHostReady(readDiagnostics = () => '') {
+async function waitForHostReady(launch) {
   const deadline = Date.now() + 4 * 60 * 1000
   while (Date.now() < deadline) {
+    if (launch.exitStatus()) throw new Error(`Desktop process exited before fixed Host readiness: ${launch.diagnostics()}`)
     try {
       const response = await fetch(FIXED_ORIGIN, { redirect: 'error', signal: AbortSignal.timeout(5_000) })
       const body = await response.text()
@@ -132,8 +148,22 @@ async function waitForHostReady(readDiagnostics = () => '') {
     } catch {}
     await new Promise(resolve => setTimeout(resolve, 1_000))
   }
-  const diagnostics = readDiagnostics()
+  const diagnostics = launch.diagnostics()
   throw new Error(`fixed Host origin did not become ready${diagnostics ? `: ${diagnostics}` : ''}`)
+}
+
+/** 在 LaunchServices 启动后按精确主程序路径定位唯一 macOS app PID。 */
+async function waitForMacApplicationProcess(executable, environment, launch) {
+  const deadline = Date.now() + 30_000
+  while (Date.now() < deadline) {
+    if (launch.exitStatus()) throw new Error(`LaunchServices exited before the macOS application appeared: ${launch.diagnostics()}`)
+    const rows = await runCommand('ps', ['-axo', 'pid=,command='], { environment, outputBound: 4 * 1024 * 1024 })
+    const matches = rows.split(/\r?\n/).map(line => /^\s*(\d+)\s+(.+)$/.exec(line)).filter(match => match?.[2] === executable || match?.[2].startsWith(`${executable} `))
+    if (matches.length === 1) return Number(matches[0][1])
+    if (matches.length > 1) throw new Error('macOS application process is ambiguous')
+    await new Promise(resolve => setTimeout(resolve, 250))
+  }
+  throw new Error('macOS application process was not observed after LaunchServices launch')
 }
 
 /** 在启动或 runtime probe 前证明固定 Host 端口没有其他进程占用。 */
@@ -240,7 +270,7 @@ async function inspectMac(installRoot, version, signingConfigured, checks, envir
   const installedVersion = (await runCommand('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', plist], { environment })).trim()
   if (installedVersion !== version) throw new Error('installed macOS version does not match candidate')
   if (signingConfigured) for (const check of checks) await runCommand(check.executable, [...check.args, app], { environment })
-  return { root: app, executable: path.join(app, 'Contents', 'MacOS', executable), codeSigning: signingConfigured ? 'verified' : 'not-configured', notarization: signingConfigured ? 'verified' : 'not-configured' }
+  return { root: app, executable: await realpath(path.join(app, 'Contents', 'MacOS', executable)), codeSigning: signingConfigured ? 'verified' : 'not-configured', notarization: signingConfigured ? 'verified' : 'not-configured' }
 }
 
 /** 按 Windows 路径语义校验 NSIS 当前用户安装记录与版本。 */
@@ -254,11 +284,19 @@ export function verifyWindowsInstallationRecord(record, version, installLocation
   return true
 }
 
+/** 解析注册表中可选成对引号包裹的绝对 Windows 安装路径。 */
+export function normalizeWindowsRegistryPath(value) {
+  const input = String(value ?? '').trim()
+  const unquoted = input.startsWith('"') && input.endsWith('"') ? input.slice(1, -1) : input
+  if (!unquoted || unquoted.includes('"') || !path.win32.isAbsolute(unquoted)) throw new Error('invalid absolute Windows registry install path')
+  return path.win32.normalize(unquoted)
+}
+
 /** 从 HKCU uninstall registry 定位 NSIS 当前用户安装及版本。 */
 async function inspectWindows(version, userRoot, environment) {
   const script = "$ErrorActionPreference='Stop'; $cu=@(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' | Where-Object {$_.DisplayName -eq 'DeepSeek Harness Desktop'}); $lm=@(Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' -ErrorAction SilentlyContinue | Where-Object {$_.DisplayName -eq 'DeepSeek Harness Desktop'}); if ($cu.Count -ne 1 -or $lm.Count -ne 0) { throw 'expected exactly one HKCU and no HKLM uninstall record' }; [Console]::Out.Write(($cu[0] | Select-Object InstallLocation,DisplayVersion,WindowsInstaller | ConvertTo-Json -Compress))"
   const record = JSON.parse(await runCommand('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { environment }))
-  const installLocation = path.resolve(record.InstallLocation)
+  const installLocation = normalizeWindowsRegistryPath(record.InstallLocation)
   const [canonicalInstallLocation, canonicalUserRoot] = await Promise.all([realpath(installLocation), realpath(userRoot)])
   verifyWindowsInstallationRecord(record, version, canonicalInstallLocation, canonicalUserRoot)
   const executables = (await readdir(installLocation)).filter(name => name.toLowerCase().endsWith('.exe') && name.toLowerCase().includes('deepseek'))
@@ -279,10 +317,22 @@ async function uninstallWindows(installation, environment) {
 /** 尽力终止真实 Desktop 进程树并要求固定 listener 消失。 */
 async function cleanupProcess(pid, environment) {
   if (!pid) return
-  try { if (process.platform === 'win32') await runCommand('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { environment }); else process.kill(-pid, 'SIGTERM') } catch {}
+  const windows = process.platform === 'win32'
+  /** 同时向隔离进程组和主进程发信号，兼容 LaunchServices 与 wrapper 进程树。 */
+  const signalPosixTree = signal => {
+    try { process.kill(-pid, signal) } catch {}
+    try { process.kill(pid, signal) } catch {}
+  }
+  try { if (windows) await runCommand('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { environment }); else signalPosixTree('SIGTERM') } catch {}
   const deadline = Date.now() + 30_000
+  const forceAt = Date.now() + 5_000
+  let forced = windows
   while (Date.now() < deadline) {
     try { await fetch(FIXED_ORIGIN, { signal: AbortSignal.timeout(1_000) }) } catch { return }
+    if (!forced && Date.now() >= forceAt) {
+      signalPosixTree('SIGKILL')
+      forced = true
+    }
     await new Promise(resolve => setTimeout(resolve, 500))
   }
   throw new Error('Desktop cleanup left the fixed Host listener alive')
@@ -321,6 +371,7 @@ export async function runNativeBootstrapDriver(options, environment = process.en
   const commandEnvironment = { PATH: environment.PATH, SystemRoot: environment.SystemRoot, HOME: environment.HOME, USERPROFILE: environment.USERPROFILE, LOCALAPPDATA: environment.LOCALAPPDATA, APPDATA: environment.APPDATA, TEMP: environment.TEMP, TMP: environment.TMP, TMPDIR: environment.TMPDIR, DISPLAY: environment.DISPLAY, XDG_CONFIG_HOME: environment.XDG_CONFIG_HOME, XDG_DATA_HOME: environment.XDG_DATA_HOME, XDG_RUNTIME_DIR: environment.XDG_RUNTIME_DIR }
   Object.keys(commandEnvironment).forEach(key => commandEnvironment[key] === undefined && delete commandEnvironment[key])
   let pid
+  let applicationPid
   let launchedAt
   let windowsInstallation
   try {
@@ -370,7 +421,9 @@ export async function runNativeBootstrapDriver(options, environment = process.en
       installed = { root: mac.root, executable: mac.executable }
       platform = { package_kind: 'app-tar-gz', install_scope: 'user', authenticode: 'not-applicable', signing_credentials_configured: options.signingConfigured === 'true', code_signing: mac.codeSigning, notarization: mac.notarization }
       launchEnvironment = { ...commandEnvironment, HOME: isolatedHome, CFFIXED_USER_HOME: isolatedHome }
-      launchExecutable = installed.executable
+      const macLaunch = buildMacLaunchPlan(installed.root, isolatedHome)
+      launchExecutable = macLaunch.executable
+      launchArguments = macLaunch.args
       verificationRoot = installRoot
     }
     await Promise.all(['APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_RUNTIME_DIR'].map(name => launchEnvironment[name] && mkdir(launchEnvironment[name], { recursive: true })))
@@ -384,17 +437,20 @@ export async function runNativeBootstrapDriver(options, environment = process.en
     launchedAt = Date.now()
     const launch = launchApplication(launchExecutable, launchArguments, launchEnvironment)
     pid = launch.pid
-    await waitForHostReady(launch.diagnostics)
+    applicationPid = options.target.startsWith('darwin-') ? await waitForMacApplicationProcess(installed.executable, commandEnvironment, launch) : pid
+    await waitForHostReady(launch)
     const configurationIdentity = await waitForConfigurationIdentity(configurationLogPath(options.target, isolatedHome, launchEnvironment), {
       endpoint: options.expectedUpdaterEndpoint,
       publicKeySha256: options.expectedUpdaterPublicKeySha256,
       appVersion: options.expectedCandidateVersion,
       platform: `${contract.platform === 'win32' ? 'windows' : contract.platform === 'darwin' ? 'macos' : 'linux'}-${contract.arch === 'arm64' ? 'aarch64' : 'x86_64'}`,
-      processId: options.target === 'linux-x86_64' ? undefined : pid,
+      processId: options.target === 'linux-x86_64' ? undefined : applicationPid,
       launchedAt
-    }, pid, installed.executable, options.target)
-    await cleanupProcess(pid, commandEnvironment)
+    }, applicationPid, installed.executable, options.target)
+    applicationPid = configurationIdentity.process_id
+    await Promise.all([...new Set([applicationPid, pid])].map(processId => cleanupProcess(processId, commandEnvironment)))
     pid = undefined
+    applicationPid = undefined
     return {
       runner: contract.runner, started_at: startedAt, completed_at: new Date().toISOString(), installation: { mode: 'fresh-install', installed_version: configurationIdentity.app_version, launched: true }, platform,
       observations: { ...observations, updater_signature_verified: true, immutable_object_identity_verified: true },
@@ -402,7 +458,7 @@ export async function runNativeBootstrapDriver(options, environment = process.en
     }
   } finally {
     try {
-      await cleanupProcess(pid, commandEnvironment)
+      await Promise.all([...new Set([applicationPid, pid].filter(Boolean))].map(processId => cleanupProcess(processId, commandEnvironment)))
       await uninstallWindows(windowsInstallation, commandEnvironment)
     } finally {
       await rm(temporary, { recursive: true, force: true })
