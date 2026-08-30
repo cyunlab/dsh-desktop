@@ -3,6 +3,7 @@ import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 import {
+  linuxX11LaunchPlan,
   nativeCloseCommandPlan,
   parseDesktopProcessRows,
   platformStatePaths,
@@ -51,6 +52,18 @@ describe('native update platform adapter pure contracts', () => {
     expect(nativeCloseCommandPlan('darwin-aarch64', { applicationPid: 456, closeHelper: '/private/tmp/smoke/macos-close-window' })).toEqual({
       executable: '/private/tmp/smoke/macos-close-window', args: ['456'], environment: {},
     })
+  })
+
+  /** Linux 必须在 EWMH window manager ready 后通过位置参数启动 exact AppImage。 */
+  it('builds a managed X11 session around the exact AppImage path', () => {
+    const installationPath = '/tmp/install/DeepSeek-Harness-Desktop.AppImage'
+    const plan = linuxX11LaunchPlan(installationPath)
+    expect(plan).toMatchObject({ executable: 'dbus-run-session', display: ':99' })
+    expect(plan.args.slice(-2)).toEqual(['dsh-native-update-x11', installationPath])
+    const sessionScript = plan.args.at(-3)
+    expect(sessionScript).toContain('/usr/bin/openbox')
+    expect(sessionScript).toContain('/usr/bin/wmctrl')
+    expect(sessionScript).toContain('"$1"')
   })
 
   /** Desktop 进程枚举必须绑定 exact executable，不能把相似路径或旧 PID 当成本次启动。 */
