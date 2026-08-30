@@ -132,7 +132,7 @@ The immutable OSS audit record written before the first-updater bootstrap change
 
 ### Native update smoke
 
-The Stable-promotion observation in which a matching native runner installs the exact published previous Stable, lets it discover and stage an isolated candidate through its compiled Stable endpoint, performs a normal platform close or quit, and then separately launches the replaced candidate. It claims only facts observed from published binaries; explicit Restart interaction, negative security paths, and preference behavior remain separate tests unless a durable production-safe observation surface exists.
+The Stable-promotion observation in which a matching native runner installs the exact published previous Stable, lets it discover and stage an isolated candidate through its compiled Stable endpoint, performs a normal platform window close, proves the saved Host process tree and exact installed Desktop processes are absent, and then separately launches a new PID from the replaced installation. macOS uses a repository-owned exact-PID Accessibility helper to press the unique main-window close button without changing TCC. It claims only facts observed from published binaries; explicit Restart interaction, negative security paths, and preference behavior remain separate tests unless a durable production-safe observation surface exists.
 
 ### Update availability indicator
 

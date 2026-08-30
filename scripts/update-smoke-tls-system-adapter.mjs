@@ -6,39 +6,67 @@ const OUTPUT_BOUND = 128 * 1024
 const HOSTS_BOUND = 1024 * 1024
 const SERVER_SCRIPT = path.resolve(import.meta.dirname, 'update-smoke-tls-gate-server.mjs')
 
+/** 向独立 child process group 发送信号，Windows 则终止 exact child。 */
+function signalChild(child, signal) {
+  if (!child.pid) return
+  if (process.platform !== 'win32') {
+    try { process.kill(-child.pid, signal) } catch {}
+  }
+  try { child.kill(signal) } catch {}
+}
+
 /** 无 shell 执行有界系统命令，并只传入显式环境。 */
 export function runBoundedCommand(executable, args, options = {}) {
   return new Promise((resolve, reject) => {
-    let timedOut = false
+    let terminationReason
+    let finished = false
+    let hardKillTimeout
+    let reapTimeout
     const child = spawn(executable, args, {
       cwd: options.cwd,
       env: options.environment ?? {},
       shell: false,
+      detached: process.platform !== 'win32',
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     const chunks = []
     let bytes = 0
+    const graceMilliseconds = options.terminationGraceMilliseconds ?? 2_000
+    /** 只完成一次 Promise，并清理全部强制回收 timer。 */
+    const finish = (error, output) => {
+      if (finished) return
+      finished = true
+      clearTimeout(timeout)
+      clearTimeout(hardKillTimeout)
+      clearTimeout(reapTimeout)
+      if (error) reject(error)
+      else resolve(output)
+    }
+    /** 先 TERM、再 KILL，并以独立 deadline 保证调用方绝不会无限等待。 */
+    const terminate = reason => {
+      if (terminationReason) return
+      terminationReason = reason
+      signalChild(child, 'SIGTERM')
+      hardKillTimeout = setTimeout(() => signalChild(child, 'SIGKILL'), graceMilliseconds)
+      reapTimeout = setTimeout(() => finish(new Error(`${path.basename(executable)} ${reason} and could not be reaped`)), graceMilliseconds * 2)
+    }
     const timeout = setTimeout(() => {
-      timedOut = true
-      child.kill()
+      terminate('timed out')
     }, options.timeoutMilliseconds ?? 5 * 60 * 1000)
     for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => {
       bytes += chunk.length
       if (bytes <= (options.outputBound ?? OUTPUT_BOUND)) chunks.push(chunk)
-      else child.kill()
+      else terminate('output exceeded byte bound')
     })
     child.once('error', error => {
-      clearTimeout(timeout)
-      reject(error)
+      finish(error)
     })
-    child.once('exit', code => {
-      clearTimeout(timeout)
+    child.once('close', code => {
       const output = Buffer.concat(chunks).toString('utf8')
-      if (timedOut) reject(new Error(`${path.basename(executable)} timed out`))
-      else if (bytes > (options.outputBound ?? OUTPUT_BOUND)) reject(new Error(`${path.basename(executable)} output exceeded byte bound`))
-      else if (code !== 0) reject(new Error(`${path.basename(executable)} failed (${code}): ${output.trim().slice(0, 2048)}`))
-      else resolve(output)
+      if (terminationReason) finish(new Error(`${path.basename(executable)} ${terminationReason}`))
+      else if (code !== 0) finish(new Error(`${path.basename(executable)} failed (${code}): ${output.trim().slice(0, 2048)}`))
+      else finish(undefined, output)
     })
   })
 }
@@ -125,20 +153,22 @@ async function createTlsIdentity(config, command, environment) {
 }
 
 /** 创建受控 root child，并把 JSONL 事件转换为有界一次性等待。 */
-function startGateChild(config, environment) {
+function startGateChild(config, environment, command) {
   const arguments_ = [SERVER_SCRIPT, '--hostname', config.hostname, '--pathname', config.pathname, '--certificate', config.identity.certificate, '--key', config.identity.key, '--manifest', config.manifestPath]
   const executable = process.platform === 'win32' ? process.execPath : 'sudo'
   const args = process.platform === 'win32' ? arguments_ : ['-n', process.execPath, ...arguments_]
-  const child = spawn(executable, args, { env: environment, shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+  const child = spawn(executable, args, { env: environment, shell: false, detached: process.platform !== 'win32', windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
   let stdout = ''
   let stderr = ''
   let exited
   const waiters = new Map()
   const observed = new Set()
+  /** 拒绝所有未完成事件等待，保留最先出现的 helper 根因。 */
   const rejectWaiters = error => {
     for (const waiter of waiters.values()) waiter.reject(error)
     waiters.clear()
   }
+  /** 记录一次 server 事件，或完成它已有的唯一 waiter。 */
   const observe = event => {
     const waiter = waiters.get(event)
     if (waiter) {
@@ -152,8 +182,9 @@ function startGateChild(config, environment) {
   child.stdout.on('data', chunk => {
     stdout += chunk
     if (Buffer.byteLength(stdout) > OUTPUT_BOUND) {
-      child.kill()
-      rejectWaiters(new Error('TLS gate server output exceeded byte bound'))
+      const error = new Error('TLS gate server output exceeded byte bound')
+      rejectWaiters(error)
+      void stop(false).catch(stopError => rejectWaiters(new AggregateError([error, stopError], error.message)))
       return
     }
     for (;;) {
@@ -168,9 +199,12 @@ function startGateChild(config, environment) {
   child.stderr.on('data', chunk => {
     if (Buffer.byteLength(stderr) < OUTPUT_BOUND) stderr += chunk.slice(0, OUTPUT_BOUND - Buffer.byteLength(stderr))
   })
-  child.once('error', error => rejectWaiters(error))
-  child.once('exit', code => {
-    exited = { code, stderr: stderr.trim() }
+  child.once('error', error => {
+    exited = { code: null, signal: null, stderr: error.message }
+    rejectWaiters(error)
+  })
+  child.once('exit', (code, signal) => {
+    exited = { code, signal, stderr: stderr.trim() }
     if (code !== 0) rejectWaiters(new Error(`TLS gate server failed (${code}): ${stderr.trim().slice(0, 2048)}`))
   })
   /** 等待一个 server 事件，或在 child 异常退出/超时后失败。 */
@@ -192,7 +226,30 @@ function startGateChild(config, environment) {
   function send(command) {
     child.stdin.write(`${JSON.stringify({ command })}\n`)
   }
-  return { child, waitFor, send, exited: () => exited }
+  /** 等待 child 在 deadline 内退出。 */
+  async function waitForExit(timeoutMilliseconds) {
+    const deadline = Date.now() + timeoutMilliseconds
+    while (!exited && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50))
+    return exited
+  }
+  /** 优先走控制通道；失效后按 exact process group 提权 TERM/KILL 并确认回收。 */
+  async function stop(graceful = true) {
+    if (exited) return exited
+    if (graceful) {
+      try { send('close') } catch {}
+      if (await waitForExit(10_000)) return exited
+    }
+    if (process.platform === 'win32') {
+      await command('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { environment }).catch(() => {})
+    } else {
+      await command('sudo', ['-n', '/bin/kill', '-TERM', '--', `-${child.pid}`], { environment, timeoutMilliseconds: 5_000 }).catch(() => {})
+      if (await waitForExit(2_000)) return exited
+      await command('sudo', ['-n', '/bin/kill', '-KILL', '--', `-${child.pid}`], { environment, timeoutMilliseconds: 5_000 }).catch(() => {})
+    }
+    if (!(await waitForExit(2_000))) throw new Error('TLS gate server process group could not be reaped')
+    return exited
+  }
+  return { child, waitFor, send, stop, exited: () => exited }
 }
 
 /** 刷新本机 DNS cache；不支持缓存服务时保留 hosts mutation 的主结果。 */
@@ -236,11 +293,11 @@ export function createUpdateSmokeTlsSystemAdapter(environment = process.env, dep
     async startHttpsGate(config) {
       const manifestPath = path.join(config.identity.directory, 'candidate-manifest.json')
       await writeFile(manifestPath, config.manifest, { flag: 'wx' })
-      const control = startGateChild({ ...config, manifestPath }, commandEnvironment)
+      const control = startGateChild({ ...config, manifestPath }, commandEnvironment, command)
       try {
         await control.waitFor('ready')
       } catch (error) {
-        control.child.kill()
+        await control.stop(false).catch(() => {})
         throw error
       }
       return {
@@ -250,13 +307,7 @@ export function createUpdateSmokeTlsSystemAdapter(environment = process.env, dep
         async releaseManifest() { control.send('release'); await control.waitFor('released') },
         /** 关闭并确认 root helper 已退出。 */
         async close() {
-          if (!control.exited()) control.send('close')
-          const deadline = Date.now() + 30_000
-          while (!control.exited() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100))
-          if (!control.exited()) {
-            control.child.kill()
-            throw new Error('TLS gate server did not exit during cleanup')
-          }
+          await control.stop(true)
           if (control.exited().code !== 0) throw new Error(`TLS gate server cleanup failed (${control.exited().code})`)
         },
       }

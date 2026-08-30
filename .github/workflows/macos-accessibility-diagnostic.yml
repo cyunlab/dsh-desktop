@@ -1,0 +1,34 @@
+name: Temporary macOS Accessibility diagnostic
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    strategy:
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compile and inspect exact helper trust
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun swiftc -parse-as-library -O \
+            -framework AppKit -framework ApplicationServices \
+            scripts/macos-close-window.swift \
+            -o "$RUNNER_TEMP/macos-close-window"
+          set +e
+          "$RUNNER_TEMP/macos-close-window" --probe-trust
+          helper_status="$?"
+          set -e
+          echo "helper_status=$helper_status"
+          sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+            "SELECT service,client,client_type,auth_value,auth_reason,flags FROM access WHERE service='kTCCServiceAccessibility' ORDER BY client;" || true

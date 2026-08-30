@@ -1656,6 +1656,11 @@ fn shutdown_installs_staged(source: ShutdownSource) -> bool {
     )
 }
 
+/// 外部 RunEvent 退出在 orderly shutdown 完成前始终拦截，内部 app.exit(code) 才放行。
+fn should_prevent_external_exit(code: Option<i32>) -> bool {
+    code.is_none()
+}
+
 /// 请求应用退出，并保证 CLI 进程树被回收。
 fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>, source: ShutdownSource) {
     if state.shutting_down.swap(true, Ordering::AcqRel) {
@@ -2185,13 +2190,15 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while running Tauri application");
     app.run(|app_handle, event| {
-        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+        if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
             let Some(state) = app_handle.try_state::<Arc<RuntimeState>>() else {
                 return;
             };
-            if !state.shutting_down.load(Ordering::Acquire) {
+            if should_prevent_external_exit(code) {
                 api.prevent_exit();
-                request_shutdown(app_handle, state.inner(), ShutdownSource::ExitRequested);
+                if !state.shutting_down.load(Ordering::Acquire) {
+                    request_shutdown(app_handle, state.inner(), ShutdownSource::ExitRequested);
+                }
             }
         }
     });

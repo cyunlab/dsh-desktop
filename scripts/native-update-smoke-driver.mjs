@@ -32,7 +32,8 @@ function validateOptions(options) {
   if (!/^[0-9a-f]{64}$/.test(options.candidatePackageSha256)) throw new Error('candidate package digest must be lowercase SHA-256')
   if (!/^[0-9a-f]{64}$/.test(options.updaterPublicKeySha256)) throw new Error('updater public key digest must be lowercase SHA-256')
   if (!['true', 'false'].includes(options.signingConfigured)) throw new Error('native update signing policy must be true or false')
-  const parseVersion = value => {
+  /** 解析只允许正式三段式版本的候选输入。 */
+  function parseVersion(value) {
     const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(value)
     if (!match) throw new Error('native update versions must be stable semantic versions')
     return match.slice(1).map(Number)

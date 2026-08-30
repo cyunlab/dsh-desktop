@@ -7,14 +7,26 @@ import { connect } from 'node:net'
 import path from 'node:path'
 
 import { verifyTauriUpdaterSignature } from './tauri-updater-signature.mjs'
+import { readMachOArchitecture } from './verify-tauri-artifact.mjs'
 import { withUpdateSmokeTlsGate } from './update-smoke-tls-gate.mjs'
 import { createUpdateSmokeTlsSystemAdapter, runBoundedCommand } from './update-smoke-tls-system-adapter.mjs'
+import {
+  findDesktopProcessIds,
+  findProcessTreePids,
+  parseDesktopProcessRows,
+  processEnvironmentContainsAppImage,
+  processExists,
+  sameInstallationLocation,
+} from './native-update-processes.mjs'
+
+export { parseDesktopProcessRows, processEnvironmentContainsAppImage, sameInstallationLocation }
 
 const APP_IDENTIFIER = 'io.github.xlcyun.dsh-desktop'
 const FIXED_ORIGIN = 'http://127.0.0.1:3080/'
 const OUTPUT_BOUND = 128 * 1024
 const UPDATE_LOG_BOUND = 16 * 1024 * 1024
 const ARCHIVE_LISTING_BOUND = 32 * 1024 * 1024
+const MAC_CLOSE_HELPER_SOURCE = path.resolve(import.meta.dirname, 'macos-close-window.swift')
 const TARGETS = Object.freeze({
   'windows-x86_64': Object.freeze({ platform: 'win32', arch: 'x64', runner: { os: 'windows', arch: 'x86_64' }, installKind: 'windows_nsis' }),
   'linux-x86_64': Object.freeze({ platform: 'linux', arch: 'x64', runner: { os: 'linux', arch: 'x86_64' }, installKind: 'linux_app_image' }),
@@ -91,7 +103,7 @@ export function nativeCloseCommandPlan(target, launch) {
     if (!Number.isSafeInteger(launch.applicationPid) || launch.applicationPid <= 0) throw new Error('native close requires the Desktop application PID')
     return {
       executable: 'powershell.exe',
-      args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "$p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; if (-not $p.CloseMainWindow()) { throw 'Desktop main window did not accept close' }", String(launch.applicationPid)],
+      args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', `$p=Get-Process -Id ${launch.applicationPid} -ErrorAction Stop; if (-not $p.CloseMainWindow()) { throw 'Desktop main window did not accept close' }`],
       environment: {},
     }
   }
@@ -101,9 +113,10 @@ export function nativeCloseCommandPlan(target, launch) {
   }
   if (target?.startsWith('darwin-')) {
     if (!Number.isSafeInteger(launch.applicationPid) || launch.applicationPid <= 0) throw new Error('native close requires the Desktop application PID')
+    if (!path.isAbsolute(launch.closeHelper ?? '')) throw new Error('native close requires the compiled macOS window helper')
     return {
-      executable: '/usr/bin/osascript',
-      args: ['-e', 'tell application id "io.github.xlcyun.dsh-desktop" to quit'],
+      executable: launch.closeHelper,
+      args: [String(launch.applicationPid)],
       environment: {},
     }
   }
@@ -200,7 +213,7 @@ async function inspectWindows(version, environment, command) {
 }
 
 /** 从 macOS bundle 的 Info.plist 获取真实主程序与版本，并按配置验证签名材料。 */
-async function inspectMac(application, version, signingConfigured, environment, command) {
+async function inspectMac(application, version, expectedArchitecture, signingConfigured, environment, command) {
   const plist = path.join(application, 'Contents', 'Info.plist')
   const executableName = (await command('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleExecutable', plist], { environment })).trim()
   const installedVersion = (await command('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', plist], { environment })).trim()
@@ -211,7 +224,22 @@ async function inspectMac(application, version, signingConfigured, environment, 
     await command('xcrun', ['stapler', 'validate', application], { environment })
   }
   const canonical = await realpath(application)
-  return { root: canonical, runtimeRoot: canonical, executable: await realpath(path.join(canonical, 'Contents', 'MacOS', executableName)), application: canonical, version }
+  const executable = await realpath(path.join(canonical, 'Contents', 'MacOS', executableName))
+  const architecture = await readMachOArchitecture(executable)
+  if (architecture !== expectedArchitecture) throw new Error(`installed macOS architecture does not match ${expectedArchitecture}`)
+  return { root: canonical, runtimeRoot: canonical, executable, application: canonical, version }
+}
+
+/** 编译仓库自有的 exact-PID macOS 原生窗口关闭 helper，不修改 runner TCC。 */
+async function compileMacCloseHelper(temporaryRoot, environment, command) {
+  const executable = path.join(temporaryRoot, 'macos-close-window')
+  await command('xcrun', [
+    'swiftc', '-parse-as-library', '-O', '-framework', 'AppKit', '-framework', 'ApplicationServices',
+    MAC_CLOSE_HELPER_SOURCE, '-o', executable,
+  ], { environment, timeoutMilliseconds: 3 * 60 * 1000, outputBound: 4 * 1024 * 1024 })
+  await chmod(executable, 0o700)
+  await command(executable, ['--probe-trust'], { environment, timeoutMilliseconds: 10_000 })
+  return executable
 }
 
 /** 把已由 manifest/签名绑定的 AppImage 展开到唯一目录并定位真实 Desktop 主程序。 */
@@ -287,18 +315,10 @@ function verifyConfigurationIdentityEvent(event, expected) {
   if (!Number.isFinite(recordedAt) || recordedAt < expected.launchedAt - 5_000 || recordedAt > Date.now() + 5_000) throw new Error('updater configuration timestamp is outside this launch')
 }
 
-/** 证明配置日志 PID 指向真实已安装 Desktop 主程序。 */
+/** 证明配置日志 PID 是 exact 安装来源当前唯一的 Desktop 主程序。 */
 async function verifyDesktopProcess(target, pid, installation, environment, command) {
-  if (target === 'windows-x86_64') {
-    const output = (await command('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '[Console]::Out.Write((Get-Process -Id ([int]$args[0]) -ErrorAction Stop).Path)', String(pid)], { environment })).trim()
-    if (path.win32.normalize(output).toLowerCase() !== path.win32.normalize(installation.executable).toLowerCase()) throw new Error('updater configuration PID is not the installed Windows Desktop')
-  } else if (target === 'linux-x86_64') {
-    const executable = await realpath(`/proc/${pid}/exe`).catch(() => '')
-    if (!path.basename(executable).toLowerCase().includes('deepseek')) throw new Error('updater configuration PID is not the AppImage Desktop')
-  } else {
-    const output = (await command('ps', ['-p', String(pid), '-o', 'command='], { environment })).trim()
-    if (output !== installation.executable && !output.startsWith(`${installation.executable} `)) throw new Error('updater configuration PID is not the installed macOS Desktop')
-  }
+  const pids = await findDesktopProcessIds(target, installation, environment, command)
+  if (pids.length !== 1 || pids[0] !== pid) throw new Error('updater configuration PID is not the unique installed Desktop process')
 }
 
 /** 从有界 JSONL 日志等待本次 app version 与 PID 的真实配置身份。 */
@@ -364,16 +384,6 @@ async function waitForLinuxWindow(pid, environment, command) {
   throw new Error('Linux Desktop X11 window was not observed')
 }
 
-/** 判断平台 PID 是否仍存在，不把权限错误误判为退出。 */
-async function processExists(target, pid, environment, command) {
-  if (!pid) return false
-  if (target === 'windows-x86_64') {
-    const script = "if (Get-Process -Id ([int]$args[0]) -ErrorAction SilentlyContinue) { [Console]::Out.Write('true') } else { [Console]::Out.Write('false') }"
-    return (await command('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script, String(pid)], { environment })).trim() === 'true'
-  }
-  try { process.kill(pid, 0); return true } catch (error) { if (error.code === 'ESRCH') return false; throw error }
-}
-
 /** 强制清理失败路径上的 Desktop 进程树，不用于生成正常退出证据。 */
 async function cleanupLaunch(target, launch, environment, command) {
   if (!launch?.applicationPid && !launch?.pid) return
@@ -428,6 +438,7 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
   let baselineInstallation
   let currentInstallation
   let baselineDigest
+  let macCloseHelper
   const launches = []
 
   /** 检查下载资产、签名、公钥和 candidate manifest 的 byte-exact pairing。 */
@@ -499,7 +510,10 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
       await command('tar', ['-xzf', options.baselineArtifact, '-C', installRoot], { environment: commandEnvironment })
       const apps = (await readdir(installRoot)).filter(name => name.endsWith('.app'))
       if (apps.length !== 1) throw new Error('macOS baseline archive application is ambiguous')
-      baselineInstallation = await inspectMac(path.join(installRoot, apps[0]), options.baselineVersion, options.signingConfigured === 'true', commandEnvironment, command)
+      const expectedArchitecture = contract.arch === 'arm64' ? 'aarch64' : 'x86_64'
+      baselineInstallation = await inspectMac(path.join(installRoot, apps[0]), options.baselineVersion, expectedArchitecture, options.signingConfigured === 'true', commandEnvironment, command)
+      macCloseHelper = await compileMacCloseHelper(temporary, commandEnvironment, command)
+      baselineInstallation.closeHelper = macCloseHelper
       baselineInstallation.launchEnvironment = launchEnvironment
       if (options.signingConfigured === 'true') Object.assign(platform, { signing_credentials_configured: true, code_signing: 'verified', notarization: 'verified' })
     }
@@ -513,6 +527,8 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
   /** 按平台启动已安装 Desktop，不使用测试构建或 runtime hook。 */
   async function launch(installation) {
     await requireHostPortFree()
+    const preexistingPids = await findDesktopProcessIds(target, installation, commandEnvironment, command)
+    if (preexistingPids.length > 0) throw new Error(`Desktop was already running before the explicit launch: ${preexistingPids.join(',')}`)
     let executable = installation.executable
     let args = []
     let launchEnvironment = { ...installation.launchEnvironment }
@@ -529,7 +545,7 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
       launcherMayExit = true
     }
     const launchedAt = Date.now()
-    const result = { ...launchApplication(executable, args, launchEnvironment), installation, launchedAt, launcherMayExit, display }
+    const result = { ...launchApplication(executable, args, launchEnvironment), installation, launchedAt, launcherMayExit, display, closeHelper: installation.closeHelper }
     launches.push(result)
     return result
   }
@@ -545,9 +561,11 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
       launchedAt: launchResult.launchedAt,
     }, launchResult.installation, target, commandEnvironment, command)
     launchResult.applicationPid = event.process_id
+    if (launches.some(previous => previous !== launchResult && previous.applicationPid === event.process_id)) throw new Error('explicit updated launch reused a previous Desktop PID')
     if (target === 'linux-x86_64') launchResult.windowId = await waitForLinuxWindow(event.process_id, { ...commandEnvironment, DISPLAY: launchResult.display }, command)
     await waitForHostReady(launchResult)
     launchResult.listenerPid = await findFixedHostListenerProcess(target, commandEnvironment, command)
+    launchResult.listenerTreePids = await findProcessTreePids(target, launchResult.listenerPid, commandEnvironment, command)
     if (version === options.candidateVersion) {
       const deadline = Date.now() + 30_000
       while (await lstat(statePaths.stagedMetadata).catch(() => null)) {
@@ -589,7 +607,7 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
     throw new Error('candidate did not reach verified staged state')
   }
 
-  /** 发出真实 Windows close、Linux X11 close 或 macOS normal Quit。 */
+  /** 发出真实 Windows close、Linux X11 close 或 macOS 唯一主窗口 AXPress。 */
   async function requestNormalClose(launchResult) {
     const plan = nativeCloseCommandPlan(target, launchResult)
     await command(plan.executable, plan.args, { environment: { ...commandEnvironment, ...plan.environment } })
@@ -599,11 +617,12 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
   async function waitForNormalClose(launchResult) {
     const deadline = Date.now() + 4 * 60 * 1000
     while (Date.now() < deadline) {
-      const alive = await processExists(target, launchResult.applicationPid, commandEnvironment, command)
+      const desktopPids = await findDesktopProcessIds(target, launchResult.installation, commandEnvironment, command)
+      const hostTreeAlive = (await Promise.all((launchResult.listenerTreePids ?? [launchResult.listenerPid]).map(pid => processExists(target, pid, commandEnvironment, command)))).some(Boolean)
       let hostAlive = false
       try { await requestLoopbackHttp(1_000); hostAlive = true } catch {}
       const synchronousInstallCompleted = target === 'windows-x86_64' || !(await lstat(statePaths.stagedMetadata).catch(() => null))
-      if (!alive && !hostAlive && synchronousInstallCompleted) return
+      if (desktopPids.length === 0 && !hostTreeAlive && !hostAlive && synchronousInstallCompleted) return
       await delay(500)
     }
     throw new Error(`Desktop or Host did not finish normal-close installation: ${launchResult.diagnostics()}`)
@@ -615,15 +634,21 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
     let lastError
     while (Date.now() < deadline) {
       try {
-        if (target === 'windows-x86_64') currentInstallation = await inspectWindows(options.candidateVersion, commandEnvironment, command)
+        if (target === 'windows-x86_64') {
+          currentInstallation = await inspectWindows(options.candidateVersion, commandEnvironment, command)
+          if (!sameInstallationLocation(target, baselineInstallation, currentInstallation)) throw new Error('Windows update did not replace the baseline installation in place')
+        }
         else if (target === 'linux-x86_64') {
           const packageBytes = await readFile(baselineInstallation.installPath)
           if (digest(packageBytes) !== options.candidatePackageSha256 || digest(packageBytes) === baselineDigest) throw new Error('AppImage replacement digest mismatch')
           currentInstallation = await inspectLinuxAppImage(baselineInstallation.installPath, options.candidateVersion, temporary, commandEnvironment, command)
         } else {
-          currentInstallation = await inspectMac(baselineInstallation.application, options.candidateVersion, options.signingConfigured === 'true', commandEnvironment, command)
+          const expectedArchitecture = contract.arch === 'arm64' ? 'aarch64' : 'x86_64'
+          currentInstallation = await inspectMac(baselineInstallation.application, options.candidateVersion, expectedArchitecture, options.signingConfigured === 'true', commandEnvironment, command)
         }
+        if (!sameInstallationLocation(target, baselineInstallation, currentInstallation)) throw new Error('update did not replace the baseline installation in place')
         currentInstallation.launchEnvironment = baselineInstallation.launchEnvironment
+        currentInstallation.closeHelper = macCloseHelper
         currentInstallation.statePaths = statePaths
         return currentInstallation
       } catch (error) {
@@ -635,10 +660,11 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
   }
 
   /** 正常关闭安装必须保持退出状态，直到 harness 主动重新启动。 */
-  async function assertNotRelaunched(previousLaunch) {
+  async function assertNotRelaunched(_previousLaunch) {
     const deadline = Date.now() + 5_000
     while (Date.now() < deadline) {
-      if (await processExists(target, previousLaunch.applicationPid, commandEnvironment, command)) throw new Error('normal-close update relaunched the previous Desktop PID')
+      const desktopPids = await findDesktopProcessIds(target, currentInstallation, commandEnvironment, command)
+      if (desktopPids.length > 0) throw new Error(`normal-close update relaunched Desktop process ${desktopPids.join(',')}`)
       try { await requestLoopbackHttp(500); throw new Error('normal-close update relaunched the fixed Host') } catch (error) { if (error.message === 'normal-close update relaunched the fixed Host') throw error }
       await delay(500)
     }
@@ -647,6 +673,10 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
   /** 清理本次 runner 创建的进程、NSIS 安装、app state 与临时目录。 */
   async function cleanup() {
     const errors = []
+    if (currentInstallation) {
+      const orphanPids = await findDesktopProcessIds(target, currentInstallation, commandEnvironment, command).catch(error => { errors.push(error); return [] })
+      for (const applicationPid of orphanPids) await cleanupLaunch(target, { applicationPid }, commandEnvironment, command).catch(error => errors.push(error))
+    }
     for (const launchResult of launches.reverse()) await cleanupLaunch(target, launchResult, commandEnvironment, command).catch(error => errors.push(error))
     if (target === 'windows-x86_64') await uninstallWindows(currentInstallation ?? baselineInstallation, commandEnvironment, command).catch(error => errors.push(error))
     for (const root of [statePaths?.configRoot, statePaths?.cacheRoot, temporary].filter(Boolean)) await rm(root, { recursive: true, force: true }).catch(error => errors.push(error))

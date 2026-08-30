@@ -3,7 +3,8 @@ use super::{
     exit_requires_failure, inspect_http_client_response, is_current_host_page_event,
     is_finished_page_load, is_packaged_startup_url, is_packaged_update_url,
     navigation_event_matches, parse_loopback_address, probe_client_page_with_timeout,
-    retry_allowed, retry_input_for_snapshot, shutdown_installs_staged,
+    retry_allowed, retry_input_for_snapshot, should_prevent_external_exit,
+    shutdown_installs_staged,
     trusted_update_command_source, DiagnosticCode, ExitReason, HttpResponseState,
     LifecycleSnapshot, LifecycleState, NavigationDecision, PageLoadEvent, ProcessObservation,
     RuntimeState, ShutdownSource, HTTP_BODY_CAP,
@@ -409,6 +410,14 @@ fn normal_application_exit_is_update_eligible() {
     assert!(shutdown_installs_staged(ShutdownSource::ExitRequested));
     assert!(!shutdown_installs_staged(ShutdownSource::Destroyed));
     assert!(!shutdown_installs_staged(ShutdownSource::TerminalSignal));
+}
+
+/// 外部退出在 cleanup 完成前始终拦截，只有内部 app.exit(code) 可以结束 event loop。
+#[test]
+fn external_exit_is_prevented_until_internal_exit_code_arrives() {
+    assert!(should_prevent_external_exit(None));
+    assert!(!should_prevent_external_exit(Some(0)));
+    assert!(!should_prevent_external_exit(Some(1)));
 }
 
 /// retry 意图只能从 Rust 当前失败快照产生，调用方不能选择操作。

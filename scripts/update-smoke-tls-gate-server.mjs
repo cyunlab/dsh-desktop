@@ -34,6 +34,7 @@ async function main() {
   if (manifest.length <= 0 || manifest.length > OUTPUT_BOUND) throw new Error('TLS gate server manifest is outside the byte bound')
   let pending
   let released = false
+  let closing = false
   const server = createServer({ cert: certificate, key }, (request, response) => {
     if (request.method !== 'GET' || request.url !== options.pathname || ![options.hostname, `${options.hostname}:443`].includes(request.headers.host ?? '')) {
       response.writeHead(404, { connection: 'close', 'content-length': '0' })
@@ -55,6 +56,16 @@ async function main() {
     server.listen({ host: '127.0.0.1', port: 443, exclusive: true }, resolve)
   })
   emit({ event: 'ready' })
+  /** 销毁 pending response，停止 listener，并让自然 event-loop 回收结束进程。 */
+  const closeServer = exitCode => {
+    if (closing) return
+    closing = true
+    pending?.destroy()
+    pending = undefined
+    process.exitCode = exitCode
+    process.stdin.pause()
+    server.close(() => process.exit(exitCode))
+  }
   let input = ''
   process.stdin.setEncoding('utf8')
   process.stdin.on('data', chunk => {
@@ -79,14 +90,15 @@ async function main() {
         pending = undefined
         emit({ event: 'released' })
       } else if (command.command === 'close') {
-        pending?.destroy()
-        pending = undefined
-        server.close(() => process.exit(0))
+        closeServer(0)
       } else {
         throw new Error('unknown TLS gate server control command')
       }
     }
   })
+  process.stdin.once('end', () => closeServer(0))
+  process.once('SIGTERM', () => closeServer(0))
+  process.once('SIGINT', () => closeServer(0))
 }
 
 main().catch(error => {

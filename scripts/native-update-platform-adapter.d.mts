@@ -17,5 +17,18 @@ export function nativeCloseCommandPlan(target: string, launch: Readonly<Record<s
   readonly environment: Readonly<Record<string, string>>
 }
 
+/** 从 ps 的 PID + command 行中只选 exact executable 及其参数。 */
+export function parseDesktopProcessRows(output: string, executable: string): number[]
+
+/** 判断 /proc/PID/environ 是否含 exact APPIMAGE 路径。 */
+export function processEnvironmentContainsAppImage(environmentBytes: Buffer, installPath: string): boolean
+
+/** 比较更新前后 canonical 安装根与主程序。 */
+export function sameInstallationLocation(
+  target: string,
+  baseline: Readonly<Record<string, unknown>>,
+  updated: Readonly<Record<string, unknown>>,
+): boolean
+
 /** 创建四平台 previous-Stable→candidate 正常退出升级的真实系统适配器。 */
 export function createNativeUpdatePlatformAdapter(target: string, environment?: NodeJS.ProcessEnv, dependencies?: Readonly<Record<string, unknown>>): import('./native-update-smoke-driver.mjs').NativeUpdatePlatformAdapter

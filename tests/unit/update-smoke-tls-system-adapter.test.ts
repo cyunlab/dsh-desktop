@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   buildTemporaryHostsBytes,
+  runBoundedCommand,
   tlsTrustCommandPlan,
 } from '../../scripts/update-smoke-tls-system-adapter.mjs'
 
@@ -44,5 +45,18 @@ describe('update smoke TLS system adapter pure contracts', () => {
         { executable: 'sudo', args: ['-n', 'update-ca-certificates'] },
       ],
     })
+  })
+
+  /** 即使 child 忽略 SIGTERM，系统命令仍必须在强杀期限内回收并拒绝。 */
+  it('force-reaps a command that ignores graceful timeout termination', async () => {
+    const startedAt = Date.now()
+    await expect(runBoundedCommand(process.execPath, [
+      '-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)',
+    ], {
+      environment: process.env,
+      timeoutMilliseconds: 250,
+      terminationGraceMilliseconds: 25,
+    })).rejects.toThrow('timed out')
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
   })
 })

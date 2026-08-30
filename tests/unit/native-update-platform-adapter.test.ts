@@ -4,7 +4,10 @@ import { describe, expect, it } from 'vitest'
 
 import {
   nativeCloseCommandPlan,
+  parseDesktopProcessRows,
   platformStatePaths,
+  processEnvironmentContainsAppImage,
+  sameInstallationLocation,
   verifyStagedCandidate,
 } from '../../scripts/native-update-platform-adapter.mjs'
 
@@ -39,14 +42,37 @@ describe('native update platform adapter pure contracts', () => {
       .toBe(path.win32.join('C:\\Users\\runner\\AppData\\Local', 'io.github.xlcyun.dsh-desktop', 'desktop-update', 'staged.json'))
   })
 
-  /** 正常退出使用原生窗口关闭；macOS 使用正常应用 Quit，由生产 ExitRequested 收口。 */
+  /** 正常退出只操作精确窗口；macOS helper 不能退化成 application Quit。 */
   it('builds no-shell native close plans', () => {
     expect(nativeCloseCommandPlan('windows-x86_64', { applicationPid: 123 })).toMatchObject({ executable: 'powershell.exe' })
     expect(nativeCloseCommandPlan('linux-x86_64', { windowId: '0x04600007', display: ':99' })).toEqual({
       executable: 'wmctrl', args: ['-i', '-c', '0x04600007'], environment: { DISPLAY: ':99' },
     })
-    expect(nativeCloseCommandPlan('darwin-aarch64', { applicationPid: 456 })).toEqual({
-      executable: '/usr/bin/osascript', args: ['-e', 'tell application id "io.github.xlcyun.dsh-desktop" to quit'], environment: {},
+    expect(nativeCloseCommandPlan('darwin-aarch64', { applicationPid: 456, closeHelper: '/private/tmp/smoke/macos-close-window' })).toEqual({
+      executable: '/private/tmp/smoke/macos-close-window', args: ['456'], environment: {},
     })
+  })
+
+  /** Desktop 进程枚举必须绑定 exact executable，不能把相似路径或旧 PID 当成本次启动。 */
+  it('parses only exact installed Desktop process rows', () => {
+    expect(parseDesktopProcessRows([
+      ' 101 /Applications/DeepSeek Harness Desktop.app/Contents/MacOS/deepseek-harness-desktop',
+      ' 202 /Applications/DeepSeek Harness Desktop.app/Contents/MacOS/deepseek-harness-desktop --flag',
+      ' 303 /tmp/DeepSeek Harness Desktop.app/Contents/MacOS/deepseek-harness-desktop',
+    ].join('\n'), '/Applications/DeepSeek Harness Desktop.app/Contents/MacOS/deepseek-harness-desktop')).toEqual([101, 202])
+  })
+
+  /** AppImage 进程身份必须来自 exact APPIMAGE 环境项，不能接受前缀碰撞。 */
+  it('binds Linux processes to the exact AppImage path', () => {
+    const environment = Buffer.from('HOME=/home/runner\0APPIMAGE=/work/DeepSeek.AppImage\0')
+    expect(processEnvironmentContainsAppImage(environment, '/work/DeepSeek.AppImage')).toBe(true)
+    expect(processEnvironmentContainsAppImage(environment, '/work/DeepSeek.AppImage.old')).toBe(false)
+  })
+
+  /** 更新后的安装根与主程序必须与 baseline 完全相同。 */
+  it('requires in-place replacement at the same installation location', () => {
+    const baseline = { root: 'C:\\Users\\runner\\AppData\\Local\\DeepSeek', executable: 'C:\\Users\\runner\\AppData\\Local\\DeepSeek\\desktop.exe' }
+    expect(sameInstallationLocation('windows-x86_64', baseline, { ...baseline })).toBe(true)
+    expect(sameInstallationLocation('windows-x86_64', baseline, { ...baseline, root: 'C:\\Users\\runner\\AppData\\Local\\DeepSeek-2' })).toBe(false)
   })
 })
