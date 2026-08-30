@@ -71,7 +71,7 @@ export async function runBootstrapUpdateSmoke(options, environment = process.env
     '--fresh-install-only', 'true'
   ]
   const driverEnvironment = { DSH_BOOTSTRAP_UPDATE_SMOKE_OUTPUT: 'json' }
-  for (const name of ['PATH', 'SystemRoot', 'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'TMPDIR', 'DISPLAY', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_RUNTIME_DIR']) {
+  for (const name of ['PATH', 'SystemRoot', 'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'TMPDIR', 'DISPLAY', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_RUNTIME_DIR', 'DSH_BOOTSTRAP_MACOS_APPLICATIONS_STAGING']) {
     if (environment[name] !== undefined) driverEnvironment[name] = environment[name]
   }
   const result = await runDriver(executable, resolvedDriver.endsWith('.mjs') ? [resolvedDriver, ...driverArguments] : driverArguments, driverEnvironment)
