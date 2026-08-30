@@ -92,12 +92,29 @@ export function runMinisignCommand(args, options = {}) {
   })
 }
 
+/** 从 Tauri 外层 base64 配置中提取 minisign `-P` 接受的公钥 packet。 */
+function minisignPublicKeyPacket(value) {
+  const encoded = String(value ?? '').trim()
+  let decoded = ''
+  try { decoded = Buffer.from(encoded, 'base64').toString('utf8').replaceAll('\r\n', '\n').trim() } catch {}
+  const match = /^untrusted comment: minisign public key: [0-9A-F]+\n(RW[A-Za-z0-9+/=]+)$/.exec(decoded)
+  const packet = match ? Buffer.from(match[1], 'base64') : Buffer.alloc(0)
+  const canonical = encoded.replace(/=+$/, '')
+  const roundTrip = decoded ? Buffer.from(decoded).toString('base64').replace(/=+$/, '') : ''
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)
+    || roundTrip !== canonical
+    || packet.length !== 42
+    || !['Ed', 'ED'].includes(packet.subarray(0, 2).toString('ascii'))) {
+    throw new Error('TAURI_SIGNING_PUBLIC_KEY must contain the base64-encoded two-line minisign public key file')
+  }
+  return match[1]
+}
+
 /** 使用嵌入发布环境的公钥验证单个 Tauri updater 签名。 */
 export async function verifyTauriSignature(artifactPath, signaturePath, publicKey, runMinisign = runMinisignCommand) {
-  const normalizedPublicKey = String(publicKey ?? '').trim()
-  if (!normalizedPublicKey) throw new Error('TAURI_SIGNING_PUBLIC_KEY is required')
+  const publicKeyPacket = minisignPublicKeyPacket(publicKey)
   await runMinisign(
-    ['-Vm', artifactPath, '-x', signaturePath, '-P', normalizedPublicKey],
+    ['-Vm', artifactPath, '-x', signaturePath, '-P', publicKeyPacket],
     { shell: false, env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot } }
   )
 }
