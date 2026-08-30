@@ -226,30 +226,47 @@ function startGateChild(config, environment, command) {
   function send(command) {
     child.stdin.write(`${JSON.stringify({ command })}\n`)
   }
-  /** 等待 child 在 deadline 内退出。 */
-  async function waitForExit(timeoutMilliseconds) {
-    const deadline = Date.now() + timeoutMilliseconds
-    while (!exited && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50))
+  /** 读取 sudo wrapper 或 Windows helper 的当前退出记录。 */
+  function currentExit() {
     return exited
+  }
+  /** 用提权 signal 0 判断 Unix exact process group 是否仍有成员。 */
+  async function unixProcessGroupExists() {
+    try {
+      await command('sudo', ['-n', '/bin/kill', '-0', '--', `-${child.pid}`], { environment, timeoutMilliseconds: 5_000 })
+      return true
+    } catch (error) {
+      if (/no such process|not found/i.test(error.message)) return false
+      throw error
+    }
+  }
+  /** 等待 wrapper 退出且整个 helper process group 在 deadline 内消失。 */
+  async function waitForReaped(timeoutMilliseconds) {
+    const deadline = Date.now() + timeoutMilliseconds
+    while (Date.now() < deadline) {
+      if (process.platform === 'win32' ? Boolean(exited) : exited && !(await unixProcessGroupExists())) return exited
+      await new Promise(resolve => setTimeout(resolve, 250))
+    }
+    return undefined
   }
   /** 优先走控制通道；失效后按 exact process group 提权 TERM/KILL 并确认回收。 */
   async function stop(graceful = true) {
-    if (exited) return exited
+    if (await waitForReaped(1)) return exited
     if (graceful) {
       try { send('close') } catch {}
-      if (await waitForExit(10_000)) return exited
+      if (await waitForReaped(10_000)) return exited
     }
     if (process.platform === 'win32') {
       await command('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { environment }).catch(() => {})
     } else {
       await command('sudo', ['-n', '/bin/kill', '-TERM', '--', `-${child.pid}`], { environment, timeoutMilliseconds: 5_000 }).catch(() => {})
-      if (await waitForExit(2_000)) return exited
+      if (await waitForReaped(2_000)) return exited
       await command('sudo', ['-n', '/bin/kill', '-KILL', '--', `-${child.pid}`], { environment, timeoutMilliseconds: 5_000 }).catch(() => {})
     }
-    if (!(await waitForExit(2_000))) throw new Error('TLS gate server process group could not be reaped')
+    if (!(await waitForReaped(2_000))) throw new Error('TLS gate server process group could not be reaped')
     return exited
   }
-  return { child, waitFor, send, stop, exited: () => exited }
+  return { child, waitFor, send, stop, exited: currentExit }
 }
 
 /** 刷新本机 DNS cache；不支持缓存服务时保留 hosts mutation 的主结果。 */
@@ -297,7 +314,9 @@ export function createUpdateSmokeTlsSystemAdapter(environment = process.env, dep
       try {
         await control.waitFor('ready')
       } catch (error) {
-        await control.stop(false).catch(() => {})
+        let cleanupError
+        try { await control.stop(false) } catch (failure) { cleanupError = failure }
+        if (cleanupError) throw new AggregateError([error, cleanupError], error.message)
         throw error
       }
       return {

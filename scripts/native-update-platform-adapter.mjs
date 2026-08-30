@@ -297,12 +297,20 @@ function launchApplication(executable, args, environment) {
   })
   child.once('error', error => { exitStatus = `spawn error: ${error.code ?? error.message}` })
   child.once('exit', (code, signal) => { exitCode = code; exitStatus = `process exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})` })
+  /** 返回 launcher 当前退出码；未退出时保持 undefined。 */
+  function readExitCode() { return exitCode }
+  /** 返回 launcher 当前退出诊断；运行中保持 undefined。 */
+  function readExitStatus() { return exitStatus }
+  /** 合并有界 stdout、stderr 与退出状态用于失败诊断。 */
+  function diagnostics() {
+    return [Buffer.concat(output).toString('utf8').trim().slice(0, OUTPUT_BOUND), bytes > OUTPUT_BOUND ? '[diagnostics truncated]' : '', exitStatus ?? ''].filter(Boolean).join('\n')
+  }
   return {
     pid: child.pid,
     child,
-    exitCode: () => exitCode,
-    exitStatus: () => exitStatus,
-    diagnostics: () => [Buffer.concat(output).toString('utf8').trim().slice(0, OUTPUT_BOUND), bytes > OUTPUT_BOUND ? '[diagnostics truncated]' : '', exitStatus ?? ''].filter(Boolean).join('\n'),
+    exitCode: readExitCode,
+    exitStatus: readExitStatus,
+    diagnostics,
   }
 }
 
@@ -684,6 +692,16 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
     if (errors.length > 1) throw new AggregateError(errors, 'native update platform cleanup failed')
   }
 
+  /** 从已安装树读取两版都必须成立的 Runtime closure observation。 */
+  function inspectInstalledRuntime(installation, options) {
+    return inspectInstalledRuntimeTree(installation.runtimeRoot, installation.executable, options.updaterEndpoint, options.updaterPublicKey)
+  }
+
+  /** 在 runner-only TLS gate 内执行唯一真实更新生命周期。 */
+  function withTlsGate(config, action) {
+    return withUpdateSmokeTlsGate(config, action, tlsSystemAdapter)
+  }
+
   return {
     runner: contract.runner,
     platform,
@@ -692,8 +710,8 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
       if (assertedTarget !== target || process.platform !== contract.platform || process.arch !== contract.arch) throw new Error('hosted runner does not match native update target')
     },
     installBaseline,
-    inspectInstalledRuntime: (installation, options) => inspectInstalledRuntimeTree(installation.runtimeRoot, installation.executable, options.updaterEndpoint, options.updaterPublicKey),
-    withTlsGate: (config, action) => withUpdateSmokeTlsGate(config, action, tlsSystemAdapter),
+    inspectInstalledRuntime,
+    withTlsGate,
     launch,
     waitForReady,
     waitForStaged,
