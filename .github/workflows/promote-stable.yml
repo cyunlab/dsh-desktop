@@ -135,6 +135,8 @@ jobs:
     needs: prepare-candidate
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/update-smoke.yml
     with:
       candidate_tag: ${{ needs.prepare-candidate.outputs.candidate_tag }}

@@ -157,6 +157,8 @@ jobs:
     needs: prepare-bootstrap
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/bootstrap-update-smoke.yml
     with:
       candidate_tag: ${{ needs.prepare-bootstrap.outputs.candidate_tag }}
