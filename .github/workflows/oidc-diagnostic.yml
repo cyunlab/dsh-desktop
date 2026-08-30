@@ -69,8 +69,8 @@ jobs:
             | head -c 36 \
             | sha256sum \
             | grep -F '90e59093c7c43001e49280468b4377020e1d7dd752752aebe3b0ecdf5f8bede5'
-          "$ossutil" ls "oss://${OSS_BUCKET}/dsh-desktop/" "${credentials[@]}" --max-keys 10
-          if "$ossutil" ls "oss://${OSS_BUCKET}/" "${credentials[@]}" --max-keys 1; then
+          "$ossutil" ls "oss://${OSS_BUCKET}/dsh-desktop/" "${credentials[@]}" --limited-num 10
+          if "$ossutil" ls "oss://${OSS_BUCKET}/" "${credentials[@]}" --limited-num 1; then
             echo 'Publishing role unexpectedly listed the bucket root.' >&2
             exit 1
           fi
