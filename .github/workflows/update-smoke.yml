@@ -119,7 +119,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             ca-certificates dbus-x11 libayatana-appindicator3-1 libwebkit2gtk-4.1-0 \
-            libxdo3 librsvg2-2 lsof wmctrl xvfb
+            libxdo3 librsvg2-2 lsof openbox wmctrl xvfb
       - name: Assert the hosted runner matches the evidence target
         shell: bash
         env:

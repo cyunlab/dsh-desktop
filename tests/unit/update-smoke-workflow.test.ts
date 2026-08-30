@@ -65,6 +65,7 @@ describe('native update smoke reusable workflow contract', () => {
     expect(workflow).toContain('TAURI_SIGNING_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}')
     expect(workflow).toContain('UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}')
     expect(workflow).toContain('wmctrl')
+    expect(workflow).toContain('openbox')
     expect(workflow).toContain('ca-certificates')
     for (const argument of ['--updater-endpoint', '--updater-public-key', '--updater-public-key-sha256', '--signing-configured']) {
       expect(workflow).toContain(argument)

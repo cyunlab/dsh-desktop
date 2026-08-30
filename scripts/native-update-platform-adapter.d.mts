@@ -17,6 +17,19 @@ export function nativeCloseCommandPlan(target: string, launch: Readonly<Record<s
   readonly environment: Readonly<Record<string, string>>
 }
 
+/** 在固定 Xvfb 内先启动 EWMH window manager，再以位置参数启动 exact AppImage。 */
+export function linuxX11LaunchPlan(installationPath: string): {
+  readonly executable: string
+  readonly args: readonly string[]
+  readonly display: string
+}
+
+/** 从脱敏更新日志提取最新失败阶段，并识别无需等待自动重试的永久 HTTP 失败。 */
+export function nativeUpdaterFailureSummary(logBody: Buffer): {
+  readonly message: string
+  readonly permanent: boolean
+} | undefined
+
 /** 从 ps 的 PID + command 行中只选 exact executable 及其参数。 */
 export function parseDesktopProcessRows(output: string, executable: string): number[]
 

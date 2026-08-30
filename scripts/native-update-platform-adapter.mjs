@@ -27,6 +27,37 @@ const OUTPUT_BOUND = 128 * 1024
 const UPDATE_LOG_BOUND = 16 * 1024 * 1024
 const ARCHIVE_LISTING_BOUND = 32 * 1024 * 1024
 const MAC_CLOSE_HELPER_SOURCE = path.resolve(import.meta.dirname, 'macos-close-window.swift')
+const LINUX_X11_SESSION_SCRIPT = String.raw`set -uo pipefail
+/usr/bin/openbox --sm-disable >/dev/null 2>&1 &
+wm_pid=$!
+app_pid=
+cleanup() {
+  status=$?
+  trap - EXIT
+  if [[ -n "$app_pid" ]]; then
+    kill "$app_pid" 2>/dev/null || true
+    wait "$app_pid" 2>/dev/null || true
+  fi
+  kill "$wm_pid" 2>/dev/null || true
+  wait "$wm_pid" 2>/dev/null || true
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+for _ in {1..100}; do
+  if /usr/bin/wmctrl -m >/dev/null 2>&1; then
+    "$1" &
+    app_pid=$!
+    wait "$app_pid"
+    app_status=$?
+    app_pid=
+    exit "$app_status"
+  fi
+  /usr/bin/sleep 0.1
+done
+exit 1`
 const TARGETS = Object.freeze({
   'windows-x86_64': Object.freeze({ platform: 'win32', arch: 'x64', runner: { os: 'windows', arch: 'x86_64' }, installKind: 'windows_nsis' }),
   'linux-x86_64': Object.freeze({ platform: 'linux', arch: 'x64', runner: { os: 'linux', arch: 'x86_64' }, installKind: 'linux_app_image' }),
@@ -121,6 +152,33 @@ export function nativeCloseCommandPlan(target, launch) {
     }
   }
   throw new Error(`unsupported native close target: ${target ?? ''}`)
+}
+
+/** 在固定 Xvfb 内先启动 EWMH window manager，再以位置参数启动 exact AppImage。 */
+export function linuxX11LaunchPlan(installationPath) {
+  if (!path.isAbsolute(installationPath) || installationPath.includes('\0')) throw new Error('Linux X11 launch requires an absolute AppImage path')
+  return {
+    executable: 'dbus-run-session',
+    args: [
+      '--', 'xvfb-run', '-n', '99', '-s', '-screen 0 1280x1024x24',
+      '/usr/bin/bash', '-c', LINUX_X11_SESSION_SCRIPT, 'dsh-native-update-x11', installationPath,
+    ],
+    display: ':99',
+  }
+}
+
+/** 从脱敏更新日志提取最新失败阶段，并识别无需等待自动重试的永久 HTTP 失败。 */
+export function nativeUpdaterFailureSummary(logBody) {
+  if (!Buffer.isBuffer(logBody) || logBody.length > UPDATE_LOG_BOUND) throw new Error('native updater log exceeds byte bound')
+  const records = logBody.toString('utf8').trim().split(/\r?\n/).flatMap(line => { try { return [JSON.parse(line)] } catch { return [] } })
+  const failure = records.findLast(record => record?.event === 'update-failed')
+  if (!failure) return undefined
+  const stage = ['check', 'download'].includes(failure.failure_stage) ? failure.failure_stage : 'unknown'
+  const status = Number.isInteger(failure.http_status) && failure.http_status >= 100 && failure.http_status <= 599 ? failure.http_status : undefined
+  return Object.freeze({
+    message: `native updater failed during ${stage} stage${status ? ` (HTTP ${status})` : ''}`,
+    permanent: status !== undefined && status >= 400 && status < 500 && ![408, 429].includes(status),
+  })
 }
 
 /** 递归列出普通文件，忽略 macOS bundle framework symlink。 */
@@ -543,9 +601,10 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
     let launcherMayExit = false
     let display
     if (target === 'linux-x86_64') {
-      display = ':99'
-      executable = 'dbus-run-session'
-      args = ['--', 'xvfb-run', '-n', '99', '-s', '-screen 0 1280x1024x24', installation.installPath]
+      const plan = linuxX11LaunchPlan(installation.installPath)
+      display = plan.display
+      executable = plan.executable
+      args = plan.args
       launchEnvironment.DISPLAY = display
     } else if (target.startsWith('darwin-')) {
       executable = '/usr/bin/open'
@@ -587,18 +646,22 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
   async function waitForStaged(_installation, options) {
     const candidateSignature = await readFile(options.candidateSignature, 'utf8')
     const deadline = Date.now() + 8 * 60 * 1000
+    let latestFailure
     while (Date.now() < deadline) {
       const [metadataBody, packageBytes, logBody] = await Promise.all([
         readFile(statePaths.stagedMetadata).catch(() => null),
         readFile(statePaths.stagedPackage).catch(() => null),
         readFile(statePaths.logFile).catch(() => null),
       ])
+      if (logBody) {
+        const failure = nativeUpdaterFailureSummary(logBody)
+        latestFailure = failure?.message ?? latestFailure
+        if (failure?.permanent) throw new Error(failure.message)
+      }
       if (metadataBody && packageBytes && logBody) {
-        if (metadataBody.length > OUTPUT_BOUND || logBody.length > UPDATE_LOG_BOUND) throw new Error('native updater state exceeds byte bound')
+        if (metadataBody.length > OUTPUT_BOUND) throw new Error('native updater state exceeds byte bound')
         const records = logBody.toString('utf8').trim().split(/\r?\n/).flatMap(line => { try { return [JSON.parse(line)] } catch { return [] } })
         const transitions = records.filter(record => record.event === 'update-transition' && record.version === options.candidateVersion)
-        const failure = records.find(record => record.event === 'update-failed')
-        if (failure) throw new Error(`native updater failed during ${failure.failure_stage ?? 'unknown'} stage`)
         if (transitions.length >= 3 && transitions.some(record => record.http_status === 200)) {
           verifyStagedCandidate(JSON.parse(metadataBody.toString('utf8')), packageBytes, {
             version: options.candidateVersion,
@@ -612,7 +675,7 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
       }
       await delay(1_000)
     }
-    throw new Error('candidate did not reach verified staged state')
+    throw new Error(latestFailure ?? 'candidate did not reach verified staged state')
   }
 
   /** 发出真实 Windows close、Linux X11 close 或 macOS 唯一主窗口 AXPress。 */
