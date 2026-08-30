@@ -170,7 +170,15 @@ jobs:
       - name: Verify aggregate evidence attestations
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh attestation verify evidence/* --repo "$GITHUB_REPOSITORY"
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(evidence/*)
+          test "${#files[@]}" -gt 0
+          for file in "${files[@]}"; do
+            test -f "$file"
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
+          done
       - name: Verify exact, fresh, real four-target evidence
         run: >-
           node scripts/verify-update-smoke-evidence.mjs --evidence evidence
@@ -208,7 +216,15 @@ jobs:
       - name: Verify aggregate evidence attestations again
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh attestation verify evidence/* --repo "$GITHUB_REPOSITORY"
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(evidence/*)
+          test "${#files[@]}" -gt 0
+          for file in "${files[@]}"; do
+            test -f "$file"
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
+          done
       - name: Reverify promotion admission before OIDC exchange
         shell: bash
         env:

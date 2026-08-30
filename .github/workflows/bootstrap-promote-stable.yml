@@ -188,7 +188,15 @@ jobs:
       - name: Verify evidence artifact attestations
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh attestation verify evidence/* --repo "$GITHUB_REPOSITORY"
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(evidence/*)
+          test "${#files[@]}" -gt 0
+          for file in "${files[@]}"; do
+            test -f "$file"
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
+          done
       - name: Verify exact real bootstrap evidence
         run: >-
           node scripts/verify-bootstrap-update-evidence.mjs --evidence evidence
@@ -224,7 +232,15 @@ jobs:
       - name: Reverify evidence artifact attestations
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh attestation verify evidence/* --repo "$GITHUB_REPOSITORY"
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(evidence/*)
+          test "${#files[@]}" -gt 0
+          for file in "${files[@]}"; do
+            test -f "$file"
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
+          done
       - name: Reverify exact bootstrap evidence before credentials
         run: >-
           node scripts/verify-bootstrap-update-evidence.mjs --evidence evidence
