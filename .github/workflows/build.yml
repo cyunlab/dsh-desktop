@@ -146,6 +146,7 @@ jobs:
           DSH_UPDATER_ENDPOINT: https://updates.cyunlab.com/dsh-desktop/channels/stable/latest.json
           DSH_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
           APPIMAGE_EXTRACT_AND_RUN: 1
+          NO_STRIP: ${{ matrix.platform == 'linux' && '1' || '' }}
         run: pnpm package -- --verbose
       - name: Build and recursively sign macOS application
         if: matrix.platform == 'mac'

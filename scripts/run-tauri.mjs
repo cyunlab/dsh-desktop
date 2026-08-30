@@ -15,9 +15,12 @@ function withCargoPath(environment) {
 
 /** 验证并规范化正式发布使用的 minisign 公钥文本。 */
 function normalizeUpdaterPublicKey(value) {
-  const normalized = value.replaceAll('\r\n', '\n').trim()
-  if (!/^untrusted comment: minisign public key: [0-9A-F]+\nRW[A-Za-z0-9+/=]+$/.test(normalized)) {
-    throw new Error('DSH_UPDATER_PUBLIC_KEY must contain the original two-line minisign public key')
+  const normalized = value.trim()
+  let decoded
+  try { decoded = Buffer.from(normalized, 'base64').toString('utf8').replaceAll('\r\n', '\n').trim() } catch { decoded = '' }
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(normalized)
+    || !/^untrusted comment: minisign public key: [0-9A-F]+\nRW[A-Za-z0-9+/=]+$/.test(decoded)) {
+    throw new Error('DSH_UPDATER_PUBLIC_KEY must contain the base64-encoded two-line minisign public key file')
   }
   return normalized
 }
@@ -29,7 +32,8 @@ export function buildTauriArguments(command, args, environment) {
     const pubkey = normalizeUpdaterPublicKey(environment.DSH_UPDATER_PUBLIC_KEY)
     cliArguments.push('--config', JSON.stringify({ plugins: { updater: { pubkey } } }))
   }
-  return [...cliArguments, ...args]
+  const normalizedArguments = args[0] === '--' ? args.slice(1) : args
+  return [...cliArguments, ...normalizedArguments]
 }
 
 /** 使用 pnpm 启动 Tauri，并继承终端输入输出与退出码。 */

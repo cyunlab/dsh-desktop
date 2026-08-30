@@ -88,8 +88,8 @@ describe('native build workflow contract', () => {
   })
 
   it('builds an AppImage in extraction mode for hosted runners', () => {
-    expect(workflow).not.toContain('NO_STRIP')
     expect(workflow).toContain('APPIMAGE_EXTRACT_AND_RUN: 1')
+    expect(workflow).toContain("NO_STRIP: ${{ matrix.platform == 'linux' && '1' || '' }}")
   })
 
   /** 确保所有原生构建都用生产 updater 密钥生成强制签名。 */
