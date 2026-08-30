@@ -1711,8 +1711,8 @@ fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>, source: Shutdown
         drop(_gate);
         let update_requested = shutdown_installs_staged(source)
             && app
-            .try_state::<Arc<TauriUpdateRuntime>>()
-            .is_some_and(|updater| updater.has_staged());
+                .try_state::<Arc<TauriUpdateRuntime>>()
+                .is_some_and(|updater| updater.has_staged());
         let install_result = (!cleanup_failed && update_requested).then(|| {
             app.try_state::<Arc<TauriUpdateRuntime>>().map_or_else(
                 || Err("update runtime unavailable".to_string()),
