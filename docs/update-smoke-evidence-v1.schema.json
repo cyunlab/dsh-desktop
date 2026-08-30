@@ -90,8 +90,8 @@
     },
     "checkpoints": {
       "type": "array",
-      "minItems": 22,
-      "maxItems": 22,
+      "minItems": 10,
+      "maxItems": 10,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -126,24 +126,12 @@
         "update.available",
         "update.downloaded",
         "update.staged",
-        "ui.user_opened",
-        "install.restart_requested",
-        "host.cleanup_confirmed_restart",
-        "install.restart_completed",
-        "app.relaunched",
-        "app.updated_origin_ready",
         "install.normal_close_requested",
         "host.cleanup_confirmed_normal_close",
         "install.normal_close_completed",
         "app.normal_close_no_relaunch",
-        "negative.bad_signature_blocked",
-        "negative.missing_signature_blocked",
-        "negative.missing_target_blocked",
-        "negative.unreachable_object_blocked",
-        "negative.tampered_staged_package_blocked",
-        "negative.failed_host_cleanup_blocked",
-        "setting.manual_check",
-        "setting.background_download_off",
+        "app.updated_version_launched",
+        "app.updated_origin_ready",
         "artifact.updater_signature_verified"
       ]
     }

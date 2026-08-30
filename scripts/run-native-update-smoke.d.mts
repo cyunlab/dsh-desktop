@@ -15,6 +15,10 @@ export interface NativeUpdateSmokeOptions {
   readonly baselineStableManifest: string
   readonly baselineProvenance: BaselineProvenance
   readonly baselineArtifactUrl: string
+  readonly updaterEndpoint: string
+  readonly updaterPublicKey: string
+  readonly updaterPublicKeySha256: string
+  readonly signingConfigured: 'true' | 'false'
   readonly outputDirectory: string
 }
 

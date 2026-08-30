@@ -5,12 +5,15 @@ import { describe, expect, it } from 'vitest'
 const operationsGuideUrl = new URL('../../docs/update-release-operations.md', import.meta.url)
 
 describe('automatic update release operations guide', () => {
-  // 验证维护者能从手册中找到生产发布所需的完整外部资源清单。
-  it('documents the verified infrastructure without claiming updater rollout is complete', () => {
+  // 验证维护者能从手册中找到生产资源与已完成的一次性 bootstrap 身份。
+  it('documents the verified infrastructure and current updater Stable', () => {
     const guide = readFileSync(operationsGuideUrl, 'utf8')
 
     expect(guide).toContain('protected GitHub Actions diagnostic verified')
-    expect(guide).toContain('installed clients are not yet on the automatic-update channel')
+    expect(guide).toContain('v2.1.5')
+    expect(guide).toContain('first-updater bootstrap completed')
+    expect(guide).toContain('abb51c70fc12cfbc67e694e0805481f8cd16d89c2278818b403e3f4ed12cd455')
+    expect(guide).not.toContain('installed clients are not yet on the automatic-update channel')
     expect(guide).toContain('cn-shenzhen')
     expect(guide).toContain('dsh-desktop/')
     expect(guide).toContain('updates.cyunlab.com')
