@@ -309,7 +309,8 @@ describe.sequential('Tauri artifact verification', { timeout: FIXED_PORT_TEST_TI
       process.env.DSH_FIXTURE_EVENTS = fixture.eventsFile
       const messages: string[] = []
       await expect(probeBundledRuntime(fixture.contentRoot, fixture.platformName, fixture.runtimeArch, message => messages.push(message))).resolves.toBeUndefined()
-      expect(messages).toEqual(['Verified packaged official Node + published dsh web runtime: macOS DMG'])
+      const expectedLabel = { win: 'Windows NSIS', mac: 'macOS DMG', linux: 'Linux AppImage' }[fixture.platformName]
+      expect(messages).toEqual([`Verified packaged official Node + published dsh web runtime: ${expectedLabel}`])
       const events = await readFile(fixture.eventsFile, 'utf8')
       const argv = events.split('\n').find(line => line.startsWith('argv:'))
       expect(argv).toBeDefined()
