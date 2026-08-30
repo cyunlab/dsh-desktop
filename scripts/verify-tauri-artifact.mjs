@@ -245,7 +245,7 @@ export async function verifyExtractedBundleContents(contentRoot, platformName, r
 }
 
 /** 用安装包内的官方 Node 与 published CLI 启动固定 dsh web。 */
-export async function probeBundledRuntime(contentRoot, platformName, runtimeArch = hostArch()) {
+export async function probeBundledRuntime(contentRoot, platformName, runtimeArch = hostArch(), log = console.log) {
   const contract = artifactContract(platformName, runtimeArch)
   const runtime = await locateBundledRuntime(contentRoot, contract)
   const result = await probeDirectDshWeb({
@@ -253,7 +253,7 @@ export async function probeBundledRuntime(contentRoot, platformName, runtimeArch
     nodeModulesRoot: runtime.nodeModulesRoot
   })
   if (result.command.args[0] !== runtime.cliEntry) throw new Error('Artifact probe did not execute package.json#bin.dsh')
-  console.log(`Verified packaged official Node + published dsh web runtime: ${contract.label}`)
+  log(`Verified packaged official Node + published dsh web runtime: ${contract.label}`)
 }
 
 /** 在真实 DMG 挂载点内执行检查，并保证主流程或检查失败时都尝试卸载。 */
