@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import { createHash, createPublicKey, verify as verifySignature } from 'node:crypto'
 import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from 'node:fs/promises'
+import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import { connect } from 'node:net'
 import path from 'node:path'
@@ -161,15 +162,42 @@ export function launchApplication(executable, args, environment) {
   }
 }
 
+/** 读取固定 loopback Host 的有界 HTTP 响应，供 readiness 与清理轮询共用。 */
+export function requestLoopbackHttp(url = FIXED_ORIGIN, timeoutMilliseconds = 5_000, maximumBytes = OUTPUT_BOUND) {
+  const endpoint = new URL(url)
+  if (endpoint.protocol !== 'http:' || endpoint.hostname !== '127.0.0.1' || endpoint.username || endpoint.password) throw new Error('loopback HTTP probe requires an uncredentialed 127.0.0.1 URL')
+  if (!Number.isSafeInteger(timeoutMilliseconds) || timeoutMilliseconds <= 0) throw new Error('loopback HTTP timeout must be a positive safe integer')
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0) throw new Error('loopback HTTP byte bound must be a positive safe integer')
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(endpoint, { method: 'GET', agent: false, headers: { connection: 'close' } }, response => {
+      const chunks = []
+      let bytes = 0
+      response.on('data', chunk => {
+        bytes += chunk.length
+        if (bytes > maximumBytes) response.destroy(new Error('loopback HTTP response exceeds byte bound'))
+        else chunks.push(chunk)
+      })
+      response.once('error', reject)
+      response.once('end', () => resolve({
+        statusCode: response.statusCode ?? 0,
+        contentType: Array.isArray(response.headers['content-type']) ? response.headers['content-type'].join(', ') : response.headers['content-type'] ?? '',
+        body: Buffer.concat(chunks).toString('utf8')
+      }))
+    })
+    request.setTimeout(timeoutMilliseconds, () => request.destroy(new Error('loopback HTTP request timed out')))
+    request.once('error', reject)
+    request.end()
+  })
+}
+
 /** 在超时内要求固定 Host origin 返回非空 HTML。 */
 async function waitForHostReady(launch, allowSuccessfulLauncherExit = false) {
   const deadline = Date.now() + 4 * 60 * 1000
   while (Date.now() < deadline) {
     if (launch.exitStatus() && !(allowSuccessfulLauncherExit && launch.exitCode() === 0)) throw new Error(`Desktop process exited before fixed Host readiness: ${launch.diagnostics()}`)
     try {
-      const response = await fetch(FIXED_ORIGIN, { redirect: 'error', signal: AbortSignal.timeout(5_000) })
-      const body = await response.text()
-      if (response.ok && /text\/html/i.test(response.headers.get('content-type') ?? '') && body.trim()) return
+      const response = await requestLoopbackHttp()
+      if (response.statusCode >= 200 && response.statusCode < 300 && /text\/html/i.test(response.contentType) && response.body.trim()) return
     } catch {}
     await new Promise(resolve => setTimeout(resolve, 1_000))
   }
@@ -410,7 +438,7 @@ async function cleanupProcess(pid, environment) {
   const forceAt = Date.now() + 5_000
   let forced = windows
   while (Date.now() < deadline) {
-    try { await fetch(FIXED_ORIGIN, { signal: AbortSignal.timeout(1_000) }) } catch { return }
+    try { await requestLoopbackHttp(FIXED_ORIGIN, 1_000) } catch { return }
     if (!forced && Date.now() >= forceAt) {
       signalPosixTree('SIGKILL')
       forced = true

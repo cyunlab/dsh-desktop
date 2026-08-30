@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
+import { createServer } from 'node:http'
+import { once } from 'node:events'
 
-import { buildBootstrapCommandPlan, buildMacLaunchPlan, combineBootstrapFailure, launchApplication, macApplicationsStagingPath, normalizeWindowsRegistryPath, parseListenerProcessId, requiresDesktopHostReadiness, runCommand, selectBootstrapCommandEnvironment, verifyConfigurationIdentityEvent, verifyMacArchiveListing, verifyTauriUpdaterSignature, verifyWindowsInstallationRecord } from '../../scripts/bootstrap-update-smoke-driver.mjs'
+import { buildBootstrapCommandPlan, buildMacLaunchPlan, combineBootstrapFailure, launchApplication, macApplicationsStagingPath, normalizeWindowsRegistryPath, parseListenerProcessId, requestLoopbackHttp, requiresDesktopHostReadiness, runCommand, selectBootstrapCommandEnvironment, verifyConfigurationIdentityEvent, verifyMacArchiveListing, verifyTauriUpdaterSignature, verifyWindowsInstallationRecord } from '../../scripts/bootstrap-update-smoke-driver.mjs'
 
 describe('native bootstrap driver command-plan seam', () => {
   /** 原生进程静默退出时仍保留 code/signal，避免 readiness 超时丢失根因。 */
@@ -9,6 +11,31 @@ describe('native bootstrap driver command-plan seam', () => {
     for (let index = 0; index < 20 && !launch.exitStatus(); index += 1) await new Promise(resolve => setTimeout(resolve, 10))
     expect(launch.exitStatus()).toContain('code=7')
     expect(launch.diagnostics()).toContain('code=7')
+  })
+
+  /** loopback readiness 不得依赖会在 Intel macOS Node 24 触发致命 socket 异常的全局 fetch。 */
+  it('reads bounded loopback HTTP without using global fetch', async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      response.end('<main>ready</main>')
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('test server did not bind TCP')
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (() => { throw Object.assign(new Error('setTypeOfService EINVAL'), { code: 'EINVAL' }) }) as typeof fetch
+    try {
+      await expect(requestLoopbackHttp(`http://127.0.0.1:${address.port}/`, 1_000)).resolves.toEqual({
+        statusCode: 200,
+        contentType: 'text/html; charset=utf-8',
+        body: '<main>ready</main>'
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+      server.close()
+      await once(server, 'close')
+    }
   })
 
   /** 大型 archive listing 可使用显式有限上限，普通命令仍受默认诊断上限保护。 */
