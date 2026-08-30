@@ -434,6 +434,25 @@ pub(crate) struct CliCommandPlan {
 }
 
 impl CliCommandPlan {
+    /// debug+WDIO 构建直接构造隔离 fixture 计划，不读取或验证生产 Runtime closure。
+    #[cfg(all(debug_assertions, feature = "wdio"))]
+    pub(crate) fn for_wdio_fixture(
+        node_executable: PathBuf,
+        cli_entry: PathBuf,
+        harness_home: PathBuf,
+        working_directory: PathBuf,
+    ) -> Result<Self, String> {
+        let path = prepend_node_path(&node_executable, inherited_path())?;
+        Ok(Self {
+            node_executable,
+            desktop_patch: cli_entry.clone(),
+            cli_entry,
+            harness_home,
+            working_directory,
+            path,
+        })
+    }
+
     /// 创建尚未启动的官方 `dsh web` 命令。
     fn command(&self) -> Command {
         let mut command = Command::new(&self.node_executable);
@@ -459,13 +478,6 @@ impl CliCommandPlan {
             command.stdout(Stdio::null()).stderr(Stdio::null());
         }
         command
-    }
-
-    /// debug+wdio 构建只替换 JS 入口，仍沿用生产命令的固定参数和环境。
-    #[cfg(all(debug_assertions, feature = "wdio"))]
-    pub(crate) fn with_test_entry(mut self, cli_entry: PathBuf) -> Self {
-        self.cli_entry = cli_entry;
-        self
     }
 }
 

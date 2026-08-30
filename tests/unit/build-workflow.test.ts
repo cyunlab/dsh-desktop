@@ -17,6 +17,14 @@ describe('native build workflow contract', () => {
     expect(scripts.build).toContain('pnpm --filter @cyunlab/dsh-desktop-update-client build')
     expect(buildScript).toContain('prepareRuntimeClosure')
   })
+
+  /** 干净 checkout 的类型检查必须先生成 capability package 的声明文件。 */
+  it('builds Desktop capability declarations before checking the update client', async () => {
+    const manifest = JSON.parse(await readFile(path.join(projectRoot, 'package.json'), 'utf8'))
+    const typecheck = manifest.scripts.typecheck as string
+    expect(typecheck.indexOf('@cyunlab/dsh-desktop-capabilities build')).toBeGreaterThanOrEqual(0)
+    expect(typecheck.indexOf('@cyunlab/dsh-desktop-capabilities build')).toBeLessThan(typecheck.indexOf('@cyunlab/dsh-desktop-update-client typecheck'))
+  })
   it('pins every third-party action to a reviewed commit', () => {
     const actions = [...workflow.matchAll(/uses:\s+([^\s#]+@[^\s#]+)(?:\s+#\s+(v\S+))?/g)]
     expect(actions).toHaveLength(7)

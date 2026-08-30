@@ -1044,26 +1044,29 @@ fn resolve_cli_plan(
         .path()
         .app_data_dir()
         .map_err(|_| DiagnosticCode::AppDataUnavailable)?;
-    let plan = build_command_plan(
-        node_path,
-        &runtime_closure_root(&resource_dir),
-        app_data.join("harness-home"),
-        app_data.join("working-directory"),
-    )
-    .map_err(|_| DiagnosticCode::BootstrapUnavailable)?;
     #[cfg(all(debug_assertions, feature = "wdio"))]
-    let plan = if let Some(test_entry) =
+    if let Some(test_entry) =
         std::env::var_os("DSH_TEST_CLI_ENTRY").filter(|value| !value.is_empty())
     {
         let test_entry = PathBuf::from(test_entry);
         if !test_entry.is_file() {
             return Err(DiagnosticCode::BootstrapUnavailable);
         }
-        plan.with_test_entry(test_entry)
-    } else {
-        plan
-    };
-    Ok(plan)
+        return cli_supervisor::CliCommandPlan::for_wdio_fixture(
+            node_path,
+            test_entry,
+            app_data.join("harness-home"),
+            app_data.join("working-directory"),
+        )
+        .map_err(|_| DiagnosticCode::BootstrapUnavailable);
+    }
+    build_command_plan(
+        node_path,
+        &runtime_closure_root(&resource_dir),
+        app_data.join("harness-home"),
+        app_data.join("working-directory"),
+    )
+    .map_err(|_| DiagnosticCode::BootstrapUnavailable)
 }
 
 /// 把 supervisor 的稳定错误映射到 Desktop 诊断分类。

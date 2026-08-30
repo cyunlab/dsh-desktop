@@ -100,6 +100,28 @@ fn write_desktop_patch_fixture(root: &Path, patch: &str) -> PathBuf {
     entry
 }
 
+/// WDIO fixture 命令计划不依赖生产 Runtime closure，避免测试入口被无关资产校验阻断。
+#[cfg(feature = "wdio")]
+#[test]
+fn builds_isolated_wdio_fixture_command_plan() {
+    let root = temporary_directory("wdio-fixture-plan");
+    let node = root.join(if cfg!(windows) { "node.exe" } else { "node" });
+    let fixture = root.join("test-cli.mjs");
+    fs::write(&node, "").unwrap();
+    fs::write(&fixture, "process.exit(0)\n").unwrap();
+    let plan = CliCommandPlan::for_wdio_fixture(
+        node.clone(),
+        fixture.clone(),
+        root.join("harness-home"),
+        root.join("working-directory"),
+    )
+    .unwrap();
+    assert_eq!(plan.node_executable, node);
+    assert_eq!(plan.cli_entry, fixture);
+    assert_eq!(plan.desktop_patch, plan.cli_entry);
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// 验证入口只由固定版本发布包的 `bin.dsh` 决定。
 #[test]
 fn resolves_manifest_declared_cli_entry() {
