@@ -1622,6 +1622,8 @@ fn request_retry(app: &AppHandle, state: &Arc<RuntimeState>) {
 enum ShutdownSource {
     /// 最终窗口收到关闭请求。
     CloseRequested,
+    /// 平台菜单、快捷键或系统发出的正常应用退出请求。
+    ExitRequested,
     /// 最终窗口已被销毁后的兜底事件。
     Destroyed,
     /// 开发终端发出的 SIGINT 或 SIGTERM。
@@ -1636,11 +1638,22 @@ impl ShutdownSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::CloseRequested => "close-requested",
+            Self::ExitRequested => "exit-requested",
             Self::Destroyed => "destroyed",
             Self::TerminalSignal => "terminal-signal",
             Self::UpdateRestart => "update-restart",
         }
     }
+}
+
+/// 只有用户正常关闭/退出或显式更新重启可以消费已验证 staging。
+fn shutdown_installs_staged(source: ShutdownSource) -> bool {
+    matches!(
+        source,
+        ShutdownSource::CloseRequested
+            | ShutdownSource::ExitRequested
+            | ShutdownSource::UpdateRestart
+    )
 }
 
 /// 请求应用退出，并保证 CLI 进程树被回收。
@@ -1691,10 +1704,8 @@ fn request_shutdown(app: &AppHandle, state: &Arc<RuntimeState>, source: Shutdown
             .as_ref()
             .is_some_and(|process| stop_cli(&state, process).is_err());
         drop(_gate);
-        let update_requested = matches!(
-            source,
-            ShutdownSource::CloseRequested | ShutdownSource::UpdateRestart
-        ) && app
+        let update_requested = shutdown_installs_staged(source)
+            && app
             .try_state::<Arc<TauriUpdateRuntime>>()
             .is_some_and(|updater| updater.has_staged());
         let install_result = (!cleanup_failed && update_requested).then(|| {
@@ -2169,10 +2180,21 @@ fn main() {
     let builder = builder
         .plugin(tauri_plugin_wdio::init())
         .plugin(tauri_plugin_wdio_webdriver::init());
-    builder
+    let app = builder
         .setup(setup)
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running Tauri application");
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            let Some(state) = app_handle.try_state::<Arc<RuntimeState>>() else {
+                return;
+            };
+            if !state.shutting_down.load(Ordering::Acquire) {
+                api.prevent_exit();
+                request_shutdown(app_handle, state.inner(), ShutdownSource::ExitRequested);
+            }
+        }
+    });
 }
 
 #[cfg(test)]

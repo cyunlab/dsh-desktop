@@ -1,4 +1,5 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -48,6 +49,10 @@ async function inputs() {
     baselineStableManifest: stableManifest,
     baselineArtifactUrl: 'https://updates.cyunlab.com/dsh-desktop/releases/2.0.15/windows-x86_64/baseline.exe',
     baselineProvenance: 'published-release' as const,
+    updaterEndpoint: 'https://updates.cyunlab.com/dsh-desktop/channels/stable/latest.json',
+    updaterPublicKey: 'public-updater-key',
+    updaterPublicKeySha256: createHash('sha256').update('public-updater-key').digest('hex'),
+    signingConfigured: 'false' as const,
     outputDirectory: directory
   }
 }
@@ -88,13 +93,26 @@ describe('native update smoke harness public seam', () => {
       },
       checkpoints: REQUIRED_SMOKE_CHECKPOINTS.map(id => ({ id, status: 'passed', details: `${id} native observation` }))
     }
+    let driverArguments: string[] = []
     const dependencies = {
-      runDriver: async () => ({ stdout: Buffer.from(JSON.stringify(observation)), stderr: '' })
+      runDriver: async (_executable: string, args: string[]) => {
+        driverArguments = args
+        return { stdout: Buffer.from(JSON.stringify(observation)), stderr: '' }
+      }
     }
     const result = await runNativeUpdateSmoke(options, { DSH_UPDATE_SMOKE_DRIVER: '/trusted/repo-native-driver' }, dependencies)
     expect(result.evidence.target).toBe('windows-x86_64')
     expect(result.evidence.evidence_kind).toBe('local-fixture')
     expect(result.evidence.baseline.provenance).toBe('local-fixture')
+    expect(driverArguments).toEqual(expect.arrayContaining([
+      '--baseline-version', '2.0.15',
+      '--candidate-version', '2.1.0',
+      '--candidate-package-sha256', createHash('sha256').update('candidate-package').digest('hex'),
+      '--updater-endpoint', options.updaterEndpoint,
+      '--updater-public-key', options.updaterPublicKey,
+      '--updater-public-key-sha256', options.updaterPublicKeySha256,
+      '--signing-configured', 'false',
+    ]))
     expect(await readFile(result.checksumPath, 'utf8')).toMatch(/^[0-9a-f]{64}  windows-x86_64\.json\n$/)
   })
 

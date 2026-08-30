@@ -111,6 +111,15 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+      - name: Install the Linux runtime, trust store, and X11 close tools
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            ca-certificates dbus-x11 libayatana-appindicator3-1 libwebkit2gtk-4.1-0 \
+            libxdo3 librsvg2-2 lsof wmctrl xvfb
       - name: Assert the hosted runner matches the evidence target
         shell: bash
         env:
@@ -188,6 +197,8 @@ jobs:
           DSH_UPDATE_SMOKE_SIGNING_CONFIGURED: ${{ inputs.signing_configured }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+          TAURI_SIGNING_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
           PREVIOUS_STABLE_TAG: ${{ inputs.previous_stable_tag }}
@@ -199,6 +210,12 @@ jobs:
           candidate_artifact="$(node -p "require('./smoke-assets/candidate/asset.json').artifactPath")"
           candidate_signature="$(node -p "require('./smoke-assets/candidate/asset.json').signaturePath")"
           baseline_commit="$(git rev-parse "refs/tags/${PREVIOUS_STABLE_TAG}^{}")"
+          test -n "$UPDATE_BASE_URL"
+          test -n "$TAURI_SIGNING_PUBLIC_KEY"
+          test "$DSH_UPDATE_SMOKE_SIGNING_CONFIGURED" = true || test "$DSH_UPDATE_SMOKE_SIGNING_CONFIGURED" = false
+          updater_endpoint="${UPDATE_BASE_URL%/}/dsh-desktop/channels/stable/latest.json"
+          test "$updater_endpoint" = "${{ inputs.stable_manifest_url }}"
+          updater_public_key_sha256="$(node -e "process.stdout.write(require('node:crypto').createHash('sha256').update(process.env.TAURI_SIGNING_PUBLIC_KEY).digest('hex'))")"
           node scripts/run-native-update-smoke.mjs \
             --target "$DSH_UPDATE_SMOKE_TARGET" \
             --candidate-tag "$CANDIDATE_TAG" \
@@ -214,6 +231,10 @@ jobs:
             --baseline-stable-manifest smoke-assets/baseline/manifest.json \
             --baseline-artifact-url "$baseline_url" \
             --baseline-provenance published-release \
+            --updater-endpoint "$updater_endpoint" \
+            --updater-public-key "$TAURI_SIGNING_PUBLIC_KEY" \
+            --updater-public-key-sha256 "$updater_public_key_sha256" \
+            --signing-configured "$DSH_UPDATE_SMOKE_SIGNING_CONFIGURED" \
             --output-directory smoke-evidence
       - name: Verify target evidence before upload
         shell: bash

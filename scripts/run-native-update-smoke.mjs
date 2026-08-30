@@ -9,6 +9,18 @@ import { verifyUpdateSmokeEvidenceDocument } from './verify-update-smoke-evidenc
 const MAX_DRIVER_OUTPUT_BYTES = 128 * 1024
 const TRUSTED_NATIVE_DRIVER = path.resolve(import.meta.dirname, 'native-update-smoke-driver.mjs')
 
+/** 只把真实 Desktop、证书工具与 GUI runner 需要的公开系统环境传给 repo driver。 */
+function selectNativeDriverEnvironment(environment) {
+  const names = [
+    'PATH', 'SystemRoot', 'SystemDrive', 'windir', 'ComSpec', 'PATHEXT', 'PSModulePath', 'OS', 'HOME',
+    'USERPROFILE', 'USERNAME', 'USERDOMAIN', 'HOMEDRIVE', 'HOMEPATH', 'LOCALAPPDATA', 'APPDATA',
+    'ProgramData', 'ALLUSERSPROFILE', 'PUBLIC', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432',
+    'CommonProgramFiles', 'CommonProgramFiles(x86)', 'CommonProgramW6432', 'NUMBER_OF_PROCESSORS',
+    'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER', 'TEMP', 'TMP', 'TMPDIR', 'RUNNER_TEMP', 'LANG', 'LC_ALL',
+  ]
+  return Object.fromEntries(names.flatMap(name => environment[name] === undefined ? [] : [[name, environment[name]]]))
+}
+
 /** 读取文件并计算完整字节的 lowercase SHA-256。 */
 async function sha256File(file) {
   return createHash('sha256').update(await readFile(file)).digest('hex')
@@ -50,7 +62,7 @@ export async function runNativeUpdateSmoke(options, environment = process.env, d
   if (!dependencies.runDriver && path.resolve(driver) !== TRUSTED_NATIVE_DRIVER) {
     throw new Error('promotion-eligible evidence requires the fixed repository-owned native driver')
   }
-  const required = ['target', 'candidateTag', 'candidateCommit', 'candidateManifest', 'candidatePackage', 'candidateSignature', 'baselineTag', 'baselineVersion', 'baselineCommit', 'baselineArtifact', 'baselineSignature', 'baselineStableManifest', 'baselineArtifactUrl', 'baselineProvenance', 'outputDirectory']
+  const required = ['target', 'candidateTag', 'candidateCommit', 'candidateManifest', 'candidatePackage', 'candidateSignature', 'baselineTag', 'baselineVersion', 'baselineCommit', 'baselineArtifact', 'baselineSignature', 'baselineStableManifest', 'baselineArtifactUrl', 'baselineProvenance', 'updaterEndpoint', 'updaterPublicKey', 'updaterPublicKeySha256', 'signingConfigured', 'outputDirectory']
   for (const name of required) if (!options[name]) throw new Error(`native update smoke option is required: ${name}`)
   const [manifestSha256, packageSha256, candidateSignatureSha256, baselineArtifactSha256, baselineSignatureSha256, baselineManifestSha256] = await Promise.all([
     sha256File(options.candidateManifest),
@@ -65,19 +77,21 @@ export async function runNativeUpdateSmoke(options, environment = process.env, d
   const driverArguments = [
     '--target', options.target,
     '--baseline-artifact', options.baselineArtifact,
+    '--baseline-signature', options.baselineSignature,
+    '--baseline-version', options.baselineVersion,
     '--candidate-package', options.candidatePackage,
     '--candidate-signature', options.candidateSignature,
     '--candidate-manifest', options.candidateManifest,
-    '--expected-candidate-version', options.candidateTag.replace(/^v/, ''),
-    '--fixed-host-origin', 'http://127.0.0.1:3080/'
+    '--candidate-version', options.candidateTag.replace(/^v/, ''),
+    '--candidate-package-sha256', packageSha256,
+    '--updater-endpoint', options.updaterEndpoint,
+    '--updater-public-key', options.updaterPublicKey,
+    '--updater-public-key-sha256', options.updaterPublicKeySha256,
+    '--signing-configured', options.signingConfigured,
   ]
   const resolvedDriver = dependencies.runDriver ? driver : TRUSTED_NATIVE_DRIVER
   const executable = resolvedDriver.endsWith('.mjs') ? process.execPath : resolvedDriver
-  const result = await runDriver(executable, resolvedDriver.endsWith('.mjs') ? [resolvedDriver, ...driverArguments] : driverArguments, {
-    PATH: environment.PATH,
-    SystemRoot: environment.SystemRoot,
-    DSH_UPDATE_SMOKE_OUTPUT: 'json'
-  })
+  const result = await runDriver(executable, resolvedDriver.endsWith('.mjs') ? [resolvedDriver, ...driverArguments] : driverArguments, selectNativeDriverEnvironment(environment))
   let observation
   try {
     observation = JSON.parse(result.stdout.toString('utf8'))

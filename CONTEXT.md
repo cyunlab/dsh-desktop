@@ -124,11 +124,15 @@ The admission of a validated Update release into the Stable channel. Promotion c
 
 ### First-updater bootstrap
 
-The single manually approved admission path used only while authoritative Stable is the legacy `2.0.15` application that cannot run Automatic update. It fresh-installs the exact four official candidate targets, records a content-digested immutable Bootstrap receipt, and writes Stable last without claiming a previous-Stable upgrade. It cannot be reused or substitute for normal Stable promotion.
+The single manually approved admission path used only while authoritative Stable was a legacy application that could not run Automatic update. It fresh-installs the exact four official candidate targets, records a content-digested immutable Bootstrap receipt, and writes Stable last without claiming a previous-Stable upgrade. The first Bootstrap receipt permanently closes this path; it cannot be reused or substitute for normal Stable promotion.
 
 ### Bootstrap receipt
 
 The immutable OSS audit record written before the first-updater bootstrap changes Stable. Its content digest appears in its object key and it binds the approved candidate, legacy Stable manifest, and exact bootstrap evidence set. Any full or partial receipt closes the one-time path and must be preserved during recovery.
+
+### Native update smoke
+
+The Stable-promotion observation in which a matching native runner installs the exact published previous Stable, lets it discover and stage an isolated candidate through its compiled Stable endpoint, performs a normal platform close or quit, and then separately launches the replaced candidate. It claims only facts observed from published binaries; explicit Restart interaction, negative security paths, and preference behavior remain separate tests unless a durable production-safe observation surface exists.
 
 ### Update availability indicator
 

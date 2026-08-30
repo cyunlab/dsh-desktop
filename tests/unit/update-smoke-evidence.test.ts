@@ -98,6 +98,11 @@ describe('update smoke evidence verifier public seam', () => {
     expect(schema.properties.schema_version.const).toBe(1)
     expect(schema.properties.target.enum).toEqual(REQUIRED_SMOKE_TARGETS)
     expect(schema.$defs.checkpointId.enum).toEqual(REQUIRED_SMOKE_CHECKPOINTS)
+    expect(schema.properties.checkpoints.minItems).toBe(REQUIRED_SMOKE_CHECKPOINTS.length)
+    expect(schema.properties.checkpoints.maxItems).toBe(REQUIRED_SMOKE_CHECKPOINTS.length)
+    expect(REQUIRED_SMOKE_CHECKPOINTS).not.toContain('install.restart_requested')
+    expect(REQUIRED_SMOKE_CHECKPOINTS.some(id => id.startsWith('negative.'))).toBe(false)
+    expect(REQUIRED_SMOKE_CHECKPOINTS.some(id => id.startsWith('setting.'))).toBe(false)
   })
 
   /** 完整真实原生证据应满足 Stable promotion 的候选绑定。 */
