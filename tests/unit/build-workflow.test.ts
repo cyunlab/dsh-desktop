@@ -54,6 +54,18 @@ describe('native build workflow contract', () => {
     expect(workflow).toContain('pnpm install --frozen-lockfile')
   })
 
+  /** 打包 CLI 必须与 Rust Tauri 保持同一 minor，避免生成不可更新的 AppImage。 */
+  it('aligns the packaging CLI with the resolved Rust Tauri minor', async () => {
+    const [manifestSource, cargoLock] = await Promise.all([
+      readFile(path.join(projectRoot, 'package.json'), 'utf8'),
+      readFile(path.join(projectRoot, 'src-tauri', 'Cargo.lock'), 'utf8')
+    ])
+    const cliVersion = JSON.parse(manifestSource).devDependencies['@tauri-apps/cli'] as string
+    const tauriVersion = cargoLock.match(/\[\[package\]\]\nname = "tauri"\nversion = "([^"]+)"/)?.[1]
+    expect(tauriVersion).toBeDefined()
+    expect(cliVersion.split('.').slice(0, 2)).toEqual(tauriVersion!.split('.').slice(0, 2))
+  })
+
   it('builds the Tauri package through the public package command', () => {
     expect(workflow).toContain('pnpm package -- --verbose')
     expect(workflow).toContain('Build native Tauri package with official Node and published CLI')
@@ -98,7 +110,9 @@ describe('native build workflow contract', () => {
   /** 确保两种 macOS 架构都绕过 Finder，并在封装 DMG 前递归签署原生资源。 */
   it('builds and recursively signs each macOS app before creating its DMG', () => {
     expect(workflow).toContain('Build and recursively sign macOS application')
+    expect(workflow).toContain('env -u APPLE_API_ISSUER -u APPLE_API_KEY -u APPLE_API_KEY_PATH')
     expect(workflow).toContain('pnpm tauri:build --bundles app --verbose')
+    expect(workflow.indexOf('env -u APPLE_API_ISSUER')).toBeLessThan(workflow.indexOf('while IFS= read -r -d'))
     expect(workflow).toContain("file -b \"$candidate\" | grep -q 'Mach-O'")
     expect(workflow).toContain('--options runtime')
     expect(workflow).toContain('codesign --verify --deep --strict --verbose=2 "$app_path"')

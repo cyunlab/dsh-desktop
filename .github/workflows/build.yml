@@ -160,7 +160,9 @@ jobs:
           DSH_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
         run: |
           set -euo pipefail
-          pnpm tauri:build --bundles app --verbose
+          # 先只生成 .app；完整 Runtime closure 会在下面递归签名后再统一提交公证。
+          env -u APPLE_API_ISSUER -u APPLE_API_KEY -u APPLE_API_KEY_PATH \
+            pnpm tauri:build --bundles app --verbose
           version="$(node -p "require('./package.json').version")"
           app_path="src-tauri/target/release/bundle/macos/DeepSeek Harness Desktop.app"
           app_directory="$(dirname "$app_path")"
