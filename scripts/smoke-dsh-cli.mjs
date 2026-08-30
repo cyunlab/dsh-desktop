@@ -59,7 +59,7 @@ function resolveMaterializedPatchDirectory(harnessHome) {
 function materializeDesktopUpdatePatch(nodeModulesRoot, harnessHome) {
   const sourcePatch = resolveClosureFile(nodeModulesRoot, DESKTOP_UPDATE_PATCH, 'Desktop update patch')
   const clientEntry = resolveClosureFile(nodeModulesRoot, DESKTOP_UPDATE_ENTRY, 'Desktop update client entry')
-  const source = readFileSync(sourcePatch, 'utf8')
+  const source = readFileSync(sourcePatch, 'utf8').replaceAll('\r\n', '\n')
   if (source !== EXPECTED_DESKTOP_UPDATE_PATCH) {
     throw new Error('Desktop update patch must match the trusted package-owned composition contract')
   }

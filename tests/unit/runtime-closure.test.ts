@@ -2,7 +2,7 @@ import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFi
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { packagedDshCliCommand, probePackagedDshCli, requiredRuntimeAssets, resolveDshCliEntry, runtimeInputHash, runtimeTarget, verifyRuntimeClosure } from '../../scripts/runtime-closure.mjs'
+import { packagedDshCliCommand, probePackagedDshCli, pruneTargetIncompatibleRuntimeAssets, requiredRuntimeAssets, resolveDshCliEntry, runtimeInputHash, runtimeTarget, verifyRuntimeClosure } from '../../scripts/runtime-closure.mjs'
 
 const desktopManifest = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'))
 const pinnedDshVersion = desktopManifest.dependencies['@deepseek-ai/dsh'] as string
@@ -84,6 +84,26 @@ async function createCompleteFixture(target = runtimeTarget('win32', 'x64'), dyn
 }
 
 describe('runtime closure contract', () => {
+  /** AppImage 只能携带 glibc Koffi 变体，避免 linuxdeploy 扫描同包内的 musl 动态依赖。 */
+  it('prunes target-incompatible Koffi native variants', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-runtime-koffi-prune-'))
+    const packageRoot = path.join(root, '@koromix', 'koffi-linux-x64')
+    try {
+      for (const variant of ['linux_x64', 'musl_x64', 'darwin_x64']) {
+        await mkdir(path.join(packageRoot, variant), { recursive: true })
+        await writeFile(path.join(packageRoot, variant, 'koffi.node'), variant)
+      }
+      await writeFile(path.join(packageRoot, 'package.json'), '{}\n')
+      await pruneTargetIncompatibleRuntimeAssets(root, runtimeTarget('linux', 'x64'))
+      await expect(readFile(path.join(packageRoot, 'linux_x64', 'koffi.node'), 'utf8')).resolves.toBe('linux_x64')
+      await expect(readFile(path.join(packageRoot, 'package.json'), 'utf8')).resolves.toBe('{}\n')
+      await expect(readFile(path.join(packageRoot, 'musl_x64', 'koffi.node'), 'utf8')).rejects.toThrow()
+      await expect(readFile(path.join(packageRoot, 'darwin_x64', 'koffi.node'), 'utf8')).rejects.toThrow()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   /** 私有 workspace 源变化必须使 Runtime closure 缓存失效。 */
   it('fingerprints private Desktop package sources', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'dsh-runtime-input-hash-'))

@@ -45,6 +45,21 @@ describe('published dsh CLI smoke cleanup', () => {
     )
   })
 
+  /** Windows checkout 的 CRLF 只属于文本传输差异，物化后仍必须写出 canonical LF 契约。 */
+  it('accepts a trusted Desktop patch with Windows line endings', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-smoke-patch-crlf-'))
+    const harnessHome = await mkdtemp(path.join(tmpdir(), 'dsh-smoke-patch-home-'))
+    try {
+      const packageRoot = await writeDesktopPatchFixture(root, trustedDesktopPatch.replaceAll('\n', '\r\n'))
+      const materializedPatch = directDshWebArgs(path.resolve(packageRoot, '..', '..'), harnessHome)[2]
+      expect(await readFile(materializedPatch, 'utf8')).not.toContain('\r')
+      expect(await readFile(materializedPatch, 'utf8')).toContain(pathToFileURL(await realpath(path.join(packageRoot, 'lib', 'index.js'))).href)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(harnessHome, { recursive: true, force: true })
+    }
+  })
+
   /** 任何偏离共享可信 composition contract 的 patch 必须在启动前失败。 */
   it('rejects missing, ambiguous, and structurally unexpected Desktop patches', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'dsh-smoke-patch-invalid-'))

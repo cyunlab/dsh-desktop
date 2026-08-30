@@ -44,6 +44,9 @@ export function runtimeTarget(runtimePlatform?: string, runtimeArch?: string): R
 /** 返回需要随应用发布的原生运行时文件清单。 */
 export function requiredRuntimeAssets(target: RuntimeTarget): RuntimeAsset[]
 
+/** 删除闭包内不属于目标 ABI 的原生包内变体。 */
+export function pruneTargetIncompatibleRuntimeAssets(root: string, target: RuntimeTarget): Promise<void>
+
 /** 计算 Runtime closure 的 workspace 输入指纹。 */
 export function runtimeInputHash(root: string, target: RuntimeTarget): Promise<string>
 

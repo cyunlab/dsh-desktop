@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url'
 const projectRoot = path.resolve(import.meta.dirname, '..')
 const desktopPackageManifest = JSON.parse(await readFile(path.join(projectRoot, 'package.json'), 'utf8'))
 const PINNED_DSH_VERSION = desktopPackageManifest.dependencies?.['@deepseek-ai/dsh']
-const RUNTIME_CLOSURE_VERSION = 8
+const RUNTIME_CLOSURE_VERSION = 9
 const DSH_CLI_CONFIGURATION_FILES = [
   'config/agent-presets/code/agent.cordis.yml',
   'config/agent-presets/code/preset.yml',
@@ -286,8 +286,22 @@ async function materializeNodeModules(source, destination, workerLimit = 8) {
 async function materializeVerifiedNodeModules(source, destination, target, workerLimit) {
   await rm(destination, { recursive: true, force: true })
   await materializeNodeModules(source, destination, workerLimit)
+  await pruneTargetIncompatibleRuntimeAssets(destination, target)
   await ensureExecutableModes(destination, target)
   await verifyRuntimeClosure(destination, target)
+}
+
+/** 删除同一 Koffi 包内不属于目标 ABI 的原生变体，避免打包器扫描不可用动态库。 */
+export async function pruneTargetIncompatibleRuntimeAssets(root, target) {
+  const packageRoot = path.join(root, packagePath(`@koromix/koffi-${target.platform}-${target.arch}`))
+  if (!await isDirectory(packageRoot)) return
+  const requiredVariant = `${target.platform}_${target.arch}`
+  const nativeVariant = /^(?:darwin|linux|musl|win32)_(?:arm64|x64)$/
+  for (const entry of await readdir(packageRoot, { withFileTypes: true })) {
+    if (entry.isDirectory() && nativeVariant.test(entry.name) && entry.name !== requiredVariant) {
+      await rm(path.join(packageRoot, entry.name), { recursive: true, force: true })
+    }
+  }
 }
 
 /** 为 POSIX 平台补齐依赖包中被归档过程剥离的可执行位。 */
@@ -537,6 +551,7 @@ async function ensureRuntimeCache(root, target, hash) {
     cacheRoot
   ], root)
   await materializePrivateWorkspacePackages(cacheRoot, cacheNodeModules)
+  await pruneTargetIncompatibleRuntimeAssets(cacheNodeModules, target)
   await verifyRuntimeClosure(cacheNodeModules, target)
   await writeFile(markerPath, JSON.stringify({ hash, target, version: RUNTIME_CLOSURE_VERSION }) + '\n', 'utf8')
   return cacheNodeModules
