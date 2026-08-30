@@ -1,8 +1,16 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildBootstrapCommandPlan, verifyConfigurationIdentityEvent, verifyMacArchiveListing, verifyTauriUpdaterSignature } from '../../scripts/bootstrap-update-smoke-driver.mjs'
+import { buildBootstrapCommandPlan, runCommand, verifyConfigurationIdentityEvent, verifyMacArchiveListing, verifyTauriUpdaterSignature, verifyWindowsInstallationRecord } from '../../scripts/bootstrap-update-smoke-driver.mjs'
 
 describe('native bootstrap driver command-plan seam', () => {
+  /** 大型 archive listing 可使用显式有限上限，普通命令仍受默认诊断上限保护。 */
+  it('admits a multi-megabyte archive listing only under an explicit bounded allowance', async () => {
+    const bytes = 4 * 1024 * 1024
+    const command = [process.execPath, ['-e', `process.stdout.write('x'.repeat(${bytes}))`]] as const
+    await expect(runCommand(command[0], command[1], { environment: process.env })).rejects.toThrow('failed')
+    await expect(runCommand(command[0], command[1], { environment: process.env, outputBound: 5 * 1024 * 1024 })).resolves.toHaveLength(bytes)
+  })
+
   /** Windows fresh install 使用 NSIS 静默安装并限定当前用户注册表与用户目录。 */
   it('plans a current-user silent NSIS install without MSI assumptions', () => {
     const plan = buildBootstrapCommandPlan({
@@ -13,11 +21,19 @@ describe('native bootstrap driver command-plan seam', () => {
     expect(JSON.stringify(plan)).not.toMatch(/\.msi/i)
   })
 
+  /** Windows 当前用户安装路径按大小写不敏感语义比较，并拒绝相邻目录或 MSI 记录。 */
+  it('validates canonical Windows install records with case-insensitive containment', () => {
+    const record = { DisplayVersion: '2.1.5', WindowsInstaller: 0 }
+    expect(verifyWindowsInstallationRecord(record, '2.1.5', 'C:\\Users\\RunnerAdmin\\AppData\\Local\\DeepSeek Harness Desktop', 'c:\\users\\runneradmin\\appdata\\local')).toBe(true)
+    expect(() => verifyWindowsInstallationRecord(record, '2.1.5', 'C:\\Users\\RunnerAdmin\\AppData\\Local-Evil\\Desktop', 'C:\\Users\\RunnerAdmin\\AppData\\Local')).toThrow('under_user_root=false')
+    expect(() => verifyWindowsInstallationRecord({ ...record, WindowsInstaller: 1 }, '2.1.5', 'C:\\Users\\RunnerAdmin\\AppData\\Local\\Desktop', 'C:\\Users\\RunnerAdmin\\AppData\\Local')).toThrow('windows_installer=1')
+  })
+
   /** Linux fresh install 直接执行 exact AppImage，并保留原路径写入与执行资格。 */
   it('plans the exact executable AppImage under xvfb', () => {
     const plan = buildBootstrapCommandPlan({ target: 'linux-x86_64', packagePath: '/tmp/candidate.AppImage', installRoot: '/tmp/install' })
     expect(plan.install.args).toEqual(['/tmp/candidate.AppImage'])
-    expect(plan.launch).toEqual({ executable: 'xvfb-run', args: ['-a', '/tmp/install/DeepSeek-Harness-Desktop.AppImage'], environment: { APPIMAGE_EXTRACT_AND_RUN: '1' } })
+    expect(plan.launch).toEqual({ executable: 'dbus-run-session', args: ['--', 'xvfb-run', '-a', '/tmp/install/DeepSeek-Harness-Desktop.AppImage'], environment: { APPIMAGE_EXTRACT_AND_RUN: '1', NO_AT_BRIDGE: '1' } })
     expect(plan.replacementPath).toBe('/tmp/install/DeepSeek-Harness-Desktop.AppImage')
   })
 

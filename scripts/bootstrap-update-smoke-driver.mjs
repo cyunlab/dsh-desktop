@@ -10,6 +10,7 @@ import { probeBundledRuntime, verifyExtractedBundleContents } from './verify-tau
 
 const FIXED_ORIGIN = 'http://127.0.0.1:3080/'
 const OUTPUT_BOUND = 128 * 1024
+const ARCHIVE_LISTING_BOUND = 32 * 1024 * 1024
 const TARGETS = Object.freeze({
   'windows-x86_64': Object.freeze({ platform: 'win32', arch: 'x64', runner: { os: 'windows', arch: 'x86_64' } }),
   'linux-x86_64': Object.freeze({ platform: 'linux', arch: 'x64', runner: { os: 'linux', arch: 'x86_64' } }),
@@ -23,7 +24,7 @@ export function buildBootstrapCommandPlan(options) {
   if (options.target === 'windows-x86_64') return Object.freeze({ install: { executable: options.packagePath, args: ['/S'], environment: {} }, discovery: { registryRoot: 'HKCU', locationRoot: options.installRoot } })
   if (options.target === 'linux-x86_64') {
     const replacementPath = path.join(options.installRoot, 'DeepSeek-Harness-Desktop.AppImage')
-    return Object.freeze({ install: { executable: 'copy', args: [options.packagePath], environment: {} }, launch: { executable: 'xvfb-run', args: ['-a', replacementPath], environment: { APPIMAGE_EXTRACT_AND_RUN: '1' } }, replacementPath })
+    return Object.freeze({ install: { executable: 'copy', args: [options.packagePath], environment: {} }, launch: { executable: 'dbus-run-session', args: ['--', 'xvfb-run', '-a', replacementPath], environment: { APPIMAGE_EXTRACT_AND_RUN: '1', NO_AT_BRIDGE: '1' } }, replacementPath })
   }
   return Object.freeze({
     install: { executable: 'tar', args: ['-xzf', options.packagePath, '-C', options.installRoot], environment: {} },
@@ -92,27 +93,36 @@ export async function verifyTauriUpdaterSignature(packageBytes, encodedSignature
   return true
 }
 
-/** 无 shell 执行有界命令并收集诊断。 */
-function runCommand(executable, args, options = {}) {
+/** 无 shell 执行有界命令并收集诊断，允许为受信的大型结构化输出显式提高上限。 */
+export function runCommand(executable, args, options = {}) {
   return new Promise((resolve, reject) => {
+    const outputBound = options.outputBound ?? OUTPUT_BOUND
+    if (!Number.isSafeInteger(outputBound) || outputBound <= 0) throw new Error('command output bound must be a positive safe integer')
     const child = spawn(executable, args, { cwd: options.cwd, env: { ...options.environment }, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     const output = []
     let bytes = 0
-    for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { bytes += chunk.length; if (bytes <= OUTPUT_BOUND) output.push(chunk); else child.kill() })
+    for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { bytes += chunk.length; if (bytes <= outputBound) output.push(chunk); else child.kill() })
     child.once('error', reject)
-    child.once('exit', code => code === 0 && bytes <= OUTPUT_BOUND ? resolve(Buffer.concat(output).toString('utf8')) : reject(new Error(`${path.basename(executable)} failed (${code}): ${Buffer.concat(output).toString('utf8').slice(0, 2048)}`)))
+    child.once('exit', code => code === 0 && bytes <= outputBound ? resolve(Buffer.concat(output).toString('utf8')) : reject(new Error(`${path.basename(executable)} failed (${code}): ${Buffer.concat(output).toString('utf8').slice(0, 2048)}`)))
   })
 }
 
-/** 启动真实 Desktop 主进程而不使用 shell 或测试 hook。 */
+/** 启动真实 Desktop 主进程并保留有界诊断，不使用 shell 或测试 hook。 */
 function launchApplication(executable, args, environment) {
-  const child = spawn(executable, args, { env: environment, shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: 'ignore' })
+  const child = spawn(executable, args, { env: environment, shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] })
+  const output = []
+  let bytes = 0
+  for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => {
+    const remaining = OUTPUT_BOUND - bytes
+    if (remaining > 0) output.push(chunk.subarray(0, remaining))
+    bytes += chunk.length
+  })
   child.unref()
-  return child.pid
+  return { pid: child.pid, diagnostics: () => `${Buffer.concat(output).toString('utf8').trim().slice(0, OUTPUT_BOUND)}${bytes > OUTPUT_BOUND ? '\n[diagnostics truncated]' : ''}` }
 }
 
 /** 在超时内要求固定 Host origin 返回非空 HTML。 */
-async function waitForHostReady() {
+async function waitForHostReady(readDiagnostics = () => '') {
   const deadline = Date.now() + 4 * 60 * 1000
   while (Date.now() < deadline) {
     try {
@@ -122,7 +132,8 @@ async function waitForHostReady() {
     } catch {}
     await new Promise(resolve => setTimeout(resolve, 1_000))
   }
-  throw new Error('fixed Host origin did not become ready')
+  const diagnostics = readDiagnostics()
+  throw new Error(`fixed Host origin did not become ready${diagnostics ? `: ${diagnostics}` : ''}`)
 }
 
 /** 在启动或 runtime probe 前证明固定 Host 端口没有其他进程占用。 */
@@ -232,17 +243,29 @@ async function inspectMac(installRoot, version, signingConfigured, checks, envir
   return { root: app, executable: path.join(app, 'Contents', 'MacOS', executable), codeSigning: signingConfigured ? 'verified' : 'not-configured', notarization: signingConfigured ? 'verified' : 'not-configured' }
 }
 
+/** 按 Windows 路径语义校验 NSIS 当前用户安装记录与版本。 */
+export function verifyWindowsInstallationRecord(record, version, installLocation, userRoot) {
+  const relative = path.win32.relative(userRoot.toLowerCase(), installLocation.toLowerCase())
+  const underUserRoot = relative === '' || (relative !== '..' && !relative.startsWith(`..${path.win32.sep}`) && !path.win32.isAbsolute(relative))
+  const windowsInstaller = Number(record.WindowsInstaller ?? 0)
+  if (record.DisplayVersion !== version || windowsInstaller !== 0 || !underUserRoot) {
+    throw new Error(`installation is not the expected non-MSI current-user NSIS version and location (display_version=${String(record.DisplayVersion)}, windows_installer=${windowsInstaller}, under_user_root=${underUserRoot})`)
+  }
+  return true
+}
+
 /** 从 HKCU uninstall registry 定位 NSIS 当前用户安装及版本。 */
 async function inspectWindows(version, userRoot, environment) {
   const script = "$ErrorActionPreference='Stop'; $cu=@(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' | Where-Object {$_.DisplayName -eq 'DeepSeek Harness Desktop'}); $lm=@(Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' -ErrorAction SilentlyContinue | Where-Object {$_.DisplayName -eq 'DeepSeek Harness Desktop'}); if ($cu.Count -ne 1 -or $lm.Count -ne 0) { throw 'expected exactly one HKCU and no HKLM uninstall record' }; [Console]::Out.Write(($cu[0] | Select-Object InstallLocation,DisplayVersion,WindowsInstaller | ConvertTo-Json -Compress))"
   const record = JSON.parse(await runCommand('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { environment }))
   const installLocation = path.resolve(record.InstallLocation)
-  if (record.DisplayVersion !== version || Number(record.WindowsInstaller ?? 0) !== 0 || !(installLocation === userRoot || installLocation.startsWith(`${userRoot}${path.sep}`))) throw new Error('installation is not the expected non-MSI current-user NSIS version and location')
+  const [canonicalInstallLocation, canonicalUserRoot] = await Promise.all([realpath(installLocation), realpath(userRoot)])
+  verifyWindowsInstallationRecord(record, version, canonicalInstallLocation, canonicalUserRoot)
   const executables = (await readdir(installLocation)).filter(name => name.toLowerCase().endsWith('.exe') && name.toLowerCase().includes('deepseek'))
   if (executables.length !== 1) throw new Error('installed Windows application executable is ambiguous')
   const uninstallers = (await readdir(installLocation)).filter(name => name.toLowerCase().endsWith('.exe') && name.toLowerCase().includes('uninstall'))
   if (uninstallers.length !== 1) throw new Error('current-user NSIS uninstaller is missing or ambiguous')
-  return { root: installLocation, executable: path.join(installLocation, executables[0]), uninstaller: path.join(installLocation, uninstallers[0]) }
+  return { root: canonicalInstallLocation, executable: path.join(canonicalInstallLocation, executables[0]), uninstaller: path.join(canonicalInstallLocation, uninstallers[0]) }
 }
 
 /** 静默卸载 bootstrap Windows 应用并确认 HKCU 注册记录消失。 */
@@ -338,8 +361,8 @@ export async function runNativeBootstrapDriver(options, environment = process.en
       verificationRoot = installed.root
     } else {
       const [names, verbose] = await Promise.all([
-        runCommand('tar', ['-tzf', options.candidatePackage], { environment: commandEnvironment }),
-        runCommand('tar', ['-tvzf', options.candidatePackage], { environment: commandEnvironment })
+        runCommand('tar', ['-tzf', options.candidatePackage], { environment: commandEnvironment, outputBound: ARCHIVE_LISTING_BOUND }),
+        runCommand('tar', ['-tvzf', options.candidatePackage], { environment: commandEnvironment, outputBound: ARCHIVE_LISTING_BOUND })
       ])
       verifyMacArchiveListing(names, verbose)
       await runCommand(plan.install.executable, plan.install.args, { environment: commandEnvironment })
@@ -359,8 +382,9 @@ export async function runNativeBootstrapDriver(options, environment = process.en
     await probeBundledRuntime(verificationRoot, platformName, contract.arch)
     await requireHostPortFree()
     launchedAt = Date.now()
-    pid = launchApplication(launchExecutable, launchArguments, launchEnvironment)
-    await waitForHostReady()
+    const launch = launchApplication(launchExecutable, launchArguments, launchEnvironment)
+    pid = launch.pid
+    await waitForHostReady(launch.diagnostics)
     const configurationIdentity = await waitForConfigurationIdentity(configurationLogPath(options.target, isolatedHome, launchEnvironment), {
       endpoint: options.expectedUpdaterEndpoint,
       publicKeySha256: options.expectedUpdaterPublicKeySha256,
