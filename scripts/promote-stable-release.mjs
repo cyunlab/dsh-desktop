@@ -110,13 +110,45 @@ function minisignPublicKeyPacket(value) {
   return match[1]
 }
 
+/** 解码并校验 Tauri 外层 base64 包装的四行 minisign 签名文件。 */
+async function decodedMinisignSignature(signaturePath) {
+  const encoded = (await readFile(signaturePath, 'utf8')).trim()
+  const body = Buffer.from(encoded, 'base64')
+  const roundTrip = body.toString('base64').replace(/=+$/, '')
+  const normalized = body.toString('utf8').replaceAll('\r\n', '\n').trim()
+  const lines = normalized.split('\n')
+  const signaturePacket = Buffer.from(lines[1] ?? '', 'base64')
+  const globalSignature = Buffer.from(lines[3] ?? '', 'base64')
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)
+    || roundTrip !== encoded.replace(/=+$/, '')
+    || lines.length !== 4
+    || !lines[0].startsWith('untrusted comment: ')
+    || !lines[2].startsWith('trusted comment: ')
+    || signaturePacket.length !== 74
+    || globalSignature.length !== 64
+    || !['Ed', 'ED'].includes(signaturePacket.subarray(0, 2).toString('ascii'))) {
+    throw new Error('Tauri updater signature must contain the base64-encoded four-line minisign signature file')
+  }
+  return `${normalized}\n`
+}
+
 /** 使用嵌入发布环境的公钥验证单个 Tauri updater 签名。 */
 export async function verifyTauriSignature(artifactPath, signaturePath, publicKey, runMinisign = runMinisignCommand) {
   const publicKeyPacket = minisignPublicKeyPacket(publicKey)
-  await runMinisign(
-    ['-Vm', artifactPath, '-x', signaturePath, '-P', publicKeyPacket],
-    { shell: false, env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot } }
-  )
+  const signature = await decodedMinisignSignature(signaturePath)
+  const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'dsh-minisign-'))
+  const decodedSignaturePath = path.join(temporaryDirectory, 'signature.minisig')
+  try {
+    await chmod(temporaryDirectory, 0o700)
+    await writeFile(decodedSignaturePath, signature, { mode: 0o600 })
+    await chmod(decodedSignaturePath, 0o600)
+    await runMinisign(
+      ['-Vm', artifactPath, '-x', decodedSignaturePath, '-P', publicKeyPacket],
+      { shell: false, env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot } }
+    )
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true })
+  }
 }
 
 /** 以无 shell 子进程运行 ossutil，并仅收集命令结果。 */
