@@ -17,6 +17,7 @@ describe('Tauri resource layout', () => {
   /** 验证目录映射保留 runtime closure 和平台目录层级，避免 glob 将文件扁平化。 */
   it('maps resource directories without glob flattening', async () => {
     const config = JSON.parse(await readFile(path.join(root, 'src-tauri/tauri.conf.json'), 'utf8'))
+    expect(config.plugins?.updater).toEqual({ pubkey: '' })
     expect(config.bundle.resources).toEqual({
       '../dist': 'dist',
       '../resources/node': 'node'

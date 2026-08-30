@@ -15,6 +15,11 @@
     "withGlobalTauri": false,
     "windows": []
   },
+  "plugins": {
+    "updater": {
+      "pubkey": ""
+    }
+  },
   "bundle": {
     "active": true,
     "targets": [

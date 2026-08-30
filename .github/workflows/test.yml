@@ -144,7 +144,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             build-essential file libayatana-appindicator3-dev libssl-dev \
-            libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev patchelf xvfb
+            libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev patchelf \
+            webkit2gtk-driver xvfb
       - name: Install stable Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Prepare the official Node runtime and frontend

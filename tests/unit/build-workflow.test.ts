@@ -3,6 +3,7 @@ import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 const workflow = (await readFile(new URL('../../.github/workflows/build.yml', import.meta.url), 'utf8')).replaceAll('\r\n', '\n')
+const behaviorWorkflow = (await readFile(new URL('../../.github/workflows/test.yml', import.meta.url), 'utf8')).replaceAll('\r\n', '\n')
 const projectRoot = path.resolve(import.meta.dirname, '../..')
 
 describe('native build workflow contract', () => {
@@ -59,6 +60,11 @@ describe('native build workflow contract', () => {
     expect(workflow).toContain('libwebkit2gtk-4.1-dev')
     expect(workflow).toContain('libayatana-appindicator3-dev')
     expect(workflow).toContain('patchelf')
+  })
+
+  /** Linux 桌面 E2E 必须安装 WebKit 的 WebDriver 可执行文件。 */
+  it('installs the Linux WebKit WebDriver for desktop E2E', () => {
+    expect(behaviorWorkflow).toMatch(/Install Linux Tauri and WebView test dependencies[\s\S]*webkit2gtk-driver/)
   })
 
   it('builds an AppImage in extraction mode for hosted runners', () => {
