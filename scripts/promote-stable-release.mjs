@@ -493,6 +493,8 @@ export async function finalizeStableCandidate(candidate, storage, options = {}) 
 function validateBootstrapApproval(options) {
   const version = releaseVersion(options.approvedTag)
   if (version !== options.approvedVersion) throw new Error('approved tag and version must identify the same semantic version')
+  const legacyVersion = releaseVersion(options.approvedLegacyVersion)
+  if (legacyVersion === version) throw new Error('approved legacy Stable must differ from the candidate version')
   if (!/^[0-9a-f]{40}$/.test(options.approvedCommit ?? '')) {
     throw new Error('approved commit must be a full lowercase Git commit SHA')
   }
@@ -502,19 +504,20 @@ function validateBootstrapApproval(options) {
   return version
 }
 
-/** 要求持久化 candidate 与 protected bootstrap approval 四元组逐字一致。 */
+/** 要求持久化 candidate 与 protected bootstrap approval 逐字一致。 */
 function requireBootstrapCandidateApproval(candidate, options) {
   const version = validateBootstrapApproval(options)
   if (
     candidate?.candidate_tag !== options.approvedTag ||
     candidate?.candidate_version !== version ||
     candidate?.candidate_commit !== options.approvedCommit ||
+    candidate?.legacy_stable_version !== options.approvedLegacyVersion ||
     candidate?.legacy_stable_manifest_sha256 !== options.approvedLegacyManifestSha256
   ) throw new Error('bootstrap candidate does not match the approved identity')
 }
 
-/** 读取并验证 bootstrap 唯一允许的 legacy Stable 2.0.15 pointer。 */
-async function readLegacyStable(storage, prefix) {
+/** 读取并验证 bootstrap 显式审批的 legacy Stable pointer。 */
+async function readLegacyStable(storage, prefix, approvedLegacyVersion) {
   const stableKey = `${prefix}/channels/stable/latest.json`
   let body
   let manifest
@@ -522,10 +525,11 @@ async function readLegacyStable(storage, prefix) {
     body = await storage.readObject(stableKey)
     manifest = JSON.parse(body.toString('utf8'))
   } catch {
-    throw new Error('legacy Stable 2.0.15 manifest is required')
+    throw new Error('approved legacy Stable manifest is required')
   }
-  if (manifest?.version !== '2.0.15') throw new Error('legacy Stable must be exactly 2.0.15')
-  return { stableKey, body, digest: createHash('sha256').update(body).digest('hex') }
+  const version = releaseVersion(manifest?.version)
+  if (version !== approvedLegacyVersion) throw new Error('legacy Stable version does not match the approved version')
+  return { stableKey, body, version, digest: createHash('sha256').update(body).digest('hex') }
 }
 
 /** 拒绝 receipt 前缀下的任何完整或部分 bootstrap 审计记录。 */
@@ -594,7 +598,7 @@ async function readBootstrapCandidateManifest(candidate, storage, prefix) {
 export async function prepareBootstrapStableCandidate(options, storage, dependencies = {}) {
   const version = validateBootstrapApproval(options)
   const prefix = normalizePrefix(options.prefix ?? 'dsh-desktop')
-  const legacy = await readLegacyStable(storage, prefix)
+  const legacy = await readLegacyStable(storage, prefix, options.approvedLegacyVersion)
   if (legacy.digest !== options.approvedLegacyManifestSha256) {
     throw new Error('approved legacy Stable manifest digest does not match authoritative OSS Stable')
   }
@@ -612,13 +616,13 @@ export async function prepareBootstrapStableCandidate(options, storage, dependen
   if (prepared.candidate_tag !== options.approvedTag || prepared.candidate_commit !== options.approvedCommit || prepared.manifest?.version !== version) {
     throw new Error('prepared candidate does not match the explicitly approved identity')
   }
-  if (prepared.previous_stable_version !== undefined && prepared.previous_stable_version !== '2.0.15') {
-    throw new Error('prepared candidate predecessor is not legacy Stable 2.0.15')
+  if (prepared.previous_stable_version !== undefined && prepared.previous_stable_version !== legacy.version) {
+    throw new Error('prepared candidate predecessor does not match the approved legacy Stable')
   }
   if (prepared.previous_stable_manifest_sha256 !== undefined && prepared.previous_stable_manifest_sha256 !== legacy.digest) {
     throw new Error('legacy Stable changed during bootstrap candidate preparation')
   }
-  const currentLegacy = await readLegacyStable(storage, prefix)
+  const currentLegacy = await readLegacyStable(storage, prefix, legacy.version)
   if (!currentLegacy.body.equals(legacy.body)) throw new Error('legacy Stable changed during bootstrap candidate preparation')
   await requireBootstrapReceiptAbsent(storage, prefix)
   return {
@@ -627,7 +631,7 @@ export async function prepareBootstrapStableCandidate(options, storage, dependen
     candidate_tag: options.approvedTag,
     candidate_version: version,
     candidate_commit: options.approvedCommit,
-    legacy_stable_version: '2.0.15',
+    legacy_stable_version: legacy.version,
     legacy_stable_manifest_sha256: legacy.digest,
     manifest_url: prepared.manifest_url,
     manifest_sha256: prepared.manifest_sha256,
@@ -641,8 +645,8 @@ export async function finalizeBootstrapStableCandidate(candidate, storage, optio
   if (options.approvedTag !== undefined) requireBootstrapCandidateApproval(candidate, options)
   if (!options?.evidenceDirectory) throw new Error('bootstrap evidence directory is required')
   if (!Number.isFinite(options.maxAgeHours) || options.maxAgeHours <= 0) throw new Error('a positive bootstrap evidence max age is required')
-  const legacy = await readLegacyStable(storage, prefix)
-  if (candidate.legacy_stable_version !== '2.0.15' || candidate.legacy_stable_manifest_sha256 !== legacy.digest) {
+  const legacy = await readLegacyStable(storage, prefix, candidate.legacy_stable_version)
+  if (candidate.legacy_stable_manifest_sha256 !== legacy.digest) {
     throw new Error('legacy Stable changed after bootstrap candidate preparation')
   }
   await requireBootstrapReceiptAbsent(storage, prefix)
@@ -669,7 +673,7 @@ export async function finalizeBootstrapStableCandidate(candidate, storage, optio
     candidate_commit: candidate.candidate_commit,
     candidate_manifest_url: candidate.manifest_url,
     candidate_manifest_sha256: candidate.manifest_sha256,
-    legacy_stable_version: '2.0.15',
+    legacy_stable_version: legacy.version,
     legacy_stable_manifest_sha256: legacy.digest,
     bootstrap_evidence_sha256: evidenceDigest,
     evidence_kind: 'bootstrap-fresh-install',
@@ -689,7 +693,7 @@ export async function finalizeBootstrapStableCandidate(candidate, storage, optio
     options.lockOwner
   )
   await storage.acquirePromotionLock(promotionLock.key, promotionLock.body)
-  const finalLegacy = await readLegacyStable(storage, prefix)
+  const finalLegacy = await readLegacyStable(storage, prefix, legacy.version)
   if (!finalLegacy.body.equals(legacy.body)) throw new Error('legacy Stable changed before bootstrap receipt write')
   await requireBootstrapReceiptAbsent(storage, prefix)
   const finalCandidate = await readBootstrapCandidateManifest(candidate, storage, prefix)
@@ -704,7 +708,7 @@ export async function finalizeBootstrapStableCandidate(candidate, storage, optio
   await requireExactBootstrapReceipt(storage, prefix, receiptKey)
 
   // Stable 是最后一次 OSS mutation；receipt 后若发生漂移则保留部分记录并禁止重试。
-  const stableBeforeWrite = await readLegacyStable(storage, prefix)
+  const stableBeforeWrite = await readLegacyStable(storage, prefix, legacy.version)
   if (!stableBeforeWrite.body.equals(legacy.body)) throw new Error('legacy Stable changed after bootstrap receipt write')
   const candidateBeforeWrite = await readBootstrapCandidateManifest(candidate, storage, prefix)
   if (!candidateBeforeWrite.body.equals(remoteCandidate.body)) throw new Error('bootstrap candidate changed after receipt write')
@@ -795,6 +799,7 @@ export async function runBootstrapPreparationCli(environment = process.env, depe
     approvedTag: values['approved-tag'],
     approvedVersion: values['approved-version'],
     approvedCommit: values['approved-commit'],
+    approvedLegacyVersion: values['approved-legacy-version'],
     approvedLegacyManifestSha256: values['approved-legacy-manifest-sha256'],
     releaseBody: values.notes,
     publishedAt: values['published-at'],
@@ -827,6 +832,7 @@ export async function runBootstrapFinalizationCli(environment = process.env, dep
     approvedTag: values['approved-tag'],
     approvedVersion: values['approved-version'],
     approvedCommit: values['approved-commit'],
+    approvedLegacyVersion: values['approved-legacy-version'],
     approvedLegacyManifestSha256: values['approved-legacy-manifest-sha256']
   }
   requireBootstrapCandidateApproval(candidate, approval)

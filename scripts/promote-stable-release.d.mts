@@ -19,7 +19,7 @@ export interface BootstrapStableCandidate {
   readonly candidate_tag: string
   readonly candidate_version: string
   readonly candidate_commit: string
-  readonly legacy_stable_version: '2.0.15'
+  readonly legacy_stable_version: string
   readonly legacy_stable_manifest_sha256: string
   readonly manifest_url: string
   readonly manifest_sha256: string
@@ -114,6 +114,7 @@ export function prepareBootstrapStableCandidate(
     readonly approvedTag: string
     readonly approvedVersion: string
     readonly approvedCommit: string
+    readonly approvedLegacyVersion: string
     readonly approvedLegacyManifestSha256: string
     readonly releaseBody?: string
     readonly publishedAt?: string
@@ -137,6 +138,7 @@ export function finalizeBootstrapStableCandidate(
     readonly approvedTag?: string
     readonly approvedVersion?: string
     readonly approvedCommit?: string
+    readonly approvedLegacyVersion?: string
     readonly approvedLegacyManifestSha256?: string
     readonly lockOwner: string
   },

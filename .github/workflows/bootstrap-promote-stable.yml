@@ -55,11 +55,13 @@ jobs:
           CONFIGURED_TAG: ${{ vars.UPDATER_BOOTSTRAP_TAG }}
           CONFIGURED_VERSION: ${{ vars.UPDATER_BOOTSTRAP_VERSION }}
           CONFIGURED_COMMIT: ${{ vars.UPDATER_BOOTSTRAP_COMMIT }}
+          CONFIGURED_LEGACY_VERSION: ${{ vars.UPDATER_BOOTSTRAP_LEGACY_VERSION }}
           CONFIGURED_LEGACY_MANIFEST_SHA256: ${{ vars.UPDATER_BOOTSTRAP_LEGACY_MANIFEST_SHA256 }}
         run: |
           set -euo pipefail
           [[ "$APPROVED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           [[ "$CONFIGURED_LEGACY_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CONFIGURED_LEGACY_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)([-+][0-9A-Za-z.-]+)?$ ]]
           [[ "$APPROVED_TAG" == "v$APPROVED_VERSION" ]]
           test "$APPROVED_TAG" = "$CONFIGURED_TAG"
           test "$APPROVED_VERSION" = "$CONFIGURED_VERSION"
@@ -124,6 +126,7 @@ jobs:
           APPROVED_TAG: ${{ github.event.inputs.approved_tag }}
           APPROVED_VERSION: ${{ github.event.inputs.approved_version }}
           APPROVED_COMMIT: ${{ github.event.inputs.approved_commit }}
+          APPROVED_LEGACY_VERSION: ${{ vars.UPDATER_BOOTSTRAP_LEGACY_VERSION }}
           APPROVED_LEGACY_MANIFEST_SHA256: ${{ vars.UPDATER_BOOTSTRAP_LEGACY_MANIFEST_SHA256 }}
         run: |
           set -euo pipefail
@@ -133,6 +136,7 @@ jobs:
           node scripts/promote-stable-release.mjs --prepare-bootstrap \
             --approved-tag "$APPROVED_TAG" --approved-version "$APPROVED_VERSION" \
             --approved-commit "$APPROVED_COMMIT" \
+            --approved-legacy-version "$APPROVED_LEGACY_VERSION" \
             --approved-legacy-manifest-sha256 "$APPROVED_LEGACY_MANIFEST_SHA256" \
             --notes "$notes" --published-at "$published_at" \
             --assets artifacts --prefix dsh-desktop --output candidate.json
@@ -276,6 +280,7 @@ jobs:
           APPROVED_TAG: ${{ vars.UPDATER_BOOTSTRAP_TAG }}
           APPROVED_VERSION: ${{ vars.UPDATER_BOOTSTRAP_VERSION }}
           APPROVED_COMMIT: ${{ vars.UPDATER_BOOTSTRAP_COMMIT }}
+          APPROVED_LEGACY_VERSION: ${{ vars.UPDATER_BOOTSTRAP_LEGACY_VERSION }}
           APPROVED_LEGACY_MANIFEST_SHA256: ${{ vars.UPDATER_BOOTSTRAP_LEGACY_MANIFEST_SHA256 }}
         run: >-
           node scripts/promote-stable-release.mjs --finalize-bootstrap
@@ -283,4 +288,5 @@ jobs:
           --max-age-hours 24 --prefix dsh-desktop
           --approved-tag "$APPROVED_TAG" --approved-version "$APPROVED_VERSION"
           --approved-commit "$APPROVED_COMMIT"
+          --approved-legacy-version "$APPROVED_LEGACY_VERSION"
           --approved-legacy-manifest-sha256 "$APPROVED_LEGACY_MANIFEST_SHA256"

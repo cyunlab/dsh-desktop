@@ -38,10 +38,12 @@ describe('first-updater bootstrap promotion workflow', () => {
       'UPDATER_BOOTSTRAP_LEGACY_MANIFEST_SHA256'
     ]) expect(workflow).toContain(`vars.${variable}`)
     expect(workflow).toContain('--approved-legacy-manifest-sha256')
+    expect(workflow).toContain('--approved-legacy-version')
     expect(workflow.match(/--approved-tag/g)).toHaveLength(2)
     expect(workflow.match(/--approved-version/g)).toHaveLength(2)
     expect(workflow.match(/--approved-commit/g)).toHaveLength(2)
     expect(workflow.match(/--approved-legacy-manifest-sha256/g)).toHaveLength(2)
+    expect(workflow.match(/--approved-legacy-version/g)).toHaveLength(2)
     const verify = workflow.lastIndexOf('verify-bootstrap-update-evidence.mjs')
     const credentials = workflow.lastIndexOf('configure-aliyun-credentials-action@')
     const finalize = workflow.lastIndexOf('--finalize-bootstrap')

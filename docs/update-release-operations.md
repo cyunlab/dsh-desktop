@@ -42,7 +42,8 @@ Set these Environment variables exactly as shown:
 | `UPDATER_BOOTSTRAP_TAG` | Exact one-time approved first-updater tag, for example `v2.1.0`; remove or retain read-only after bootstrap, but never repurpose |
 | `UPDATER_BOOTSTRAP_VERSION` | Exact semantic version matching `UPDATER_BOOTSTRAP_TAG` |
 | `UPDATER_BOOTSTRAP_COMMIT` | Exact 40-character lowercase Git commit resolved by the approved tag |
-| `UPDATER_BOOTSTRAP_LEGACY_MANIFEST_SHA256` | Lowercase SHA-256 of the byte-exact authoritative 2.0.15 OSS Stable manifest captured during approval |
+| `UPDATER_BOOTSTRAP_LEGACY_VERSION` | Exact semantic version of the approved pre-updater OSS Stable anchor |
+| `UPDATER_BOOTSTRAP_LEGACY_MANIFEST_SHA256` | Lowercase SHA-256 of the byte-exact approved pre-updater OSS Stable anchor |
 | `UPDATER_BOOTSTRAP_MACOS_SIGNING_CONFIGURED` | Literal `true` requires Apple trust checks; literal `false` explicitly approves unsigned macOS; missing or any other value fails closed |
 
 Set these Environment secrets exactly as shown:
@@ -99,7 +100,7 @@ Create a RAM role whose trusted principal is only that OIDC provider. Its trust 
 
 - `oidc:iss` = `https://token.actions.githubusercontent.com`;
 - `oidc:aud` = `sts.aliyuncs.com`;
-- `oidc:sub` = `repo:cyunlab/dsh-desktop:environment:production`.
+- `oidc:sub` = `repo:cyunlab@318327647/dsh-desktop@1335996339:environment:production` for the repository's current immutable-subject format.
 
 The `sub` value is case-sensitive and depends on GitHub's active subject format. Before the first production run, request a token from a diagnostic job that references the `production` Environment but has no OSS permission, decode only the non-secret JWT claims, and verify that the observed `iss`, `aud`, and `sub` exactly match the RAM trust policy. GitHub repositories using immutable subject claims have a different `sub` format containing repository identifiers; if this repository opts into that format, update the RAM trust condition to the exact observed immutable subject before running promotion. Never broaden the condition to a wildcard repository, branch, pull request, or Environment.
 
@@ -177,11 +178,11 @@ Release procedure:
 
 ### One-time first updater bootstrap
 
-The current 2.0.15 Stable application was not built with the automatic updater and cannot produce truthful previous-Stable-to-candidate evidence. The normal published-release workflow therefore remains blocked for the first updater-capable release. It is not weakened or bypassed.
+The current 2.0.17 Stable application was not built with the automatic updater and cannot produce truthful previous-Stable-to-candidate evidence. The normal published-release workflow therefore remains blocked for the first updater-capable release. It is not weakened or bypassed.
 
-After the four official candidate packages exist on one published GitHub Release, capture the byte-exact authoritative 2.0.15 Stable manifest digest and configure the four `UPDATER_BOOTSTRAP_*` Environment variables above. A repository administrator may then manually dispatch `Bootstrap first updater Stable`. The dispatcher must enter the exact approved `v<semver>` tag, matching semantic version, and 40-character lowercase Git commit. The workflow requires those inputs to match the protected Environment values byte-for-byte. Both OSS-writing jobs reference the GitHub `production` Environment; configure required reviewers so a human reviews this identity before credentials are issued. The workflow refuses a Draft Release, tag/commit drift, a Stable pointer other than the configured byte-exact 2.0.15 manifest, or any object under `dsh-desktop/bootstrap/receipts/`.
+After the four official candidate packages exist on one published GitHub Release, confirm the byte-exact authoritative legacy Stable anchor version and digest and configure the `UPDATER_BOOTSTRAP_*` Environment variables above. A repository administrator may then manually dispatch `Bootstrap first updater Stable`. The dispatcher must enter the exact approved `v<semver>` tag, matching semantic version, and 40-character lowercase Git commit. The workflow requires those inputs to match the protected Environment values byte-for-byte. Both OSS-writing jobs reference the GitHub `production` Environment; configure required reviewers so a human reviews this identity before credentials are issued. The workflow refuses a Draft Release, tag/commit drift, a Stable pointer other than the configured byte-exact legacy version and digest, or any object under `dsh-desktop/bootstrap/receipts/`.
 
-The reusable bootstrap smoke workflow fresh-installs and launches the official published Windows x64 current-user NSIS EXE, Linux x64 AppImage, macOS arm64 archive, and macOS x64 archive. Its distinct `bootstrap-fresh-install` evidence proves package/signature/manifest identity, updater configuration, installed version, launch, Runtime closure, Official Node, Desktop capability package, update client, and composition patch. It explicitly records `claims_previous_stable_upgrade: false`. This evidence cannot pass `verify-update-smoke-evidence.mjs --require-real-native` and must never be described as 2.0.15 upgrade evidence.
+The reusable bootstrap smoke workflow fresh-installs and launches the official published Windows x64 current-user NSIS EXE, Linux x64 AppImage, macOS arm64 archive, and macOS x64 archive. Its distinct `bootstrap-fresh-install` evidence proves package/signature/manifest identity, updater configuration, installed version, launch, Runtime closure, Official Node, Desktop capability package, update client, and composition patch. It explicitly records `claims_previous_stable_upgrade: false`. This evidence cannot pass `verify-update-smoke-evidence.mjs --require-real-native` and must never be described as 2.0.17 upgrade evidence.
 
 Finalization downloads and re-verifies the attested four-target evidence, then exchanges the final OIDC identity. The publisher re-reads the byte-exact candidate, legacy Stable pointer, evidence set, and absence of any receipt before its first mutation. It writes `dsh-desktop/bootstrap/receipts/<receipt-sha256>-first-updater-stable.json` with immutable caching, reads it back byte-for-byte, re-reads all admission inputs, and replaces `channels/stable/latest.json` last. The receipt binds the approved tag/version/commit, candidate and legacy manifest digests, and an exact evidence-set digest.
 
@@ -211,11 +212,11 @@ Windows evidence additionally requires an NSIS EXE installed under the current u
 
 ### Bootstrap evidence limitation
 
-The current previous Stable, `2.0.15`, predates the automatic updater. Its published binary therefore cannot discover an isolated candidate manifest or exercise either install path. The updater endpoint is also compiled into the binary. Rebuilding the `2.0.15` source with another endpoint would be `source-rebuild` evidence, not evidence for the published Stable artifact.
+The current previous Stable, `2.0.17`, predates the automatic updater. Its published binary therefore cannot discover an isolated candidate manifest or exercise either install path. The updater endpoint is also compiled into the binary. Rebuilding the `2.0.17` source with another endpoint would be `source-rebuild` evidence, not evidence for the published Stable artifact.
 
 The repository-owned native driver currently stops after verifying the real runner identity and reports this limitation. It does not emit evidence. This is an unimplemented internal test capability, not an external credential or runner configuration problem. Normal close can be automated through operating-system close plus process, staging, port, replacement, and manual-relaunch observations, but that observation code is not yet implemented in the production driver. The packaged explicit Restart action also has no durable native automation entry. Rust unit tests and debug-only WDIO hooks do not satisfy this production evidence contract.
 
-The separately reviewed one-time bootstrap admits only fresh-install evidence; it does not fabricate the missing 2.0.15 update lifecycle. Its repository-owned native driver performs the platform packaging path on the matching hosted runner: current-user silent NSIS plus HKCU discovery on Windows, the exact executable AppImage under a virtual display on Linux, and updater archive extraction plus configured Apple trust checks on macOS. It verifies candidate bytes and Tauri minisign with the approved public key, then binds Host readiness and installed resources to the fresh process's `updater-configuration-identity` record under the isolated Tauri app config directory. No successful four-runner production execution has yet been recorded, so first-updater Stable promotion remains blocked until all four attested documents pass admission. After bootstrap succeeds, normal Stable promotion remains blocked until its real previous-Stable driver implements both install paths and all required checkpoints.
+The separately reviewed one-time bootstrap admits only fresh-install evidence; it does not fabricate the missing 2.0.17 update lifecycle. Its repository-owned native driver performs the platform packaging path on the matching hosted runner: current-user silent NSIS plus HKCU discovery on Windows, the exact executable AppImage under a virtual display on Linux, and updater archive extraction plus configured Apple trust checks on macOS. It verifies candidate bytes and Tauri minisign with the approved public key, then binds Host readiness and installed resources to the fresh process's `updater-configuration-identity` record under the isolated Tauri app config directory. No successful four-runner production execution has yet been recorded, so first-updater Stable promotion remains blocked until all four attested documents pass admission. After bootstrap succeeds, normal Stable promotion remains blocked until its real previous-Stable driver implements both install paths and all required checkpoints.
 
 ## Failure handling and recovery
 
@@ -223,7 +224,7 @@ The separately reviewed one-time bootstrap admits only fresh-install evidence; i
 
 Leave the previous Stable manifest untouched. Diagnose and rerun the same immutable publication only if every existing content-addressed object is byte-for-byte identical to the expected object and its signature verifies. Different bytes use a different content-addressed key, but changing release contents after publication still requires a higher semantic version. Never overwrite or delete a released object.
 
-For the first-updater bootstrap, the rule is stricter. A failure before the receipt write may be retried only with the same approved tag, version, commit, byte-identical candidate, unchanged 2.0.15 Stable pointer, and newly admitted complete evidence. A failure during or after receipt creation is a partial bootstrap record and must not be retried. Preserve the receipt, candidate, evidence artifacts, workflow logs, and current Stable version for investigation. Do not delete or rename the receipt. If Stable was not changed, repair the release process and publish a higher version through a separately reviewed recovery decision; if Stable was changed, follow bad-release recovery below.
+For the first-updater bootstrap, the rule is stricter. A failure before the receipt write may be retried only with the same approved tag, version, commit, byte-identical candidate, unchanged approved legacy Stable anchor, and newly admitted complete evidence. A failure during or after receipt creation is a partial bootstrap record and must not be retried. Preserve the receipt, candidate, evidence artifacts, workflow logs, and current Stable version for investigation. Do not delete or rename the receipt. If Stable was not changed, repair the release process and publish a higher version through a separately reviewed recovery decision; if Stable was changed, follow bad-release recovery below.
 
 ### Stale promotion lock
 
@@ -252,7 +253,7 @@ Disable the `production` Environment or publishing role first. Revoke or tighten
 - [ ] RAM permissions cannot read, write, list, delete, or administer outside the required `dsh-desktop/` scope.
 - [ ] The publishing RAM role has no object delete permission and immutable release objects are retained permanently.
 - [ ] Every package and signature basename starts with its deterministic SHA-256 prefix; same-key retries verify byte-for-byte identity before reuse.
-- [ ] All normal Environment variables, the five fixed `UPDATER_BOOTSTRAP_*` approval variables, and both Environment secrets use the exact names in this runbook.
+- [ ] All normal Environment variables, the six fixed `UPDATER_BOOTSTRAP_*` approval variables, and both Environment secrets use the exact names in this runbook.
 - [ ] `TAURI_SIGNING_PUBLIC_KEY` matches both the protected private key and the public key embedded in Desktop; offline encrypted restore has been tested.
 - [ ] Promotion verifies all four updater packages with minisign before writing OSS.
 - [ ] Windows builds explicitly use NSIS `currentUser`; all four binaries embed the production Stable endpoint and the same updater public key used by promotion.
@@ -262,7 +263,7 @@ Disable the `production` Environment or publishing role first. Revoke or tighten
 - [ ] Draft creation leaves Stable unchanged; every candidate, smoke, evidence, credential, or revalidation failure also leaves Stable unchanged.
 - [ ] A successful published-release smoke has passed on all four targets and its evidence is recorded.
 - [ ] The manually dispatched one-time bootstrap is protected by `production` required reviewers and binds the exact approved tag/version/commit.
-- [ ] Authoritative Stable is still byte-identical version 2.0.15 and the bootstrap receipt prefix is empty before dispatch.
+- [ ] Authoritative Stable still matches the byte-identical approved legacy version and digest, and the bootstrap receipt prefix is empty before dispatch.
 - [ ] All four attested `bootstrap-fresh-install` documents pass the dedicated verifier without claiming a previous-Stable upgrade.
 - [ ] The content-digested immutable bootstrap receipt is byte-verified before Stable is written last; any partial receipt is preserved and blocks reuse.
 - [ ] The four evidence documents pass `verify-update-smoke-evidence.mjs --require-real-native`, and their GitHub artifact attestations verify against this repository and workflow run.

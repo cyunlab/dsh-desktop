@@ -28,7 +28,7 @@ function main() {
   assertNativeRunner(target)
   throw new Error([
     'real-native update automation is not yet available for released Desktop binaries',
-    'the current previous Stable 2.0.15 has no updater and cannot consume the isolated candidate manifest',
+    'the current previous Stable 2.0.17 has no updater and cannot consume the isolated candidate manifest',
     'a production-safe native automation seam must prove the explicit Restart path before this driver may emit evidence'
   ].join('; '))
 }
