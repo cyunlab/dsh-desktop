@@ -29,6 +29,13 @@ describe('first-updater bootstrap promotion workflow', () => {
     expect(workflow).toMatch(/bootstrap-native-smoke:\n[\s\S]*?permissions:\n      contents: read\n      id-token: write\n      attestations: write\n    uses: \.\/\.github\/workflows\/bootstrap-update-smoke\.yml/)
   })
 
+  /** gh CLI 一次只验证一个文件，两个准入点都必须逐项且非空地验证聚合证据。 */
+  it('verifies each evidence attestation separately at both admission boundaries', () => {
+    expect(workflow.match(/gh attestation verify "\$file" --repo "\$GITHUB_REPOSITORY"/g)).toHaveLength(2)
+    expect(workflow.match(/test "\$\{#files\[@\]\}" -gt 0/g)).toHaveLength(2)
+    expect(workflow).not.toContain('gh attestation verify evidence/*')
+  })
+
   /** 显式输入贯穿 candidate preparation、evidence 和 finalization，Stable 仍是最后写入。 */
   it('binds the approved tag version and commit through prepare and finalize', () => {
     expect(workflow).toContain('--prepare-bootstrap')
