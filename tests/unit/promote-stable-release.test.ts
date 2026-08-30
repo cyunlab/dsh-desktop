@@ -6,6 +6,7 @@ import {
   createOssutilStorage,
   finalizeStableCandidate,
   prepareStableCandidate,
+  runOssutilCommand,
   verifyTauriSignature,
   type OssutilResult,
   type PromotionStorage
@@ -615,6 +616,15 @@ describe('Stable update promotion', () => {
     await expect(storage.ensureObject('another-app/releases/2.1.0/package', Buffer.from('wrong scope'), {
       cacheControl: 'no-cache'
     })).rejects.toThrow('outside the configured application prefix')
+  })
+
+  /** ossutil v1 会把 NoSuchKey 写到 stdout；必须保留该错误码供 immutable upload 分支识别。 */
+  it('preserves bounded ossutil stdout diagnostics when the command fails', async () => {
+    await expect(runOssutilCommand([
+      '-e',
+      'process.stdout.write("Error: NoSuchKey: object does not exist\\n0.123(s) elapsed\\n"); process.exit(1)'
+    ], { executable: process.execPath, env: { PATH: process.env.PATH } }))
+      .rejects.toThrow('NoSuchKey: object does not exist')
   })
 
   /** 验证 immutable 对象仅可复用相同字节，绝不覆盖不同内容。 */

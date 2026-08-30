@@ -81,7 +81,10 @@ export interface OssutilStorageOptions {
 export function createOssutilStorage(options: OssutilStorageOptions): PromotionStorage
 
 /** 以无 shell 子进程运行 ossutil。 */
-export function runOssutilCommand(args: string[], options?: { readonly env?: NodeJS.ProcessEnv }): Promise<OssutilResult>
+export function runOssutilCommand(args: string[], options?: {
+  readonly env?: NodeJS.ProcessEnv
+  readonly executable?: string
+}): Promise<OssutilResult>
 
 /** 以无 shell 子进程运行 minisign。 */
 export function runMinisignCommand(args: string[], options?: { readonly env?: NodeJS.ProcessEnv }): Promise<void>
