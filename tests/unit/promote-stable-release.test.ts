@@ -468,14 +468,18 @@ describe('Stable update promotion', () => {
   /** 验证默认 minisign 适配器使用官方校验参数且不经 shell。 */
   it('verifies a Tauri signature with minisign and the configured public key', async () => {
     const calls: Array<{ args: string[]; shell: boolean }> = []
+    const publicKeyPacket = 'RWST3AOnSlwxKdQeGVbg9+u22K2c7niKQPaCJy4ECs9GpC6Moedx+9uf'
+    const tauriPublicKey = Buffer.from(`untrusted comment: minisign public key: 29315C4AA703DC93\n${publicKeyPacket}`).toString('base64')
     /** 记录 minisign 适配器收到的公开参数，避免执行本机二进制。 */
-    await verifyTauriSignature('/release/app.exe', '/release/app.exe.sig', 'RWQpublic', async (args, options) => {
+    await verifyTauriSignature('/release/app.exe', '/release/app.exe.sig', tauriPublicKey, async (args, options) => {
       calls.push({ args, shell: options.shell })
     })
     expect(calls).toEqual([{
-      args: ['-Vm', '/release/app.exe', '-x', '/release/app.exe.sig', '-P', 'RWQpublic'],
+      args: ['-Vm', '/release/app.exe', '-x', '/release/app.exe.sig', '-P', publicKeyPacket],
       shell: false
     }])
+    await expect(verifyTauriSignature('/release/app.exe', '/release/app.exe.sig', publicKeyPacket, async () => undefined))
+      .rejects.toThrow('base64-encoded two-line minisign public key file')
   })
 
   /** 验证非法 release tag 在上传前被拒绝。 */
