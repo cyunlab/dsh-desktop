@@ -11,6 +11,14 @@ import { probeBundledRuntime, verifyExtractedBundleContents } from './verify-tau
 const FIXED_ORIGIN = 'http://127.0.0.1:3080/'
 const OUTPUT_BOUND = 128 * 1024
 const ARCHIVE_LISTING_BOUND = 32 * 1024 * 1024
+const COMMAND_ENVIRONMENT_NAMES = Object.freeze([
+  'PATH', 'SystemRoot', 'SystemDrive', 'windir', 'ComSpec', 'PATHEXT', 'PSModulePath', 'OS', 'HOME', 'USERPROFILE',
+  'USERNAME', 'USERDOMAIN', 'HOMEDRIVE', 'HOMEPATH',
+  'LOCALAPPDATA', 'APPDATA', 'ProgramData', 'ALLUSERSPROFILE', 'PUBLIC', 'ProgramFiles', 'ProgramFiles(x86)',
+  'ProgramW6432', 'CommonProgramFiles', 'CommonProgramFiles(x86)', 'CommonProgramW6432', 'NUMBER_OF_PROCESSORS',
+  'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER', 'TEMP', 'TMP', 'TMPDIR', 'DISPLAY', 'XDG_CONFIG_HOME',
+  'XDG_DATA_HOME', 'XDG_RUNTIME_DIR'
+])
 const TARGETS = Object.freeze({
   'windows-x86_64': Object.freeze({ platform: 'win32', arch: 'x64', runner: { os: 'windows', arch: 'x86_64' } }),
   'linux-x86_64': Object.freeze({ platform: 'linux', arch: 'x64', runner: { os: 'linux', arch: 'x86_64' } }),
@@ -40,7 +48,7 @@ export function buildBootstrapCommandPlan(options) {
 export function buildMacLaunchPlan(application, isolatedHome) {
   return Object.freeze({
     executable: '/usr/bin/open',
-    args: ['-n', '-W', '-g', '--stdout', '/dev/stdout', '--stderr', '/dev/stderr', '--env', `HOME=${isolatedHome}`, '--env', `CFFIXED_USER_HOME=${isolatedHome}`, application]
+    args: ['-n', '-W', '-g', '--stdout', '/dev/stdout', '--stderr', '/dev/stderr', '--env', `HOME=${isolatedHome}`, '--env', `CFFIXED_USER_HOME=${isolatedHome}`, '-a', application]
   })
 }
 
@@ -48,6 +56,11 @@ export function buildMacLaunchPlan(application, isolatedHome) {
 export function macApplicationsStagingPath(pid = process.pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('invalid bootstrap staging process id')
   return path.join('/Applications', `DeepSeek Harness Desktop Bootstrap ${pid}.app`)
+}
+
+/** 只把真实桌面启动所需的受信系统变量传入原生进程，拒绝继承 CI 凭证。 */
+export function selectBootstrapCommandEnvironment(environment) {
+  return Object.fromEntries(COMMAND_ENVIRONMENT_NAMES.flatMap(name => environment[name] === undefined ? [] : [[name, environment[name]]]))
 }
 
 /** 在解压前校验 macOS tar member、唯一 app 根和 symlink 目标均留在 archive 内。 */
@@ -426,8 +439,7 @@ export async function runNativeBootstrapDriver(options, environment = process.en
   if (!path.basename(new URL(entry.url).pathname).startsWith(options.expectedPackageSha256.slice(0, 12))) throw new Error('candidate package URL is not content addressed')
   await verifyTauriUpdaterSignature(packageBytes, signatureText, options.expectedUpdaterPublicKey)
   const temporary = await mkdtemp(path.join(tmpdir(), 'dsh-bootstrap-native-'))
-  const commandEnvironment = { PATH: environment.PATH, SystemRoot: environment.SystemRoot, HOME: environment.HOME, USERPROFILE: environment.USERPROFILE, LOCALAPPDATA: environment.LOCALAPPDATA, APPDATA: environment.APPDATA, TEMP: environment.TEMP, TMP: environment.TMP, TMPDIR: environment.TMPDIR, DISPLAY: environment.DISPLAY, XDG_CONFIG_HOME: environment.XDG_CONFIG_HOME, XDG_DATA_HOME: environment.XDG_DATA_HOME, XDG_RUNTIME_DIR: environment.XDG_RUNTIME_DIR }
-  Object.keys(commandEnvironment).forEach(key => commandEnvironment[key] === undefined && delete commandEnvironment[key])
+  const commandEnvironment = selectBootstrapCommandEnvironment(environment)
   let pid
   let applicationPid
   let listenerPid
@@ -451,7 +463,7 @@ export async function runNativeBootstrapDriver(options, environment = process.en
       installed = await inspectWindows(options.expectedCandidateVersion, environment.LOCALAPPDATA, commandEnvironment)
       windowsInstallation = installed
       platform = { package_kind: 'nsis-exe', install_scope: 'current-user', authenticode: 'not-required', code_signing: 'not-applicable', notarization: 'not-applicable', install_registry_root: 'HKCU', install_location_class: 'user-profile', msi_present: false }
-      launchEnvironment = { ...commandEnvironment, APPDATA: path.join(isolatedHome, 'AppData', 'Roaming'), LOCALAPPDATA: path.join(isolatedHome, 'AppData', 'Local') }
+      launchEnvironment = { ...commandEnvironment }
       launchExecutable = installed.executable
       verificationRoot = installed.root
     } else if (options.target === 'linux-x86_64') {
@@ -495,7 +507,7 @@ export async function runNativeBootstrapDriver(options, environment = process.en
     await requireHostPortFree()
     const platformName = options.target === 'windows-x86_64' ? 'win' : options.target === 'linux-x86_64' ? 'linux' : 'mac'
     await verifyExtractedBundleContents(verificationRoot, platformName, contract.arch)
-    await probeBundledRuntime(verificationRoot, platformName, contract.arch)
+    await probeBundledRuntime(verificationRoot, platformName, contract.arch, () => {})
     await requireHostPortFree()
     launchedAt = Date.now()
     const launch = launchApplication(launchExecutable, launchArguments, launchEnvironment)

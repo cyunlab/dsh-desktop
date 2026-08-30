@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildBootstrapCommandPlan, buildMacLaunchPlan, combineBootstrapFailure, launchApplication, macApplicationsStagingPath, normalizeWindowsRegistryPath, parseListenerProcessId, runCommand, verifyConfigurationIdentityEvent, verifyMacArchiveListing, verifyTauriUpdaterSignature, verifyWindowsInstallationRecord } from '../../scripts/bootstrap-update-smoke-driver.mjs'
+import { buildBootstrapCommandPlan, buildMacLaunchPlan, combineBootstrapFailure, launchApplication, macApplicationsStagingPath, normalizeWindowsRegistryPath, parseListenerProcessId, runCommand, selectBootstrapCommandEnvironment, verifyConfigurationIdentityEvent, verifyMacArchiveListing, verifyTauriUpdaterSignature, verifyWindowsInstallationRecord } from '../../scripts/bootstrap-update-smoke-driver.mjs'
 
 describe('native bootstrap driver command-plan seam', () => {
   /** 原生进程静默退出时仍保留 code/signal，避免 readiness 超时丢失根因。 */
@@ -67,7 +67,7 @@ describe('native bootstrap driver command-plan seam', () => {
   it('plans a waiting background LaunchServices launch for the extracted app', () => {
     expect(buildMacLaunchPlan('/tmp/install/Desktop.app', '/tmp/home')).toEqual({
       executable: '/usr/bin/open',
-      args: ['-n', '-W', '-g', '--stdout', '/dev/stdout', '--stderr', '/dev/stderr', '--env', 'HOME=/tmp/home', '--env', 'CFFIXED_USER_HOME=/tmp/home', '/tmp/install/Desktop.app']
+      args: ['-n', '-W', '-g', '--stdout', '/dev/stdout', '--stderr', '/dev/stderr', '--env', 'HOME=/tmp/home', '--env', 'CFFIXED_USER_HOME=/tmp/home', '-a', '/tmp/install/Desktop.app']
     })
   })
 
@@ -86,6 +86,19 @@ describe('native bootstrap driver command-plan seam', () => {
     expect(failure?.message).toContain('bootstrap failed: Host did not start')
     expect(failure?.message).toContain('cleanup also failed: uninstall record remained')
     expect(failure?.cause).toBe(primary)
+  })
+
+  /** Windows 启动保留系统与用户目录变量，但不能把任意 CI secret 继承给桌面进程。 */
+  it('selects the Windows runtime environment without CI credentials', () => {
+    expect(selectBootstrapCommandEnvironment({
+      PATH: 'C:\\Windows', SystemRoot: 'C:\\Windows', ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+      APPDATA: 'C:\\Users\\runner\\AppData\\Roaming', LOCALAPPDATA: 'C:\\Users\\runner\\AppData\\Local',
+      ProgramData: 'C:\\ProgramData', GH_TOKEN: 'secret'
+    })).toEqual({
+      PATH: 'C:\\Windows', SystemRoot: 'C:\\Windows', ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+      APPDATA: 'C:\\Users\\runner\\AppData\\Roaming', LOCALAPPDATA: 'C:\\Users\\runner\\AppData\\Local',
+      ProgramData: 'C:\\ProgramData'
+    })
   })
 
   /** 不支持的平台或 runner 架构不能生成可执行计划。 */

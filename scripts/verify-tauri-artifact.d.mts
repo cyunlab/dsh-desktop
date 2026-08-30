@@ -18,7 +18,7 @@ export function readMachOArchitecture(file: string): Promise<string>
 export function verifyExtractedBundleContents(contentRoot: string, platformName: string, runtimeArch?: string): Promise<void>
 
 /** 使用解包后的官方 Node 和 published CLI 启动固定 dsh web 并验证清理。 */
-export function probeBundledRuntime(contentRoot: string, platformName: string, runtimeArch?: string): Promise<void>
+export function probeBundledRuntime(contentRoot: string, platformName: string, runtimeArch?: string, log?: (message: string) => void): Promise<void>
 
 /** 删除安装包检查目录，并重试卸载后的短暂文件系统占用。 */
 export function removeInspectionRoot(
