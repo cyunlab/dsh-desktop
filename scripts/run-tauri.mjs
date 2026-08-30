@@ -13,13 +13,32 @@ function withCargoPath(environment) {
   return environment
 }
 
+/** 验证并规范化正式发布使用的 minisign 公钥文本。 */
+function normalizeUpdaterPublicKey(value) {
+  const normalized = value.replaceAll('\r\n', '\n').trim()
+  if (!/^untrusted comment: minisign public key: [0-9A-F]+\nRW[A-Za-z0-9+/=]+$/.test(normalized)) {
+    throw new Error('DSH_UPDATER_PUBLIC_KEY must contain the original two-line minisign public key')
+  }
+  return normalized
+}
+
+/** 为正式 build 合并 updater 公钥，使运行时与 Tauri bundler 使用同一信任根。 */
+export function buildTauriArguments(command, args, environment) {
+  const cliArguments = [command]
+  if (command === 'build' && environment.DSH_UPDATER_PUBLIC_KEY) {
+    const pubkey = normalizeUpdaterPublicKey(environment.DSH_UPDATER_PUBLIC_KEY)
+    cliArguments.push('--config', JSON.stringify({ plugins: { updater: { pubkey } } }))
+  }
+  return [...cliArguments, ...args]
+}
+
 /** 使用 pnpm 启动 Tauri，并继承终端输入输出与退出码。 */
 function run() {
   const [command, ...args] = process.argv.slice(2)
   if (!command) throw new Error('Tauri command is required')
   const pnpmEntry = process.env.npm_execpath
   if (!pnpmEntry) throw new Error('Tauri launcher must be run from a pnpm script')
-  const child = spawn(process.execPath, [pnpmEntry, 'exec', 'tauri', command, ...args], {
+  const child = spawn(process.execPath, [pnpmEntry, 'exec', 'tauri', ...buildTauriArguments(command, args, process.env)], {
     cwd: process.cwd(),
     env: withCargoPath(process.env),
     stdio: 'inherit'
@@ -28,4 +47,4 @@ function run() {
   child.once('exit', code => { process.exitCode = code ?? 1 })
 }
 
-run()
+if (process.argv[1] && path.resolve(process.argv[1]) === import.meta.filename) run()
