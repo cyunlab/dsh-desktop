@@ -534,8 +534,10 @@ describe('Stable update promotion', () => {
         directoryMode: directoryInformation.mode & 0o777,
         fileMode: fileInformation.mode & 0o777
       })
-      if (calls.length === 1 && args[0] === 'cat') throw new Error('NoSuchKey: object does not exist')
-      return { stdout: args[0] === 'cat' ? Buffer.from('package bytes') : Buffer.alloc(0), stderr: '' }
+      const downloadsObject = args[0] === 'cp' && args[1]?.startsWith('oss://')
+      if (calls.length === 1 && downloadsObject) throw new Error('NoSuchKey: object does not exist')
+      if (downloadsObject) await writeFile(args[2], Buffer.from('package bytes'))
+      return { stdout: Buffer.from('0.123(s) elapsed\n'), stderr: '' }
     }
     const storage = createOssutilStorage({
       bucket: 'cyunlab-public-releases',
@@ -564,11 +566,14 @@ describe('Stable update promotion', () => {
     ]))
     expect(calls[1].args).not.toContain('--force')
     expect(calls[2].args).toEqual([
-      'cat',
+      'cp',
       'oss://cyunlab-public-releases/dsh-desktop/releases/2.1.0/linux-x86_64/package',
+      expect.any(String),
+      '--force',
       '--config-file',
       calls[2].configFile
     ])
+    await expect(stat(calls[2].args[2])).rejects.toThrow()
     expect(calls[3].args).toEqual(expect.arrayContaining([
       'cp',
       'oss://cyunlab-public-releases/dsh-desktop/channels/stable/latest.json',
@@ -600,7 +605,8 @@ describe('Stable update promotion', () => {
     /** 模拟已存在的 immutable OSS 对象。 */
     const runOssutil = async (args: string[]): Promise<OssutilResult> => {
       commands.push(args)
-      return { stdout: Buffer.from('existing bytes'), stderr: '' }
+      await writeFile(args[2], Buffer.from('existing bytes'))
+      return { stdout: Buffer.from('0.123(s) elapsed\n'), stderr: '' }
     }
     const storage = createOssutilStorage({
       bucket: 'cyunlab-public-releases',
@@ -619,7 +625,7 @@ describe('Stable update promotion', () => {
     await expect(storage.ensureObject('dsh-desktop/releases/2.1.0/package', Buffer.from('different bytes'), {
       cacheControl: 'public, max-age=31536000, immutable'
     })).rejects.toThrow('immutable OSS object already exists with different bytes')
-    expect(commands.every(args => args[0] === 'cat')).toBe(true)
+    expect(commands.every(args => args[0] === 'cp' && args[1]?.startsWith('oss://'))).toBe(true)
   })
 
 })

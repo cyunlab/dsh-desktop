@@ -242,8 +242,10 @@ describe('one-time first-updater Stable bootstrap', () => {
         return new Response(init?.method === 'DELETE' ? null : '', { status: init?.method === 'DELETE' ? 204 : 200 })
       },
       runOssutil: async args => {
-        expect(args[0]).toBe('cat')
-        return { stdout: owner, stderr: '' }
+        expect(args[0]).toBe('cp')
+        expect(args[1]).toContain('oss://release-bucket/')
+        await writeFile(args[2], owner)
+        return { stdout: Buffer.from('0.123(s) elapsed\n'), stderr: '' }
       }
     })
     const key = 'dsh-desktop/channels/stable/promotion.lock'

@@ -181,12 +181,21 @@ export function createOssutilStorage(options) {
       }
     })
   }
-  /** 读取 OSS 对象的原始字节。 */
+  /** 下载 OSS 对象到隔离临时文件，避免 ossutil 的 stdout 计时文本污染对象字节。 */
   async function readObject(key) {
-    return withOssutilConfig(configFile => runOssutil(
-      ['cat', objectUri(key), '--config-file', configFile],
-      { env: commandEnvironment }
-    )).then(result => Buffer.from(result.stdout))
+    const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'dsh-oss-read-'))
+    const destination = path.join(temporaryDirectory, 'object')
+    try {
+      await chmod(temporaryDirectory, 0o700)
+      await withOssutilConfig(configFile => runOssutil(
+        ['cp', objectUri(key), destination, '--force', '--config-file', configFile],
+        { env: commandEnvironment }
+      ))
+      await chmod(destination, 0o600)
+      return await readFile(destination)
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true })
+    }
   }
   /** 将内容写入临时文件后调用 ossutil cp。 */
   async function copyObject(key, body, metadata, allowOverwrite) {
