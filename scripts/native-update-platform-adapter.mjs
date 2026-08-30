@@ -167,6 +167,20 @@ export function linuxX11LaunchPlan(installationPath) {
   }
 }
 
+/** 从脱敏更新日志提取最新失败阶段，并识别无需等待自动重试的永久 HTTP 失败。 */
+export function nativeUpdaterFailureSummary(logBody) {
+  if (!Buffer.isBuffer(logBody) || logBody.length > UPDATE_LOG_BOUND) throw new Error('native updater log exceeds byte bound')
+  const records = logBody.toString('utf8').trim().split(/\r?\n/).flatMap(line => { try { return [JSON.parse(line)] } catch { return [] } })
+  const failure = records.findLast(record => record?.event === 'update-failed')
+  if (!failure) return undefined
+  const stage = ['check', 'download'].includes(failure.failure_stage) ? failure.failure_stage : 'unknown'
+  const status = Number.isInteger(failure.http_status) && failure.http_status >= 100 && failure.http_status <= 599 ? failure.http_status : undefined
+  return Object.freeze({
+    message: `native updater failed during ${stage} stage${status ? ` (HTTP ${status})` : ''}`,
+    permanent: status !== undefined && status >= 400 && status < 500 && ![408, 429].includes(status),
+  })
+}
+
 /** 递归列出普通文件，忽略 macOS bundle framework symlink。 */
 async function walkFiles(root) {
   const files = []
@@ -632,18 +646,22 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
   async function waitForStaged(_installation, options) {
     const candidateSignature = await readFile(options.candidateSignature, 'utf8')
     const deadline = Date.now() + 8 * 60 * 1000
+    let latestFailure
     while (Date.now() < deadline) {
       const [metadataBody, packageBytes, logBody] = await Promise.all([
         readFile(statePaths.stagedMetadata).catch(() => null),
         readFile(statePaths.stagedPackage).catch(() => null),
         readFile(statePaths.logFile).catch(() => null),
       ])
+      if (logBody) {
+        const failure = nativeUpdaterFailureSummary(logBody)
+        latestFailure = failure?.message ?? latestFailure
+        if (failure?.permanent) throw new Error(failure.message)
+      }
       if (metadataBody && packageBytes && logBody) {
-        if (metadataBody.length > OUTPUT_BOUND || logBody.length > UPDATE_LOG_BOUND) throw new Error('native updater state exceeds byte bound')
+        if (metadataBody.length > OUTPUT_BOUND) throw new Error('native updater state exceeds byte bound')
         const records = logBody.toString('utf8').trim().split(/\r?\n/).flatMap(line => { try { return [JSON.parse(line)] } catch { return [] } })
         const transitions = records.filter(record => record.event === 'update-transition' && record.version === options.candidateVersion)
-        const failure = records.find(record => record.event === 'update-failed')
-        if (failure) throw new Error(`native updater failed during ${failure.failure_stage ?? 'unknown'} stage`)
         if (transitions.length >= 3 && transitions.some(record => record.http_status === 200)) {
           verifyStagedCandidate(JSON.parse(metadataBody.toString('utf8')), packageBytes, {
             version: options.candidateVersion,
@@ -657,7 +675,7 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
       }
       await delay(1_000)
     }
-    throw new Error('candidate did not reach verified staged state')
+    throw new Error(latestFailure ?? 'candidate did not reach verified staged state')
   }
 
   /** 发出真实 Windows close、Linux X11 close 或 macOS 唯一主窗口 AXPress。 */

@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest'
 import {
   linuxX11LaunchPlan,
   nativeCloseCommandPlan,
+  nativeUpdaterFailureSummary,
   parseDesktopProcessRows,
   platformStatePaths,
   processEnvironmentContainsAppImage,
@@ -64,6 +65,22 @@ describe('native update platform adapter pure contracts', () => {
     expect(sessionScript).toContain('/usr/bin/openbox')
     expect(sessionScript).toContain('/usr/bin/wmctrl')
     expect(sessionScript).toContain('"$1"')
+  })
+
+  /** 脱敏日志必须让 OSS 4xx 永久失败快速可诊断，同时不泄露原始记录。 */
+  it('summarizes permanent updater HTTP failures', () => {
+    const log = Buffer.from([
+      JSON.stringify({ event: 'update-transition', version: '2.1.8' }),
+      JSON.stringify({ event: 'update-failed', failure_stage: 'download', http_status: 403, ignored: '/Users/secret' }),
+    ].join('\n'))
+    expect(nativeUpdaterFailureSummary(log)).toEqual({
+      message: 'native updater failed during download stage (HTTP 403)',
+      permanent: true,
+    })
+    expect(nativeUpdaterFailureSummary(Buffer.from('{"event":"update-failed","failure_stage":"check","http_status":503}'))).toEqual({
+      message: 'native updater failed during check stage (HTTP 503)',
+      permanent: false,
+    })
   })
 
   /** Desktop 进程枚举必须绑定 exact executable，不能把相似路径或旧 PID 当成本次启动。 */

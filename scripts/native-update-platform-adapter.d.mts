@@ -24,6 +24,12 @@ export function linuxX11LaunchPlan(installationPath: string): {
   readonly display: string
 }
 
+/** 从脱敏更新日志提取最新失败阶段，并识别无需等待自动重试的永久 HTTP 失败。 */
+export function nativeUpdaterFailureSummary(logBody: Buffer): {
+  readonly message: string
+  readonly permanent: boolean
+} | undefined
+
 /** 从 ps 的 PID + command 行中只选 exact executable 及其参数。 */
 export function parseDesktopProcessRows(output: string, executable: string): number[]
 
