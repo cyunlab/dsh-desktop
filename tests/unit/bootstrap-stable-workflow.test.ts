@@ -24,6 +24,11 @@ describe('first-updater bootstrap promotion workflow', () => {
     expect(workflow).not.toContain('signing_configured: true')
   })
 
+  /** reusable bootstrap evidence workflow 必须由 caller 显式授予 attestation 所需权限。 */
+  it('grants the reusable bootstrap evidence workflow its required attestation permissions', () => {
+    expect(workflow).toMatch(/bootstrap-native-smoke:\n[\s\S]*?permissions:\n      contents: read\n      id-token: write\n      attestations: write\n    uses: \.\/\.github\/workflows\/bootstrap-update-smoke\.yml/)
+  })
+
   /** 显式输入贯穿 candidate preparation、evidence 和 finalization，Stable 仍是最后写入。 */
   it('binds the approved tag version and commit through prepare and finalize', () => {
     expect(workflow).toContain('--prepare-bootstrap')

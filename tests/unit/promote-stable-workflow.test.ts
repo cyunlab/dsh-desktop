@@ -37,12 +37,12 @@ describe('Stable promotion workflow contract', () => {
     expect(credentials).toBeGreaterThan(validation)
   })
 
-  /** 确保只有 candidate preparation 与最终 promotion 两个 production job 可交换 OIDC。 */
-  it('scopes OIDC to the two production OSS jobs', () => {
+  /** OSS 凭证只在两个 production job 交换；第三个 OIDC 权限只供 reusable evidence 生成 attestation。 */
+  it('scopes OIDC to production OSS jobs and reusable evidence attestation', () => {
     expect(workflow).toMatch(/^permissions:\n  contents: read$/m)
     expect(workflow).toMatch(/prepare-candidate:[\s\S]*environment: production[\s\S]*permissions:\n      contents: read\n      id-token: write/)
     expect(workflow).toMatch(/promote-stable:[\s\S]*environment: production[\s\S]*permissions:\n      contents: read\n      id-token: write/)
-    expect(workflow.match(/id-token: write/g)).toHaveLength(2)
+    expect(workflow.match(/id-token: write/g)).toHaveLength(3)
   })
 
   /** 确保四个真实原生目标消费隔离 candidate，聚合 gate 严格先于最终 OIDC。 */
@@ -71,6 +71,11 @@ describe('Stable promotion workflow contract', () => {
     expect(candidateBinding).toBeGreaterThan(finalJob)
     expect(finalCredentials).toBeGreaterThan(candidateBinding)
     expect(stableWrite).toBeGreaterThan(finalCredentials)
+  })
+
+  /** reusable evidence workflow 必须由 caller 显式授予 attestation 所需权限，否则 GitHub 会在调度前拒绝整个调用图。 */
+  it('grants the reusable native evidence workflow its required attestation permissions', () => {
+    expect(workflow).toMatch(/native-update-smoke:\n[\s\S]*?permissions:\n      contents: read\n      id-token: write\n      attestations: write\n    uses: \.\/\.github\/workflows\/update-smoke\.yml/)
   })
 
   /** 确保 release.published 先生成 candidate，且 candidate 阶段没有 Stable 写入入口。 */
