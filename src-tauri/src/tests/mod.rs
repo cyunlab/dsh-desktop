@@ -4,10 +4,9 @@ use super::{
     is_finished_page_load, is_packaged_startup_url, is_packaged_update_url,
     navigation_event_matches, parse_loopback_address, probe_client_page_with_timeout,
     retry_allowed, retry_input_for_snapshot, should_prevent_external_exit,
-    shutdown_installs_staged,
-    trusted_update_command_source, DiagnosticCode, ExitReason, HttpResponseState,
-    LifecycleSnapshot, LifecycleState, NavigationDecision, PageLoadEvent, ProcessObservation,
-    RuntimeState, ShutdownSource, HTTP_BODY_CAP,
+    shutdown_installs_staged, trusted_update_command_source, DiagnosticCode, ExitReason,
+    HttpResponseState, LifecycleSnapshot, LifecycleState, NavigationDecision, PageLoadEvent,
+    ProcessObservation, RuntimeState, ShutdownSource, HTTP_BODY_CAP,
 };
 use crate::desktop_capabilities::app_update::{
     UpdateInput, UpdateOperation, UpdateSnapshot, UpdateState,
