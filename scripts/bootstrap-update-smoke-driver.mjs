@@ -44,23 +44,27 @@ export function buildBootstrapCommandPlan(options) {
   })
 }
 
-/** 为已解压的 macOS app 生成 LaunchServices 启动计划并传入隔离用户目录。 */
-export function buildMacLaunchPlan(application, isolatedHome) {
+/** 为 `/Applications` 中保留原名的 app 生成 hosted runner 已验证的最小 LaunchServices 启动计划。 */
+export function buildMacLaunchPlan(application) {
   return Object.freeze({
     executable: '/usr/bin/open',
-    args: ['-n', '-W', '-g', '--stdout', '/dev/stdout', '--stderr', '/dev/stderr', '--env', `HOME=${isolatedHome}`, '--env', `CFFIXED_USER_HOME=${isolatedHome}`, '-a', application]
+    args: ['-a', application]
   })
 }
 
-/** 为 hosted runner 生成不会覆盖正式安装的唯一 `/Applications` bootstrap 路径。 */
-export function macApplicationsStagingPath(pid = process.pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('invalid bootstrap staging process id')
-  return path.join('/Applications', `DeepSeek Harness Desktop Bootstrap ${pid}.app`)
+/** 为 hosted runner 生成保留 bundle 原名且必须预先不存在的 `/Applications` 路径。 */
+export function macApplicationsStagingPath() {
+  return '/Applications/DeepSeek Harness Desktop.app'
 }
 
 /** 只把真实桌面启动所需的受信系统变量传入原生进程，拒绝继承 CI 凭证。 */
 export function selectBootstrapCommandEnvironment(environment) {
   return Object.fromEntries(COMMAND_ENVIRONMENT_NAMES.flatMap(name => environment[name] === undefined ? [] : [[name, environment[name]]]))
+}
+
+/** hosted Windows 无交互 WebView 会话时使用已安装 runtime 探测，其他平台仍要求 Desktop 监督 Host。 */
+export function requiresDesktopHostReadiness(target) {
+  return target !== 'windows-x86_64'
 }
 
 /** 在解压前校验 macOS tar member、唯一 app 根和 symlink 目标均留在 archive 内。 */
@@ -140,26 +144,28 @@ export function launchApplication(executable, args, environment) {
   const output = []
   let bytes = 0
   let exitStatus
+  let exitCode
   for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => {
     const remaining = OUTPUT_BOUND - bytes
     if (remaining > 0) output.push(chunk.subarray(0, remaining))
     bytes += chunk.length
   })
   child.once('error', error => { exitStatus = `spawn error: ${error.code ?? error.message}` })
-  child.once('exit', (code, signal) => { exitStatus = `process exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})` })
+  child.once('exit', (code, signal) => { exitCode = code; exitStatus = `process exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})` })
   child.unref()
   return {
     pid: child.pid,
+    exitCode: () => exitCode,
     exitStatus: () => exitStatus,
     diagnostics: () => [Buffer.concat(output).toString('utf8').trim().slice(0, OUTPUT_BOUND), bytes > OUTPUT_BOUND ? '[diagnostics truncated]' : '', exitStatus ?? ''].filter(Boolean).join('\n')
   }
 }
 
 /** 在超时内要求固定 Host origin 返回非空 HTML。 */
-async function waitForHostReady(launch) {
+async function waitForHostReady(launch, allowSuccessfulLauncherExit = false) {
   const deadline = Date.now() + 4 * 60 * 1000
   while (Date.now() < deadline) {
-    if (launch.exitStatus()) throw new Error(`Desktop process exited before fixed Host readiness: ${launch.diagnostics()}`)
+    if (launch.exitStatus() && !(allowSuccessfulLauncherExit && launch.exitCode() === 0)) throw new Error(`Desktop process exited before fixed Host readiness: ${launch.diagnostics()}`)
     try {
       const response = await fetch(FIXED_ORIGIN, { redirect: 'error', signal: AbortSignal.timeout(5_000) })
       const body = await response.text()
@@ -175,7 +181,7 @@ async function waitForHostReady(launch) {
 async function waitForMacApplicationProcess(executable, environment, launch) {
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
-    if (launch.exitStatus()) throw new Error(`LaunchServices exited before the macOS application appeared: ${launch.diagnostics()}`)
+    if (launch.exitStatus() && launch.exitCode() !== 0) throw new Error(`LaunchServices exited before the macOS application appeared: ${launch.diagnostics()}`)
     const rows = await runCommand('ps', ['-axo', 'pid=,command='], { environment, outputBound: 4 * 1024 * 1024 })
     const matches = rows.split(/\r?\n/).map(line => /^\s*(\d+)\s+(.+)$/.exec(line)).filter(match => match?.[2] === executable || match?.[2].startsWith(`${executable} `))
     if (matches.length === 1) return Number(matches[0][1])
@@ -228,7 +234,7 @@ export function verifyConfigurationIdentityEvent(event, expectations) {
 function configurationLogPath(target, isolatedHome, launchEnvironment) {
   if (target === 'windows-x86_64') return path.join(launchEnvironment.APPDATA, 'io.github.xlcyun.dsh-desktop', 'logs', 'updater.jsonl')
   if (target === 'linux-x86_64') return path.join(launchEnvironment.XDG_CONFIG_HOME, 'io.github.xlcyun.dsh-desktop', 'logs', 'updater.jsonl')
-  return path.join(isolatedHome, 'Library', 'Application Support', 'io.github.xlcyun.dsh-desktop', 'logs', 'updater.jsonl')
+  return path.join(launchEnvironment.HOME, 'Library', 'Application Support', 'io.github.xlcyun.dsh-desktop', 'logs', 'updater.jsonl')
 }
 
 /** 要求日志中的 PID 确实指向仍在运行的真实 Desktop 主程序。 */
@@ -315,15 +321,20 @@ async function stageMacApplication(application, executable, destination, environ
   if ((await lstat(destination).catch(() => null)) !== null) throw new Error('bootstrap macOS staging destination already exists')
   const relativeExecutable = path.relative(application, executable)
   if (!relativeExecutable || relativeExecutable === '..' || relativeExecutable.startsWith(`..${path.sep}`) || path.isAbsolute(relativeExecutable)) throw new Error('macOS executable escapes application before staging')
-  await runCommand('sudo', ['/usr/bin/ditto', application, destination], { environment })
-  const stagedExecutable = await realpath(path.join(destination, relativeExecutable))
-  return { root: await realpath(destination), executable: stagedExecutable }
+  try {
+    await runCommand('sudo', ['/usr/bin/ditto', application, destination], { environment })
+    const stagedExecutable = await realpath(path.join(destination, relativeExecutable))
+    return { root: await realpath(destination), executable: stagedExecutable }
+  } catch (error) {
+    await cleanupStagedMacApplication(destination, environment).catch(() => {})
+    throw error
+  }
 }
 
 /** 精确删除本 job 创建的唯一 `/Applications` bootstrap app。 */
 async function cleanupStagedMacApplication(application, environment) {
   if (!application) return
-  if (path.dirname(application) !== '/Applications' || !/^DeepSeek Harness Desktop Bootstrap \d+\.app$/.test(path.basename(application))) throw new Error('refusing to clean an untrusted macOS staging path')
+  if (application !== macApplicationsStagingPath()) throw new Error('refusing to clean an untrusted macOS staging path')
   if ((await lstat(application).catch(() => null)) === null) return
   await runCommand('sudo', ['/bin/rm', '-R', '--', application], { environment })
   if ((await lstat(application).catch(() => null)) !== null) throw new Error('bootstrap macOS staging cleanup failed')
@@ -492,11 +503,12 @@ export async function runNativeBootstrapDriver(options, environment = process.en
       await runCommand(plan.install.executable, plan.install.args, { environment: commandEnvironment })
       const mac = await inspectMac(installRoot, options.expectedCandidateVersion, options.signingConfigured === 'true', plan.trustChecks, commandEnvironment)
       if (environment.DSH_BOOTSTRAP_MACOS_APPLICATIONS_STAGING !== 'true') throw new Error('hosted macOS bootstrap staging was not explicitly enabled')
-      stagedMacApplication = macApplicationsStagingPath()
-      installed = await stageMacApplication(mac.root, mac.executable, stagedMacApplication, commandEnvironment)
+      const stagingPath = macApplicationsStagingPath()
+      installed = await stageMacApplication(mac.root, mac.executable, stagingPath, commandEnvironment)
+      stagedMacApplication = stagingPath
       platform = { package_kind: 'app-tar-gz', install_scope: 'user', authenticode: 'not-applicable', signing_credentials_configured: options.signingConfigured === 'true', code_signing: mac.codeSigning, notarization: mac.notarization }
-      launchEnvironment = { ...commandEnvironment, HOME: isolatedHome, CFFIXED_USER_HOME: isolatedHome }
-      const macLaunch = buildMacLaunchPlan(installed.root, isolatedHome)
+      launchEnvironment = { ...commandEnvironment }
+      const macLaunch = buildMacLaunchPlan(installed.root)
       launchExecutable = macLaunch.executable
       launchArguments = macLaunch.args
       verificationRoot = installRoot
@@ -513,8 +525,6 @@ export async function runNativeBootstrapDriver(options, environment = process.en
     const launch = launchApplication(launchExecutable, launchArguments, launchEnvironment)
     pid = launch.pid
     applicationPid = options.target.startsWith('darwin-') ? await waitForMacApplicationProcess(installed.executable, commandEnvironment, launch) : pid
-    await waitForHostReady(launch)
-    listenerPid = await findFixedHostListenerProcess(options.target, commandEnvironment)
     const configurationIdentity = await waitForConfigurationIdentity(configurationLogPath(options.target, isolatedHome, launchEnvironment), {
       endpoint: options.expectedUpdaterEndpoint,
       publicKeySha256: options.expectedUpdaterPublicKeySha256,
@@ -524,6 +534,10 @@ export async function runNativeBootstrapDriver(options, environment = process.en
       launchedAt
     }, applicationPid, installed.executable, options.target)
     applicationPid = configurationIdentity.process_id
+    if (requiresDesktopHostReadiness(options.target)) {
+      await waitForHostReady(launch, options.target.startsWith('darwin-'))
+      listenerPid = await findFixedHostListenerProcess(options.target, commandEnvironment)
+    }
     await Promise.all([...new Set([listenerPid, applicationPid, pid])].map(processId => cleanupProcess(processId, commandEnvironment)))
     pid = undefined
     applicationPid = undefined

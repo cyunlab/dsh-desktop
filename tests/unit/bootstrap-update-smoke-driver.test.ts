@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildBootstrapCommandPlan, buildMacLaunchPlan, combineBootstrapFailure, launchApplication, macApplicationsStagingPath, normalizeWindowsRegistryPath, parseListenerProcessId, runCommand, selectBootstrapCommandEnvironment, verifyConfigurationIdentityEvent, verifyMacArchiveListing, verifyTauriUpdaterSignature, verifyWindowsInstallationRecord } from '../../scripts/bootstrap-update-smoke-driver.mjs'
+import { buildBootstrapCommandPlan, buildMacLaunchPlan, combineBootstrapFailure, launchApplication, macApplicationsStagingPath, normalizeWindowsRegistryPath, parseListenerProcessId, requiresDesktopHostReadiness, runCommand, selectBootstrapCommandEnvironment, verifyConfigurationIdentityEvent, verifyMacArchiveListing, verifyTauriUpdaterSignature, verifyWindowsInstallationRecord } from '../../scripts/bootstrap-update-smoke-driver.mjs'
 
 describe('native bootstrap driver command-plan seam', () => {
   /** 原生进程静默退出时仍保留 code/signal，避免 readiness 超时丢失根因。 */
@@ -63,17 +63,17 @@ describe('native bootstrap driver command-plan seam', () => {
     ])
   })
 
-  /** macOS GUI app 通过 LaunchServices 启动，并把隔离 HOME 显式传给真实 app。 */
-  it('plans a waiting background LaunchServices launch for the extracted app', () => {
-    expect(buildMacLaunchPlan('/tmp/install/Desktop.app', '/tmp/home')).toEqual({
+  /** macOS GUI app 保留 bundle 原名，并按 hosted runner 已验证的最小参数交给 LaunchServices。 */
+  it('plans the minimal hosted-runner LaunchServices invocation', () => {
+    expect(buildMacLaunchPlan('/Applications/DeepSeek Harness Desktop.app')).toEqual({
       executable: '/usr/bin/open',
-      args: ['-n', '-W', '-g', '--stdout', '/dev/stdout', '--stderr', '/dev/stderr', '--env', 'HOME=/tmp/home', '--env', 'CFFIXED_USER_HOME=/tmp/home', '-a', '/tmp/install/Desktop.app']
+      args: ['-a', '/Applications/DeepSeek Harness Desktop.app']
     })
   })
 
-  /** hosted macOS staging 名称唯一且固定在 `/Applications`，listener 只接受一个 PID。 */
-  it('builds a scoped macOS staging path and parses one listener process', () => {
-    expect(macApplicationsStagingPath(1234)).toBe('/Applications/DeepSeek Harness Desktop Bootstrap 1234.app')
+  /** hosted macOS staging 保留 bundle 原名并固定在 `/Applications`，listener 只接受一个 PID。 */
+  it('builds the original macOS staging path and parses one listener process', () => {
+    expect(macApplicationsStagingPath()).toBe('/Applications/DeepSeek Harness Desktop.app')
     expect(parseListenerProcessId('p4321\n')).toBe(4321)
     expect(parseListenerProcessId('4321\r\n')).toBe(4321)
     expect(() => parseListenerProcessId('p1\np2\n')).toThrow('ambiguous')
@@ -99,6 +99,13 @@ describe('native bootstrap driver command-plan seam', () => {
       APPDATA: 'C:\\Users\\runner\\AppData\\Roaming', LOCALAPPDATA: 'C:\\Users\\runner\\AppData\\Local',
       ProgramData: 'C:\\ProgramData'
     })
+  })
+
+  /** Windows hosted runner 由已安装 runtime 探测 Host，其余平台仍要求真实 Desktop 监督 Host。 */
+  it('requires Desktop-supervised Host readiness outside hosted Windows', () => {
+    expect(requiresDesktopHostReadiness('windows-x86_64')).toBe(false)
+    expect(requiresDesktopHostReadiness('linux-x86_64')).toBe(true)
+    expect(requiresDesktopHostReadiness('darwin-aarch64')).toBe(true)
   })
 
   /** 不支持的平台或 runner 架构不能生成可执行计划。 */
