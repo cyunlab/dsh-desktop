@@ -90,13 +90,14 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-      - name: Install the Linux virtual display required by the real AppImage
+      - name: Install the Linux runtime and virtual display required by the real AppImage
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y xvfb
+          sudo apt-get install --no-install-recommends -y \
+            dbus-x11 libayatana-appindicator3-1 libwebkit2gtk-4.1-0 libxdo3 librsvg2-2 xvfb
       - name: Bind the approved tag to trusted default-branch history and a published Release
         shell: bash
         env:
