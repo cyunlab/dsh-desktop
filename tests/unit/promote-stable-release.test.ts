@@ -6,8 +6,6 @@ import {
   createOssutilStorage,
   finalizeStableCandidate,
   prepareStableCandidate,
-  promoteStableRelease,
-  runPromotionCli,
   verifyTauriSignature,
   type OssutilResult,
   type PromotionStorage
@@ -86,9 +84,21 @@ function seedPreviousStable(storage: ReturnType<typeof createStorage>) {
   })
 }
 
-/** 使用通过的密码学验证 seam 执行测试 promotion。 */
-function promoteFixture(options: Parameters<typeof promoteStableRelease>[0], storage: PromotionStorage) {
-  return promoteStableRelease(options, storage, { verifySignature: async () => {} })
+/** 仅通过生产 candidate prepare/finalize 协议执行测试 promotion。 */
+async function promoteFixture(
+  options: Omit<Parameters<typeof prepareStableCandidate>[0], 'candidateCommit'>,
+  storage: ReturnType<typeof createStorage>,
+  dependencies = { verifySignature: async (_artifactPath: string, _signaturePath: string) => {} }
+) {
+  if (!storage.writes.some(write => write.key.endsWith('/channels/stable/latest.json'))) seedPreviousStable(storage)
+  const candidate = await prepareStableCandidate({
+    ...options,
+    candidateCommit: '0123456789abcdef0123456789abcdef01234567'
+  }, storage, dependencies)
+  return finalizeStableCandidate(candidate, storage, {
+    prefix: options.prefix,
+    lockOwner: `test-run:1:${candidate.candidate_commit}`
+  })
 }
 
 describe('Stable update promotion', () => {
@@ -309,16 +319,15 @@ describe('Stable update promotion', () => {
           }
         }
       })
-      expect(storage.writes).toHaveLength(9)
-      expect(storage.writes.slice(0, 8).every(write => write.cacheControl === 'public, max-age=31536000, immutable')).toBe(true)
-      expect(storage.writes[1].key).toBe('dsh-desktop/releases/2.1.0/windows-x86_64/6db7805715b93f0d6e447c59cb476199f37623ed8c49664de1c9045ba338316a-dsh-desktop-windows-x86_64-updater.exe.sig')
+      const immutableWrites = storage.writes.filter(write => write.cacheControl === 'public, max-age=31536000, immutable')
+      expect(immutableWrites).toHaveLength(9)
+      expect(immutableWrites[1].key).toBe('dsh-desktop/releases/2.1.0/windows-x86_64/6db7805715b93f0d6e447c59cb476199f37623ed8c49664de1c9045ba338316a-dsh-desktop-windows-x86_64-updater.exe.sig')
       expect(storage.writes.at(-1)).toMatchObject({
         key: 'dsh-desktop/channels/stable/latest.json',
         cacheControl: 'no-cache'
       })
       expect(JSON.parse(storage.writes.at(-1)!.body.toString('utf8'))).toEqual(manifest)
-      expect(storage.events.at(-1)).toBe('replace:dsh-desktop/channels/stable/latest.json')
-      expect(storage.events.slice(8, 16).every(event => event.startsWith('read:'))).toBe(true)
+      expect(storage.events).toContain('replace:dsh-desktop/channels/stable/latest.json')
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
@@ -329,30 +338,33 @@ describe('Stable update promotion', () => {
     const directory = await createReleaseDirectory()
     const storage = createStorage()
     try {
-      const first = await promoteFixture({
+      seedPreviousStable(storage)
+      const first = await prepareStableCandidate({
         tag: 'v2.1.0',
         releaseBody: 'First publication',
         publishedAt: '2026-08-28T02:30:00Z',
         artifactsDirectory: directory,
         downloadOrigin: 'https://updates.cyunlab.com',
-        prefix: 'dsh-desktop'
-      }, storage)
+        prefix: 'dsh-desktop',
+        candidateCommit: '0123456789abcdef0123456789abcdef01234567'
+      }, storage, { verifySignature: async () => {} })
       await writeFile(path.join(directory, 'windows-x86_64', 'dsh-desktop-windows-x86_64-updater.exe'), Buffer.from([0x4d, 0x5a, 0x02, 0x03]))
       await writeFile(path.join(directory, 'windows-x86_64', 'dsh-desktop-windows-x86_64-updater.exe.sig'), 'changed-signature\n')
-      const second = await promoteFixture({
+      const second = await prepareStableCandidate({
         tag: 'v2.1.0',
         releaseBody: 'Corrected publication',
         publishedAt: '2026-08-28T03:30:00Z',
         artifactsDirectory: directory,
         downloadOrigin: 'https://updates.cyunlab.com',
-        prefix: 'dsh-desktop'
-      }, storage)
+        prefix: 'dsh-desktop',
+        candidateCommit: '89abcdef0123456789abcdef0123456789abcdef'
+      }, storage, { verifySignature: async () => {} })
 
-      expect(second.platforms['windows-x86_64'].url).not.toBe(first.platforms['windows-x86_64'].url)
+      expect(second.manifest.platforms['windows-x86_64'].url).not.toBe(first.manifest.platforms['windows-x86_64'].url)
       const windowsObjects = storage.writes.filter(write => write.key.includes('/windows-x86_64/'))
       expect(windowsObjects).toHaveLength(4)
       expect(new Set(windowsObjects.map(write => write.key)).size).toBe(4)
-      expect(storage.events.at(-1)).toBe('replace:dsh-desktop/channels/stable/latest.json')
+      expect(storage.events.some(event => event.startsWith('replace:'))).toBe(false)
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
@@ -377,7 +389,7 @@ describe('Stable update promotion', () => {
         downloadOrigin: 'https://updates.cyunlab.com',
         prefix: 'dsh-desktop'
       }, storage)).rejects.toThrow('remote object mismatch')
-      expect(storage.writes.some(write => write.key.endsWith('/channels/stable/latest.json'))).toBe(false)
+      expect(storage.events.some(event => event.startsWith('replace:'))).toBe(false)
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
@@ -403,7 +415,7 @@ describe('Stable update promotion', () => {
         downloadOrigin: 'https://updates.cyunlab.com',
         prefix: 'dsh-desktop'
       }, storage)).rejects.toThrow('OSS upload failed')
-      expect(storage.writes.some(write => write.key.endsWith('/channels/stable/latest.json'))).toBe(false)
+      expect(storage.events.some(event => event.startsWith('replace:'))).toBe(false)
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
@@ -433,7 +445,7 @@ describe('Stable update promotion', () => {
     const storage = createStorage()
     const verified: string[] = []
     try {
-      await expect(promoteStableRelease({
+      await expect(promoteFixture({
         tag: 'v2.1.0',
         releaseBody: 'Release notes',
         publishedAt: '2026-08-28T02:30:00Z',
@@ -447,7 +459,7 @@ describe('Stable update promotion', () => {
         }
       })).rejects.toThrow('invalid updater signature')
       expect(verified).toHaveLength(3)
-      expect(storage.events).toHaveLength(0)
+      expect(storage.events.some(event => event.startsWith('ensure:'))).toBe(false)
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
@@ -479,7 +491,7 @@ describe('Stable update promotion', () => {
         downloadOrigin: 'https://updates.cyunlab.com',
         prefix: 'dsh-desktop'
       }, storage)).rejects.toThrow('release tag is not a semantic version')
-      expect(storage.writes).toHaveLength(0)
+      expect(storage.events.some(event => event.startsWith('ensure:'))).toBe(false)
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
@@ -500,88 +512,6 @@ describe('Stable update promotion', () => {
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
-  })
-
-  /** 验证 published GitHub Release 与 STS 环境契约。 */
-  it('builds the promotion only from a published GitHub Release and short-lived STS credentials', async () => {
-    const directory = await createReleaseDirectory()
-    const eventFile = path.join(directory, 'event.json')
-    await writeFile(eventFile, JSON.stringify({
-      action: 'published',
-      repository: { full_name: 'cyunlab/dsh-desktop' },
-      release: {
-        draft: false,
-        tag_name: 'v2.1.0',
-        body: 'Notes from the published GitHub Release.',
-        published_at: '2026-08-28T02:30:00Z'
-      }
-    }))
-    let receivedOptions: Record<string, unknown> | undefined
-    let receivedStorage: PromotionStorage | undefined
-    try {
-      await runPromotionCli({
-        GITHUB_EVENT_PATH: eventFile,
-        GITHUB_REPOSITORY: 'cyunlab/dsh-desktop',
-        OSS_BUCKET: 'cyunlab-public-releases',
-        OSS_REGION: 'cn-shenzhen',
-        UPDATE_BASE_URL: 'https://updates.cyunlab.com',
-        TAURI_SIGNING_PUBLIC_KEY: 'RWQpublic',
-        PROMOTION_ARTIFACTS_DIR: directory,
-        ALIBABA_CLOUD_ACCESS_KEY_ID: 'temporary-id',
-        ALIBABA_CLOUD_ACCESS_KEY_SECRET: 'temporary-secret',
-        ALIBABA_CLOUD_SECURITY_TOKEN: 'temporary-session-token'
-      }, {
-        createStorage(options) {
-          expect(options).toMatchObject({
-            bucket: 'cyunlab-public-releases',
-            region: 'cn-shenzhen',
-            credentials: { accessKeyId: 'temporary-id', securityToken: 'temporary-session-token' }
-          })
-          receivedStorage = createStorage()
-          return receivedStorage
-        },
-        async promote(options, storage) {
-          receivedOptions = options as unknown as Record<string, unknown>
-          expect(storage).toBe(receivedStorage)
-          return { version: '2.1.0', notes: '', pub_date: '', platforms: {} }
-        }
-      })
-      expect(receivedOptions).toMatchObject({
-        tag: 'v2.1.0',
-        releaseBody: 'Notes from the published GitHub Release.',
-        publishedAt: '2026-08-28T02:30:00Z',
-        downloadOrigin: 'https://updates.cyunlab.com',
-        prefix: 'dsh-desktop'
-      })
-    } finally {
-      await rm(directory, { recursive: true, force: true })
-    }
-  })
-
-  /** 验证缺少 STS session token 时不读取其他输入。 */
-  it('refuses credentials without an STS session token', async () => {
-    await expect(runPromotionCli({
-      GITHUB_EVENT_PATH: '/not-read-with-invalid-credentials',
-      OSS_BUCKET: 'bucket',
-      OSS_REGION: 'cn-shenzhen',
-      UPDATE_BASE_URL: 'https://updates.cyunlab.com',
-      TAURI_SIGNING_PUBLIC_KEY: 'RWQpublic',
-      ALIBABA_CLOUD_ACCESS_KEY_ID: 'long-lived-id',
-      ALIBABA_CLOUD_ACCESS_KEY_SECRET: 'long-lived-secret'
-    })).rejects.toThrow('short-lived Alibaba Cloud STS credentials are required')
-  })
-
-  /** 验证缺少 updater 公钥时在读取 release 输入前 fail closed。 */
-  it('refuses promotion without the Tauri signing public key', async () => {
-    await expect(runPromotionCli({
-      GITHUB_EVENT_PATH: '/not-read-without-public-key',
-      OSS_BUCKET: 'bucket',
-      OSS_REGION: 'cn-shenzhen',
-      UPDATE_BASE_URL: 'https://updates.cyunlab.com',
-      ALIBABA_CLOUD_ACCESS_KEY_ID: 'temporary-id',
-      ALIBABA_CLOUD_ACCESS_KEY_SECRET: 'temporary-secret',
-      ALIBABA_CLOUD_SECURITY_TOKEN: 'temporary-token'
-    })).rejects.toThrow('TAURI_SIGNING_PUBLIC_KEY is required')
   })
 
   /** 验证 ossutil v1 临时配置、权限和凭据隔离。 */
@@ -692,37 +622,4 @@ describe('Stable update promotion', () => {
     expect(commands.every(args => args[0] === 'cat')).toBe(true)
   })
 
-  /** 验证 workflow 显式 CLI 参数无需读取 event 文件。 */
-  it('accepts the workflow CLI arguments without reading a GitHub event file', async () => {
-    const storage = createStorage()
-    let receivedOptions: Record<string, unknown> | undefined
-    await runPromotionCli({
-      OSS_BUCKET: 'cyunlab-public-releases',
-      OSS_REGION: 'cn-shenzhen',
-      UPDATE_BASE_URL: 'https://updates.cyunlab.com',
-      TAURI_SIGNING_PUBLIC_KEY: 'RWQpublic',
-      ALIBABA_CLOUD_ACCESS_KEY_ID: 'temporary-id',
-      ALIBABA_CLOUD_ACCESS_KEY_SECRET: 'temporary-secret',
-      ALIBABA_CLOUD_SECURITY_TOKEN: 'temporary-token'
-    }, {
-      createStorage: () => storage,
-      async promote(options) {
-        receivedOptions = options as unknown as Record<string, unknown>
-        return { version: '2.1.0', notes: '', pub_date: '', platforms: {} }
-      }
-    }, [
-      '--tag', 'v2.1.0',
-      '--notes', 'Published notes',
-      '--published-at', '2026-08-28T02:30:00Z',
-      '--assets', 'downloaded-artifacts',
-      '--prefix', 'dsh-desktop'
-    ])
-    expect(receivedOptions).toMatchObject({
-      tag: 'v2.1.0',
-      releaseBody: 'Published notes',
-      publishedAt: '2026-08-28T02:30:00Z',
-      artifactsDirectory: 'downloaded-artifacts',
-      prefix: 'dsh-desktop'
-    })
-  })
 })

@@ -28,7 +28,6 @@
     "test:behavior": "pnpm test && pnpm test:integration && pnpm test:e2e",
     "typecheck": "tsc --noEmit && pnpm --filter @cyunlab/dsh-desktop-capabilities typecheck && pnpm --filter @cyunlab/dsh-desktop-update-client typecheck",
     "release:tag": "node scripts/tag-release.mjs",
-    "release:promote": "node scripts/promote-stable-release.mjs",
     "verify:release-version": "node scripts/verify-release-version.mjs"
   },
   "devDependencies": {

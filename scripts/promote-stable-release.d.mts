@@ -172,22 +172,3 @@ export function runCandidateFinalizationCli(
   dependencies?: Record<string, unknown>,
   args?: string[]
 ): Promise<StableManifest>
-
-/** @deprecated 仅保留旧单元边界；生产 CLI 拒绝不带显式 candidate mode 的调用。 */
-export function runPromotionCli(
-  environment?: NodeJS.ProcessEnv,
-  dependencies?: {
-    readonly createStorage?: (options: OssutilStorageOptions) => PromotionStorage
-    readonly promote?: typeof promoteStableRelease
-    readonly verifySignature?: (artifactPath: string, signaturePath: string) => Promise<void>
-    readonly runMinisign?: MinisignRunner
-  },
-  args?: string[]
-): Promise<StableManifest>
-
-/** @deprecated 仅保留旧单元边界；生产 workflow 不得直接调用。 */
-export function promoteStableRelease(
-  options: PromotionOptions,
-  storage: PromotionStorage,
-  dependencies: { readonly verifySignature: (artifactPath: string, signaturePath: string) => Promise<void> }
-): Promise<StableManifest>

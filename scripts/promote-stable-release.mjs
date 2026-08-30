@@ -267,53 +267,6 @@ function parseArguments(args) {
   return values
 }
 
-/** 校验并读取 GitHub published Release event。 */
-async function readPublishedRelease(eventPath, repository) {
-  const event = JSON.parse(await readFile(eventPath, 'utf8'))
-  if (event.action !== 'published' || event.release?.draft !== false) throw new Error('only a published GitHub Release can enter Stable')
-  if (repository && event.repository?.full_name !== repository) throw new Error('GitHub Release repository does not match GITHUB_REPOSITORY')
-  return event.release
-}
-
-/** 解析 CLI/environment，创建 OSS 适配器并执行 Stable promotion。 */
-export async function runPromotionCli(environment = process.env, dependencies = {}, args = process.argv.slice(2)) {
-  const credentials = {
-    accessKeyId: environment.ALIBABA_CLOUD_ACCESS_KEY_ID,
-    accessKeySecret: environment.ALIBABA_CLOUD_ACCESS_KEY_SECRET,
-    securityToken: environment.ALIBABA_CLOUD_SECURITY_TOKEN
-  }
-  if (!credentials.accessKeyId || !credentials.accessKeySecret || !credentials.securityToken) {
-    throw new Error('short-lived Alibaba Cloud STS credentials are required')
-  }
-  if (!environment.OSS_BUCKET || !environment.OSS_REGION || !environment.UPDATE_BASE_URL) {
-    throw new Error('OSS_BUCKET, OSS_REGION, and UPDATE_BASE_URL are required')
-  }
-  if (!environment.TAURI_SIGNING_PUBLIC_KEY) throw new Error('TAURI_SIGNING_PUBLIC_KEY is required')
-  const values = parseArguments(args)
-  const prefix = values.prefix ?? 'dsh-desktop'
-  const release = values.tag && values.notes && values['published-at']
-    ? { tag_name: values.tag, body: values.notes, published_at: values['published-at'] }
-    : await readPublishedRelease(environment.GITHUB_EVENT_PATH, environment.GITHUB_REPOSITORY)
-  const createStorage = dependencies.createStorage ?? createOssutilStorage
-  const promote = dependencies.promote ?? promoteStableRelease
-  const verifySignature = dependencies.verifySignature
-    ?? ((artifactPath, signaturePath) => verifyTauriSignature(
-      artifactPath,
-      signaturePath,
-      environment.TAURI_SIGNING_PUBLIC_KEY,
-      dependencies.runMinisign
-    ))
-  const storage = createStorage({ bucket: environment.OSS_BUCKET, region: environment.OSS_REGION, prefix, credentials })
-  return promote({
-    tag: release.tag_name,
-    releaseBody: release.body,
-    publishedAt: release.published_at,
-    artifactsDirectory: values.assets ?? environment.PROMOTION_ARTIFACTS_DIR ?? 'artifacts',
-    downloadOrigin: environment.UPDATE_BASE_URL,
-    prefix
-  }, storage, { verifySignature })
-}
-
 /** 构造完成密码学验证的四目标 manifest 与不可变发布对象。 */
 async function buildReleaseBundle(options, dependencies) {
   const version = releaseVersion(options.tag)
@@ -844,18 +797,6 @@ export async function runBootstrapFinalizationCli(environment = process.env, dep
     lockOwner: `${environment.GITHUB_RUN_ID ?? 'local'}:${environment.GITHUB_RUN_ATTEMPT ?? '0'}:${candidate.candidate_commit}`,
     ...approval
   }, { verifyEvidence: dependencies.verifyEvidence })
-}
-
-/** 提升一个完整的四目标更新发布，并返回写入 Stable channel 的 manifest。 */
-export async function promoteStableRelease(options, storage, dependencies = {}) {
-  const bundle = await buildReleaseBundle(options, dependencies)
-  await publishImmutableObjects(bundle.objects, storage)
-  await storage.replaceObject(
-    `${bundle.prefix}/channels/stable/latest.json`,
-    Buffer.from(`${JSON.stringify(bundle.manifest, null, 2)}\n`),
-    { cacheControl: 'no-cache', contentType: 'application/json; charset=utf-8' }
-  )
-  return bundle.manifest
 }
 
 /** 运行发布器 CLI，日志仅包含公开版本信息。 */

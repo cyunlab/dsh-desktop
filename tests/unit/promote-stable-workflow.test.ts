@@ -4,6 +4,16 @@ import { describe, expect, it } from 'vitest'
 const workflow = (await readFile(new URL('../../.github/workflows/promote-stable.yml', import.meta.url), 'utf8')).replaceAll('\r\n', '\n')
 
 describe('Stable promotion workflow contract', () => {
+  /** 发布边界只能暴露显式的 candidate prepare/finalize 协议。 */
+  it('does not expose the legacy direct Stable promotion entrypoint', async () => {
+    const manifest = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'))
+    const publisher = await import('../../scripts/promote-stable-release.mjs')
+
+    expect(manifest.scripts).not.toHaveProperty('release:promote')
+    expect(publisher).not.toHaveProperty('runPromotionCli')
+    expect(publisher).not.toHaveProperty('promoteStableRelease')
+  })
+
   /** 确保只有正式发布事件能够触发 Stable promotion。 */
   it('runs only after a GitHub Release is published', () => {
     expect(workflow).toMatch(/^on:\n  release:\n    types: \[published\]/m)
