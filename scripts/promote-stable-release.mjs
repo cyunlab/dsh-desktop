@@ -151,23 +151,42 @@ export async function verifyTauriSignature(artifactPath, signaturePath, publicKe
   }
 }
 
-/** 以无 shell 子进程运行 ossutil，并仅收集命令结果。 */
+const OSSUTIL_OUTPUT_BOUND = 128 * 1024
+
+/** 以无 shell子进程运行 ossutil，并有界保留 stdout/stderr 的真实失败诊断。 */
 export function runOssutilCommand(args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn('ossutil', args, {
+    const child = spawn(options.executable ?? 'ossutil', args, {
       env: options.env,
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true
     })
     const stdout = []
-    let stderr = ''
-    child.stdout.on('data', chunk => stdout.push(chunk))
-    child.stderr.on('data', chunk => { stderr += chunk })
+    const stderr = []
+    let outputBytes = 0
+    let outputExceeded = false
+    /** 累计单个输出块，并在合计超过证据上限时终止子进程。 */
+    function capture(target, chunk) {
+      outputBytes += chunk.length
+      if (outputBytes > OSSUTIL_OUTPUT_BOUND) {
+        outputExceeded = true
+        child.kill()
+      } else {
+        target.push(chunk)
+      }
+    }
+    child.stdout.on('data', chunk => capture(stdout, chunk))
+    child.stderr.on('data', chunk => capture(stderr, chunk))
     child.once('error', reject)
     child.once('exit', code => {
-      if (code !== 0) reject(new Error(`ossutil exited ${code}: ${stderr.trim()}`))
-      else resolve({ stdout: Buffer.concat(stdout), stderr })
+      const stdoutBody = Buffer.concat(stdout)
+      const stderrBody = Buffer.concat(stderr).toString('utf8')
+      if (outputExceeded) reject(new Error('ossutil output exceeded the diagnostic bound'))
+      else if (code !== 0) {
+        const diagnostic = [stderrBody.trim(), stdoutBody.toString('utf8').trim()].filter(Boolean).join('\n').slice(0, 4096)
+        reject(new Error(`ossutil exited ${code}: ${diagnostic}`))
+      } else resolve({ stdout: stdoutBody, stderr: stderrBody })
     })
   })
 }
