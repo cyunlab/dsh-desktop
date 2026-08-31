@@ -5,14 +5,16 @@ import { describe, expect, it } from 'vitest'
 const operationsGuideUrl = new URL('../../docs/update-release-operations.md', import.meta.url)
 
 describe('automatic update release operations guide', () => {
-  // 验证维护者能从手册中找到生产资源与已完成的一次性 bootstrap 身份。
+  // 验证维护者能从手册中找到生产资源、当前 Stable 与永久审计凭据。
   it('documents the verified infrastructure and current updater Stable', () => {
     const guide = readFileSync(operationsGuideUrl, 'utf8')
 
     expect(guide).toContain('protected GitHub Actions diagnostic verified')
-    expect(guide).toContain('v2.1.5')
-    expect(guide).toContain('first-updater bootstrap completed')
+    expect(guide).toContain('v2.1.11')
+    expect(guide).toContain('33367060346')
+    expect(guide).toContain('7155061849558db113b6d059fa21b9a3969aacc2386cb4d10c8a08b603a71c68')
     expect(guide).toContain('abb51c70fc12cfbc67e694e0805481f8cd16d89c2278818b403e3f4ed12cd455')
+    expect(guide).toContain('f919e61e61a5375f697bcba78237042aa73d4ecca399e50a2f947ef99510b3df')
     expect(guide).not.toContain('installed clients are not yet on the automatic-update channel')
     expect(guide).toContain('cn-shenzhen')
     expect(guide).toContain('dsh-desktop/')
@@ -66,7 +68,7 @@ describe('automatic update release operations guide', () => {
   it('separates build signing access from promotion cloud identity', () => {
     const guide = readFileSync(operationsGuideUrl, 'utf8')
 
-    expect(guide).toContain('In the normal path, exactly two OSS jobs consume Alibaba Cloud OIDC provider/role variables')
+    expect(guide).toContain('Exactly two OSS jobs consume Alibaba Cloud OIDC provider/role variables')
     expect(guide).toContain('`prepare-candidate` may write only content-addressed immutable objects')
     expect(guide).toContain('Native smoke jobs receive no id-token permission')
     expect(guide).toContain('Evidence admission jobs may use GitHub\'s token to verify artifact attestations')
