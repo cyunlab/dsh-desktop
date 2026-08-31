@@ -5,41 +5,10 @@ export interface PromotionStorage {
   replaceObject(key: string, body: Buffer, metadata: ObjectMetadata): Promise<void>
   /** 读取远端对象的原始字节。 */
   readObject(key: string): Promise<Buffer>
-  /** 列出指定应用前缀下的对象键。 */
-  listObjects?(prefix: string): Promise<readonly string[]>
   /** 使用 OSS AppendObject(position=0) 原子获取全局 Stable promotion lock。 */
   acquirePromotionLock?(key: string, ownerBody: Buffer): Promise<void>
   /** 仅在 owner bytes 仍一致时释放全局 Stable promotion lock。 */
   releasePromotionLock?(key: string, ownerBody: Buffer): Promise<void>
-}
-
-export interface BootstrapStableCandidate {
-  readonly schema_version: 1
-  readonly bootstrap_kind: 'first-updater-stable'
-  readonly candidate_tag: string
-  readonly candidate_version: string
-  readonly candidate_commit: string
-  readonly legacy_stable_version: string
-  readonly legacy_stable_manifest_sha256: string
-  readonly manifest_url: string
-  readonly manifest_sha256: string
-  readonly manifest: StableManifest
-}
-
-export interface UpdaterStableRecoveryCandidate {
-  readonly schema_version: 1
-  readonly bootstrap_kind: 'broken-updater-stable-recovery'
-  readonly candidate_tag: string
-  readonly candidate_version: string
-  readonly candidate_commit: string
-  readonly broken_stable_version: string
-  readonly broken_stable_manifest_sha256: string
-  readonly prior_bootstrap_receipt_key: string
-  readonly prior_bootstrap_receipt_sha256: string
-  readonly failed_promotion_run_id: string
-  readonly manifest_url: string
-  readonly manifest_sha256: string
-  readonly manifest: StableManifest
 }
 
 export interface ObjectMetadata { readonly cacheControl: string; readonly contentType?: string }
@@ -126,107 +95,6 @@ export function finalizeStableCandidate(
   storage: PromotionStorage,
   options: { readonly prefix?: string; readonly lockOwner: string }
 ): Promise<StableManifest>
-
-/** 准备一次性首个 updater Stable candidate，但不创建 receipt 或写 Stable。 */
-export function prepareBootstrapStableCandidate(
-  options: {
-    readonly approvedTag: string
-    readonly approvedVersion: string
-    readonly approvedCommit: string
-    readonly approvedLegacyVersion: string
-    readonly approvedLegacyManifestSha256: string
-    readonly releaseBody?: string
-    readonly publishedAt?: string
-    readonly artifactsDirectory?: string
-    readonly downloadOrigin?: string
-    readonly prefix: string
-  },
-  storage: PromotionStorage,
-  dependencies?: Readonly<Record<string, unknown>>
-): Promise<BootstrapStableCandidate>
-
-/** 验证真实 bootstrap evidence，先写 receipt 并复读，再最后写 Stable。 */
-export function finalizeBootstrapStableCandidate(
-  candidate: BootstrapStableCandidate,
-  storage: PromotionStorage,
-  options: {
-    readonly prefix: string
-    readonly evidenceDirectory: string
-    readonly maxAgeHours: number
-    readonly now?: Date
-    readonly approvedTag?: string
-    readonly approvedVersion?: string
-    readonly approvedCommit?: string
-    readonly approvedLegacyVersion?: string
-    readonly approvedLegacyManifestSha256?: string
-    readonly lockOwner: string
-  },
-  dependencies?: Readonly<Record<string, unknown>>
-): Promise<{ readonly manifest: StableManifest; readonly receipt_key: string; readonly receipt_sha256: string }>
-
-/** 准备一次性损坏 updater Stable recovery candidate。 */
-export function prepareUpdaterStableRecovery(
-  options: {
-    readonly approvedTag: string
-    readonly approvedVersion: string
-    readonly approvedCommit: string
-    readonly approvedCandidateManifestSha256: string
-    readonly approvedBrokenStableVersion: string
-    readonly approvedBrokenStableManifestSha256: string
-    readonly approvedPriorReceiptKey: string
-    readonly approvedPriorReceiptSha256: string
-    readonly approvedFailedPromotionRunId: string
-    readonly releaseBody?: string
-    readonly publishedAt?: string
-    readonly artifactsDirectory?: string
-    readonly downloadOrigin?: string
-    readonly prefix: string
-  },
-  storage: PromotionStorage,
-  dependencies?: Readonly<Record<string, unknown>>
-): Promise<UpdaterStableRecoveryCandidate>
-
-/** 复核 recovery evidence，receipt-first、Stable-last 完成一次性恢复。 */
-export function finalizeUpdaterStableRecovery(
-  candidate: UpdaterStableRecoveryCandidate,
-  storage: PromotionStorage,
-  options: {
-    readonly prefix: string
-    readonly evidenceDirectory: string
-    readonly maxAgeHours: number
-    readonly now?: Date
-    readonly lockOwner: string
-  },
-  dependencies?: Readonly<Record<string, unknown>>
-): Promise<{ readonly manifest: StableManifest; readonly receipt_key: string; readonly receipt_sha256: string }>
-
-/** 解析一次性 bootstrap preparation CLI。 */
-export function runBootstrapPreparationCli(
-  environment?: NodeJS.ProcessEnv,
-  dependencies?: Record<string, unknown>,
-  args?: string[]
-): Promise<BootstrapStableCandidate>
-
-/** 解析一次性 bootstrap finalization CLI。 */
-export function runBootstrapFinalizationCli(
-  environment?: NodeJS.ProcessEnv,
-  dependencies?: Record<string, unknown>,
-  args?: string[]
-): Promise<{ readonly manifest: StableManifest; readonly receipt_key: string; readonly receipt_sha256: string }>
-
-/** 解析一次性 updater recovery preparation CLI。 */
-export function runUpdaterRecoveryPreparationCli(
-  environment?: NodeJS.ProcessEnv,
-  dependencies?: Record<string, unknown>,
-  args?: string[]
-): Promise<UpdaterStableRecoveryCandidate>
-
-/** 解析一次性 updater recovery finalization CLI。 */
-export function runUpdaterRecoveryFinalizationCli(
-  environment?: NodeJS.ProcessEnv,
-  dependencies?: Record<string, unknown>,
-  args?: string[]
-): Promise<{ readonly manifest: StableManifest; readonly receipt_key: string; readonly receipt_sha256: string }>
 
 /** 解析 candidate preparation CLI。 */
 export function runCandidatePreparationCli(

@@ -2,7 +2,7 @@
 
 This runbook provisions and operates the production release path for Desktop automatic updates. It is intentionally fail-closed: immutable packages are uploaded and checked first, and `dsh-desktop/channels/stable/latest.json` is replaced only after every target passes validation.
 
-> **Current status (2026-08-31):** the Alibaba Cloud resources, prefix-scoped OIDC role, GitHub `production` Environment, DNS mapping, TLS certificate, certificate renewal task, and production updater signing key described below are provisioned. A protected GitHub Actions diagnostic verified the exact OIDC claims, temporary credential exchange, allowed `dsh-desktop/` access, denied bucket-root listing, and public HTTPS anchor. The v2.1.5 first-updater bootstrap completed and is the authoritative OSS Stable. Its immutable receipt digest is `abb51c70fc12cfbc67e694e0805481f8cd16d89c2278818b403e3f4ed12cd455`. Normal previous-Stable promotion now uses the real native close/quit update gate described below; the first v2.1.5-to-successor production run still has to be recorded before that path is declared verified.
+> **Current status (2026-08-31):** the Alibaba Cloud resources, prefix-scoped OIDC role, GitHub `production` Environment, DNS mapping, TLS certificate, certificate renewal task, and production updater signing key described below are provisioned. A protected GitHub Actions diagnostic verified the exact OIDC claims, temporary credential exchange, allowed `dsh-desktop/` access, denied bucket-root listing, and public HTTPS anchor. Recovery run `33363029014` established v2.1.10 as the healthy baseline. Normal promotion run `33367060346` attempt 2 then proved the real v2.1.10-to-v2.1.11 update on Windows x64, Linux x64 AppImage, macOS arm64, and macOS x64. OSS Stable is v2.1.11 with manifest SHA-256 `7155061849558db113b6d059fa21b9a3969aacc2386cb4d10c8a08b603a71c68`. The immutable bootstrap and recovery receipt digests are respectively `abb51c70fc12cfbc67e694e0805481f8cd16d89c2278818b403e3f4ed12cd455` and `f919e61e61a5375f697bcba78237042aa73d4ecca399e50a2f947ef99510b3df`; their temporary workflows and approval variables have been retired.
 
 ## Ownership boundary
 
@@ -27,7 +27,7 @@ Do not put private business data in this bucket. It is a shared public-release b
 
 ## Required GitHub Environment configuration
 
-Create an Environment named exactly `production`. Configure required reviewers or other deployment protection appropriate to the organization. Build matrix jobs may reference `production` only to read updater signing material and embed the trusted Stable endpoint/public key. In the normal path, exactly two OSS jobs consume Alibaba Cloud OIDC provider/role variables: `prepare-candidate` may write only content-addressed immutable objects and the isolated candidate manifest, while `promote-stable` runs only after aggregate evidence admission and may replace the Stable pointer. The separately dispatched one-time bootstrap likewise has only a preparation job and a final receipt/Stable job with OSS identity. Native smoke jobs receive no id-token permission. Evidence admission jobs may use GitHub's token to verify artifact attestations, but they must not consume Alibaba Cloud OIDC variables or receive Alibaba Cloud credentials.
+Create an Environment named exactly `production`. Configure required reviewers or other deployment protection appropriate to the organization. Build matrix jobs may reference `production` only to read updater signing material and embed the trusted Stable endpoint/public key. Exactly two OSS jobs consume Alibaba Cloud OIDC provider/role variables: `prepare-candidate` may write only content-addressed immutable objects and the isolated candidate manifest, while `promote-stable` runs only after aggregate evidence admission and may replace the Stable pointer. Native smoke jobs receive no id-token permission. Evidence admission jobs may use GitHub's token to verify artifact attestations, but they must not consume Alibaba Cloud OIDC variables or receive Alibaba Cloud credentials.
 
 Set these Environment variables exactly as shown:
 
@@ -39,22 +39,6 @@ Set these Environment variables exactly as shown:
 | `OSS_REGION` | `cn-shenzhen` |
 | `UPDATE_BASE_URL` | `https://updates.cyunlab.com` with no trailing slash |
 | `TAURI_SIGNING_PUBLIC_KEY` | Entire minisign public-key content used by promotion; it must exactly match the public key embedded in Desktop |
-| `UPDATER_BOOTSTRAP_TAG` | Exact one-time approved first-updater tag, for example `v2.1.0`; remove or retain read-only after bootstrap, but never repurpose |
-| `UPDATER_BOOTSTRAP_VERSION` | Exact semantic version matching `UPDATER_BOOTSTRAP_TAG` |
-| `UPDATER_BOOTSTRAP_COMMIT` | Exact 40-character lowercase Git commit resolved by the approved tag |
-| `UPDATER_BOOTSTRAP_LEGACY_VERSION` | Exact semantic version of the approved pre-updater OSS Stable anchor |
-| `UPDATER_BOOTSTRAP_LEGACY_MANIFEST_SHA256` | Lowercase SHA-256 of the byte-exact approved pre-updater OSS Stable anchor |
-| `UPDATER_BOOTSTRAP_MACOS_SIGNING_CONFIGURED` | Literal `true` requires Apple trust checks; literal `false` explicitly approves unsigned macOS; missing or any other value fails closed |
-| `UPDATER_RECOVERY_TAG` | Exact one-time approved broken-updater recovery tag; for the known incident, `v2.1.10` |
-| `UPDATER_RECOVERY_VERSION` | Exact semantic version matching `UPDATER_RECOVERY_TAG` |
-| `UPDATER_RECOVERY_COMMIT` | Exact 40-character lowercase Git commit resolved by the recovery tag |
-| `UPDATER_RECOVERY_MANIFEST_SHA256` | Lowercase SHA-256 of the byte-exact immutable recovery candidate manifest |
-| `UPDATER_RECOVERY_BROKEN_STABLE_VERSION` | Exact semantic version of the broken current Stable anchor |
-| `UPDATER_RECOVERY_BROKEN_STABLE_MANIFEST_SHA256` | Lowercase SHA-256 of the byte-exact broken Stable manifest |
-| `UPDATER_RECOVERY_PRIOR_RECEIPT_KEY` | Exact sole first-updater bootstrap receipt object key; its digest-prefixed filename must match the approved raw digest |
-| `UPDATER_RECOVERY_PRIOR_RECEIPT_SHA256` | Lowercase SHA-256 of the raw first-updater bootstrap receipt bytes |
-| `UPDATER_RECOVERY_FAILED_PROMOTION_RUN_ID` | Numeric GitHub Actions run ID that demonstrated the broken updater path |
-| `UPDATER_RECOVERY_MACOS_SIGNING_CONFIGURED` | Must be the literal `true`; recovery accepts only verified macOS signing and notarization evidence |
 
 Set these Environment secrets exactly as shown:
 
@@ -187,31 +171,13 @@ Release procedure:
 9. Final promotion atomically acquires `dsh-desktop/channels/stable/promotion.lock` through OSS `AppendObject(position=0)`. Its body binds the workflow run/attempt, candidate identity, and previously observed Stable digest. A 409 or 412 means another owner won and fails closed. While holding the lock, promotion re-reads both the immutable candidate manifest and authoritative Stable pointer. Either digest changing after candidate preparation fails closed and preserves the lock for investigation. The byte-identical candidate manifest is then written to `dsh-desktop/channels/stable/latest.json` after every other release mutation, read back byte-for-byte, and only then may the byte-identical lock owner delete the current lock marker.
 10. Independently fetch the manifest and all target URLs through `https://updates.cyunlab.com`. Verify HTTPS, version, release notes, RFC 3339 publication timestamp, literal signatures, cache headers, and a real update path on every target before recording production readiness.
 
-### Completed one-time first updater bootstrap
+### Retired first-updater bootstrap and recovery
 
-The legacy 2.0.17 Stable application was not built with the automatic updater and could not produce truthful previous-Stable-to-candidate evidence. The separately reviewed v2.1.5 first-updater bootstrap completed once without weakening the normal published-release verifier. OSS Stable now points to the byte-exact v2.1.5 candidate manifest.
+The one-time v2.1.5 first-updater bootstrap completed with immutable receipt `dsh-desktop/bootstrap/receipts/abb51c70fc12cfbc67e694e0805481f8cd16d89c2278818b403e3f4ed12cd455-first-updater-stable.json`. It truthfully proved only a fresh installation because legacy Stable 2.0.17 did not contain the updater.
 
-The completed workflow was manually dispatched against the exact approved tag, semantic version, 40-character lowercase Git commit, legacy Stable version, and legacy manifest digest. Both OSS-writing jobs used the GitHub `production` Environment and its required review. Its four hosted-runner jobs fresh-installed the published Windows x64 current-user NSIS EXE, Linux x64 AppImage, macOS arm64 archive, and macOS x64 archive before final admission.
+The v2.1.5 downloader later proved unable to stage any non-empty update because its temporary file cursor remained at EOF. Recovery run `33363029014` therefore admitted v2.1.10 as the healthy baseline with immutable receipt `dsh-desktop/recovery/receipts/f919e61e61a5375f697bcba78237042aa73d4ecca399e50a2f947ef99510b3df-broken-updater-stable.json`. This did not claim that existing v2.1.5 installations auto-upgraded; those installations require a manual v2.1.10-or-later install.
 
-The reusable bootstrap smoke workflow fresh-installs and launches the official published Windows x64 current-user NSIS EXE, Linux x64 AppImage, macOS arm64 archive, and macOS x64 archive. Its distinct `bootstrap-fresh-install` evidence proves package/signature/manifest identity, updater configuration, installed version, launch, Runtime closure, Official Node, Desktop capability package, update client, and composition patch. It explicitly records `claims_previous_stable_upgrade: false`. This evidence cannot pass `verify-update-smoke-evidence.mjs --require-real-native` and must never be described as 2.0.17 upgrade evidence.
-
-Finalization downloaded and reverified the attested four-target evidence, then exchanged the final OIDC identity. It wrote and byte-verified `dsh-desktop/bootstrap/receipts/abb51c70fc12cfbc67e694e0805481f8cd16d89c2278818b403e3f4ed12cd455-first-updater-stable.json`, re-read all admission inputs, and replaced `channels/stable/latest.json` last. The receipt binds the approved v2.1.5 tag/version/commit, candidate and legacy manifest digests, and exact evidence-set digest.
-
-Bootstrap finalization participates in the same global promotion lock as normal Stable promotion. It acquires the lock only after evidence admission and before receipt creation, then re-reads all admission inputs while holding it. Stable is the last release-content mutation; the owner verifies the resulting Stable bytes before releasing the lock.
-
-This workflow has been used exactly once and is permanently closed by its immutable receipt. Never change the retained approval identity, manually edit Stable, delete the receipt, or reuse bootstrap for a later release.
-
-### One-time broken-updater Stable recovery
-
-The first updater Stable, v2.1.5, downloads an update into a temporary file but stages it while the file cursor remains at EOF. The repaired v2.1.10 code cannot change the downloader already executing inside an installed v2.1.5 application. Existing v2.1.5 installations therefore require a manual v2.1.10-or-later installation; recovery cannot truthfully claim that they auto-upgraded.
-
-`recover-updater-stable.yml` is a separately reviewed, manual, one-time exception that establishes v2.1.10 as the healthy baseline for new and manually updated installations. Dispatch it only after setting every `UPDATER_RECOVERY_*` variable above to the reviewed incident identity. Preparation requires the protected candidate manifest digest and byte-exact v2.1.5 Stable/receipt anchors. Four GitHub-hosted runners must fresh-install the published v2.1.10 assets. Artifact attestations are restricted to the exact reusable workflow and workflow commit, and both macOS documents must record verified code signing and notarization.
-
-Recovery and normal promotion share the `stable-promotion` concurrency group and OSS promotion lock. Finalization rebinds the downloaded candidate artifact and protected variables before OIDC, then re-reads all admission inputs while holding the lock. It writes and byte-verifies one immutable `dsh-desktop/recovery/receipts/<sha256>-broken-updater-stable.json` object, re-reads the prior bootstrap receipt after that write, and replaces Stable last. Any existing recovery receipt, including a partial record, permanently blocks reuse.
-
-After recovery, publish a higher semantic version and require the ordinary four-target previous-Stable native update gate. A v2.1.10-to-successor run is the first production proof that automatic update is repaired. Only after that proof may the temporary bootstrap/recovery workflows and approval variables be removed; both immutable OSS receipts remain permanent audit records.
-
-Never manually edit Stable to point at a partly uploaded release. Never reuse a version path or overwrite an immutable package.
+Normal promotion run `33367060346` attempt 2 subsequently proved the real v2.1.10-to-v2.1.11 update on all four native targets and promoted Stable v2.1.11. The repository bootstrap/recovery workflows, drivers, and approval variables were then removed. Their ADRs, GitHub Actions logs, and immutable OSS receipts remain permanent audit records. Never recreate or reuse either one-time path, delete either receipt, manually edit Stable, reuse a version path, or overwrite an immutable package.
 
 ## Native automatic-update smoke evidence
 
@@ -236,9 +202,9 @@ Windows evidence additionally requires an NSIS EXE installed under the current u
 
 The updater endpoint is compiled into the published binary, so the native smoke must exercise the exact production Stable URL without changing the application. Each hosted runner installs a one-run temporary CA, maps only `updates.cyunlab.com` to a loopback HTTPS gate, and waits for the exact `/dsh-desktop/channels/stable/latest.json` request. Once that TLS connection exists, the harness restores the original hosts bytes and DNS state before releasing the byte-exact isolated candidate manifest. The package download therefore resolves the immutable OSS URL normally. Cleanup restores hosts byte-for-byte, removes only that temporary CA, closes the root port-443 helper, and preserves the primary failure if cleanup also fails.
 
-The long-lived repository driver installs the exact OSS-selected v2.1.5 package, verifies both baseline and candidate minisign signatures with the embedded public key, inspects runtime closure from both installed trees, and binds configuration identity to the unique exact installed process. It then observes staging, performs the platform-native window close, verifies the saved Host listener process tree has exited and the candidate replaced the same installation, proves exact Desktop process enumeration remains empty, and only then manually starts a new candidate PID. Fixture adapters remain `local-fixture` and cannot satisfy `--require-real-native`.
+The long-lived repository driver installs the exact package selected by the current OSS previous-Stable manifest, verifies both baseline and candidate minisign signatures with the embedded public key, inspects runtime closure from both installed trees, and binds configuration identity to the unique exact installed process. It then observes staging, performs the platform-native window close, verifies the saved Host listener process tree has exited and the candidate replaced the same installation, proves exact Desktop process enumeration remains empty, and only then manually starts a new candidate PID. Fixture adapters remain `local-fixture` and cannot satisfy `--require-real-native`.
 
-The retained bootstrap evidence admits only v2.1.5 fresh installation; it does not fabricate a 2.0.17 update lifecycle and cannot pass the normal verifier. The next published release is the first production proof of the new previous-Stable driver.
+Historical bootstrap evidence admits only v2.1.5 fresh installation; it does not fabricate a 2.0.17 update lifecycle and cannot pass the normal verifier. Promotion run `33367060346` attempt 2 is the first completed production proof of the normal previous-Stable driver.
 
 ## Failure handling and recovery
 
@@ -246,11 +212,11 @@ The retained bootstrap evidence admits only v2.1.5 fresh installation; it does n
 
 Leave the previous Stable manifest untouched. Diagnose and rerun the same immutable publication only if every existing content-addressed object is byte-for-byte identical to the expected object and its signature verifies. Different bytes use a different content-addressed key, but changing release contents after publication still requires a higher semantic version. Never overwrite or delete a released object.
 
-For the first-updater bootstrap, the rule is stricter. A failure before the receipt write may be retried only with the same approved tag, version, commit, byte-identical candidate, unchanged approved legacy Stable anchor, and newly admitted complete evidence. A failure during or after receipt creation is a partial bootstrap record and must not be retried. Preserve the receipt, candidate, evidence artifacts, workflow logs, and current Stable version for investigation. Do not delete or rename the receipt. If Stable was not changed, repair the release process and publish a higher version through a separately reviewed recovery decision; if Stable was changed, follow bad-release recovery below.
+The retired bootstrap and recovery paths must never be rerun. Preserve both immutable receipts, their candidate/evidence artifacts, workflow logs, and historical Stable versions for investigation.
 
 ### Stale promotion lock
 
-Any promotion error or runner crash intentionally leaves `dsh-desktop/channels/stable/promotion.lock` current. Do not automatically expire or overwrite it. Inspect its owner run/attempt, mode, candidate identity, observed Stable digest, workflow status, current and historical Stable versions, candidate/evidence artifacts, and any bootstrap receipt. Confirm no writer is still active. If the attempted Stable write completed, follow bad-release recovery or complete the audit decision before unlocking. Only an authorized administrator may remove the current lock marker after documenting the finding; bucket Versioning preserves its historical version. Never delete another release object as part of lock recovery.
+Any promotion error or runner crash intentionally leaves `dsh-desktop/channels/stable/promotion.lock` current. Do not automatically expire or overwrite it. Inspect its owner run/attempt, mode, candidate identity, observed Stable digest, workflow status, current and historical Stable versions, candidate/evidence artifacts, and related immutable historical receipts. Confirm no writer is still active. If the attempted Stable write completed, follow bad-release recovery or complete the audit decision before unlocking. Only an authorized administrator may remove the current lock marker after documenting the finding; bucket Versioning preserves its historical version. Never delete another release object as part of lock recovery.
 
 OSS does not support destination `If-Match` on `PutObject`; `CopyObject` conditions bind only the source, and Versioning ignores `x-oss-forbid-overwrite`. The append lock is therefore the actual storage-side atomic primitive, not a simulated read-then-write CAS. Its guarantee covers the two repository workflows that exclusively receive Stable write authority. Alibaba Cloud account-owner actions can bypass this protocol and must be separately restricted and audited.
 
@@ -275,24 +241,20 @@ Disable the `production` Environment or publishing role first. Revoke or tighten
 - [ ] RAM permissions cannot read, write, list, delete, or administer outside the required `dsh-desktop/` scope.
 - [ ] The publishing RAM role has no object delete permission and immutable release objects are retained permanently.
 - [ ] Every package and signature basename starts with its deterministic SHA-256 prefix; same-key retries verify byte-for-byte identity before reuse.
-- [ ] All normal Environment variables, fixed one-time bootstrap/recovery approval variables, and both Environment secrets use the exact names in this runbook.
+- [ ] All normal Environment variables and both Environment secrets use the exact names in this runbook; retired one-time approval variables are absent.
 - [ ] `TAURI_SIGNING_PUBLIC_KEY` matches both the protected private key and the public key embedded in Desktop; offline encrypted restore has been tested.
 - [ ] Promotion verifies all four updater packages with minisign before writing OSS.
 - [ ] Windows builds explicitly use NSIS `currentUser`; all four binaries embed the production Stable endpoint and the same updater public key used by promotion.
 - [ ] Candidate preparation binds the authoritative previous Stable URL/version/digest, uploads only immutable objects, and leaves Stable unchanged.
-- [ ] Normal, bootstrap, and recovery finalizers use the same OSS `AppendObject(position=0)` promotion lock; conflicts fail closed and successful owners verify Stable before releasing it.
+- [ ] The normal finalizer uses the OSS `AppendObject(position=0)` promotion lock; conflicts fail closed and successful owners verify Stable before releasing it.
 - [ ] Aggregate and final admission both require exact fresh real-native evidence before final OIDC exchange.
 - [ ] Draft creation leaves Stable unchanged; every candidate, smoke, evidence, credential, or revalidation failure also leaves Stable unchanged.
-- [ ] A successful published-release smoke has passed on all four targets and its evidence is recorded.
-- [ ] The manually dispatched one-time bootstrap is protected by `production` required reviewers and binds the exact approved tag/version/commit.
-- [ ] Authoritative Stable still matches the byte-identical approved legacy version and digest, and the bootstrap receipt prefix is empty before dispatch.
-- [ ] All four attested `bootstrap-fresh-install` documents pass the dedicated verifier without claiming a previous-Stable upgrade.
-- [ ] The content-digested immutable bootstrap receipt is byte-verified before Stable is written last; any partial receipt is preserved and blocks reuse.
-- [ ] Recovery binds the exact candidate manifest, broken Stable, prior receipt, failed run, signer workflow, signer digest, and verified macOS trust evidence before writing its immutable receipt and Stable last.
+- [x] Published-release run `33367060346` attempt 2 passed on all four targets and its evidence is recorded.
+- [x] The retired bootstrap and recovery receipts remain byte-identical and permanently retained; their workflows and approval variables are absent.
 - [ ] The four evidence documents pass `verify-update-smoke-evidence.mjs --require-real-native`, and their GitHub artifact attestations verify against this repository and workflow run.
 - [ ] The evidence baseline is the exact OSS Stable manifest target, not a source rebuild, fixture, or GitHub latest-release guess.
 
-Until every checkbox is complete, production automatic updates remain not configured or not verified.
+Production automatic updates are verified. Use this checklist when changing release infrastructure, identity, signing material, or the native update gate.
 
 ## Primary references
 

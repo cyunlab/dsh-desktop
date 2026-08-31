@@ -253,16 +253,7 @@ gh secret set TAURI_SIGNING_PRIVATE_KEY --env production --repo "$DSH_GH_REPO" <
 gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --env production --repo "$DSH_GH_REPO"
 ```
 
-Set the one-time bootstrap approval variables only after the approved tag, version, commit, legacy-manifest digest, and Apple-signing decision are fixed:
-
-```bash
-printf '%s' '<v-semver>' | gh variable set UPDATER_BOOTSTRAP_TAG --env production --repo "$DSH_GH_REPO"
-printf '%s' '<semver>' | gh variable set UPDATER_BOOTSTRAP_VERSION --env production --repo "$DSH_GH_REPO"
-printf '%s' '<40-char-lowercase-commit>' | gh variable set UPDATER_BOOTSTRAP_COMMIT --env production --repo "$DSH_GH_REPO"
-printf '%s' '<legacy-semver>' | gh variable set UPDATER_BOOTSTRAP_LEGACY_VERSION --env production --repo "$DSH_GH_REPO"
-printf '%s' '<64-char-lowercase-sha256>' | gh variable set UPDATER_BOOTSTRAP_LEGACY_MANIFEST_SHA256 --env production --repo "$DSH_GH_REPO"
-printf '%s' true | gh variable set UPDATER_BOOTSTRAP_MACOS_SIGNING_CONFIGURED --env production --repo "$DSH_GH_REPO"
-```
+The one-time bootstrap and broken-updater recovery have completed. Their temporary `UPDATER_BOOTSTRAP_*` and `UPDATER_RECOVERY_*` variables are deliberately absent and must not be recreated. The immutable OSS receipts and historical ADRs remain the audit record.
 
 Confirm names and public values without reading secrets:
 
@@ -298,7 +289,7 @@ If stricter Environment scoping is desired later, copy the same six values into 
 
 ## 10. Final preflight
 
-Before dispatching bootstrap, verify all of the following:
+Before publishing releases, verify all of the following:
 
 ```bash
 aliyun oss stat "oss://${DSH_OSS_BUCKET}" --region "$DSH_OSS_REGION"
@@ -311,4 +302,4 @@ gh secret list --env production --repo "$DSH_GH_REPO"
 gh secret list --repo "$DSH_GH_REPO" | grep '^APPLE_'
 ```
 
-Do not configure `ALIBABA_CLOUD_ACCESS_KEY_ID` or `ALIBABA_CLOUD_ACCESS_KEY_SECRET` in GitHub. Do not dispatch the bootstrap until the observed GitHub OIDC claims match the role trust policy exactly, anonymous `GET` works only for the intended paths, anonymous listing/write fail, TLS validates on `updates.cyunlab.com`, and the required-reviewer prompt appears before either OSS-writing job obtains credentials.
+Do not configure `ALIBABA_CLOUD_ACCESS_KEY_ID` or `ALIBABA_CLOUD_ACCESS_KEY_SECRET` in GitHub. Do not publish until the observed GitHub OIDC claims match the role trust policy exactly, anonymous `GET` works only for the intended paths, anonymous listing/write fail, TLS validates on `updates.cyunlab.com`, and the required-reviewer prompt appears before either OSS-writing job obtains credentials.

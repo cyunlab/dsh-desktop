@@ -241,7 +241,7 @@ describe('Stable update promotion', () => {
     }
   })
 
-  /** 验证没有真实 previous Stable 时不能准备 candidate 或进入 bootstrap bypass。 */
+  /** 验证没有真实 previous Stable 时不能准备 candidate。 */
   it('fails closed when no previous Stable updater release exists', async () => {
     const directory = await createReleaseDirectory()
     const storage = createStorage()
