@@ -755,6 +755,218 @@ export async function finalizeBootstrapStableCandidate(candidate, storage, optio
   return { manifest: candidate.manifest, receipt_key: receiptKey, receipt_sha256: receiptSha256 }
 }
 
+/** 校验损坏 updater recovery 的受保护审批身份。 */
+function validateUpdaterRecoveryApproval(options) {
+  const version = releaseVersion(options.approvedTag)
+  if (version !== options.approvedVersion) throw new Error('approved recovery tag and version must identify the same semantic version')
+  if (version === releaseVersion(options.approvedBrokenStableVersion)) throw new Error('recovery candidate must differ from the broken Stable')
+  if (!/^[0-9a-f]{40}$/.test(options.approvedCommit ?? '')) throw new Error('approved recovery commit must be a full lowercase Git commit SHA')
+  if (!/^[0-9a-f]{64}$/.test(options.approvedCandidateManifestSha256 ?? '')) throw new Error('approved recovery candidate manifest digest must be a lowercase SHA-256')
+  if (!/^[0-9a-f]{64}$/.test(options.approvedBrokenStableManifestSha256 ?? '')) throw new Error('approved broken Stable digest must be a lowercase SHA-256')
+  if (!/^[0-9a-f]{64}$/.test(options.approvedPriorReceiptSha256 ?? '')) throw new Error('approved prior bootstrap receipt digest must be a lowercase SHA-256')
+  if (!/^\d+$/.test(options.approvedFailedPromotionRunId ?? '')) throw new Error('approved failed promotion run id must be numeric')
+  return version
+}
+
+/** 要求 recovery candidate 与受保护审批逐字段一致。 */
+function requireUpdaterRecoveryCandidateApproval(candidate, options) {
+  const version = validateUpdaterRecoveryApproval(options)
+  if (
+    candidate?.candidate_tag !== options.approvedTag || candidate?.candidate_version !== version ||
+    candidate?.candidate_commit !== options.approvedCommit ||
+    candidate?.manifest_sha256 !== options.approvedCandidateManifestSha256 ||
+    candidate?.broken_stable_version !== options.approvedBrokenStableVersion ||
+    candidate?.broken_stable_manifest_sha256 !== options.approvedBrokenStableManifestSha256 ||
+    candidate?.prior_bootstrap_receipt_key !== options.approvedPriorReceiptKey ||
+    candidate?.prior_bootstrap_receipt_sha256 !== options.approvedPriorReceiptSha256 ||
+    candidate?.failed_promotion_run_id !== options.approvedFailedPromotionRunId
+  ) throw new Error('updater recovery candidate does not match the approved identity')
+}
+
+/** 读取并逐字验证唯一的首次 bootstrap receipt，证明 recovery 有明确前序。 */
+async function readExactPriorBootstrapReceipt(storage, prefix, options) {
+  if (typeof storage.listObjects !== 'function') throw new Error('updater recovery requires receipt-prefix listing support')
+  const expectedPrefix = `${prefix}/bootstrap/receipts/`
+  const expectedPattern = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/bootstrap/receipts/[0-9a-f]{64}-first-updater-stable\\.json$`)
+  if (!expectedPattern.test(options.approvedPriorReceiptKey ?? '')) throw new Error('approved prior bootstrap receipt key is invalid')
+  const keyDigest = path.posix.basename(options.approvedPriorReceiptKey).slice(0, 64)
+  if (keyDigest !== options.approvedPriorReceiptSha256) throw new Error('approved prior bootstrap receipt key digest does not match the approved digest')
+  const receipts = await storage.listObjects(expectedPrefix)
+  if (receipts.length !== 1 || receipts[0] !== options.approvedPriorReceiptKey) throw new Error('prior bootstrap receipt set does not match the approved receipt')
+  const body = await storage.readObject(options.approvedPriorReceiptKey)
+  const digest = createHash('sha256').update(body).digest('hex')
+  if (digest !== options.approvedPriorReceiptSha256) throw new Error('prior bootstrap receipt digest does not match the approved digest')
+  let receipt
+  try { receipt = JSON.parse(body.toString('utf8')) } catch { throw new Error('prior bootstrap receipt is invalid') }
+  if (
+    receipt?.schema_version !== 1 || receipt.kind !== 'first-updater-stable-bootstrap' ||
+    receipt.candidate_version !== options.approvedBrokenStableVersion ||
+    receipt.candidate_manifest_sha256 !== options.approvedBrokenStableManifestSha256
+  ) throw new Error('prior bootstrap receipt does not identify the broken Stable')
+  return { key: options.approvedPriorReceiptKey, body, digest }
+}
+
+/** 拒绝任何完整或部分 recovery receipt，确保恢复只能执行一次。 */
+async function requireUpdaterRecoveryReceiptAbsent(storage, prefix) {
+  if (typeof storage.listObjects !== 'function') throw new Error('updater recovery requires receipt-prefix listing support')
+  const receipts = await storage.listObjects(`${prefix}/recovery/receipts/`)
+  if (receipts.length !== 0) throw new Error(`recovery receipt already exists: ${receipts[0]}`)
+}
+
+/** recovery receipt 写入后要求目录内恰好只有预期记录。 */
+async function requireExactUpdaterRecoveryReceipt(storage, prefix, receiptKey) {
+  if (typeof storage.listObjects !== 'function') throw new Error('updater recovery requires receipt-prefix listing support')
+  const receipts = await storage.listObjects(`${prefix}/recovery/receipts/`)
+  if (receipts.length !== 1 || receipts[0] !== receiptKey) throw new Error('updater recovery receipt set changed after receipt write')
+}
+
+/** 验证远端 recovery candidate 并返回 byte-exact manifest。 */
+async function readUpdaterRecoveryCandidateManifest(candidate, storage, prefix) {
+  if (candidate?.schema_version !== 1 || candidate.bootstrap_kind !== 'broken-updater-stable-recovery') throw new Error('unsupported updater recovery candidate')
+  const version = releaseVersion(candidate.candidate_tag)
+  if (candidate.candidate_version !== version || candidate.manifest?.version !== version) throw new Error('updater recovery candidate identity mismatch')
+  if (!/^[0-9a-f]{40}$/.test(candidate.candidate_commit ?? '') || !/^[0-9a-f]{64}$/.test(candidate.manifest_sha256 ?? '')) throw new Error('updater recovery candidate digest identity is invalid')
+  if (JSON.stringify(Object.keys(candidate.manifest?.platforms ?? {})) !== JSON.stringify(TARGETS)) throw new Error('updater recovery candidate must contain exactly four canonical targets')
+  const manifestUrl = new URL(candidate.manifest_url)
+  const suffix = `/${prefix}/candidates/${version}/${candidate.candidate_commit}/${candidate.manifest_sha256}-latest.json`
+  if (manifestUrl.protocol !== 'https:' || manifestUrl.username || manifestUrl.password || manifestUrl.search || manifestUrl.hash || !manifestUrl.pathname.endsWith(suffix)) throw new Error('updater recovery candidate manifest URL is invalid')
+  const body = await storage.readObject(manifestUrl.pathname.slice(1))
+  if (createHash('sha256').update(body).digest('hex') !== candidate.manifest_sha256) throw new Error('updater recovery candidate manifest digest mismatch')
+  if (!body.equals(Buffer.from(`${JSON.stringify(candidate.manifest, null, 2)}\n`))) throw new Error('updater recovery candidate manifest bytes mismatch')
+  return body
+}
+
+/** 准备一次性损坏 updater Stable recovery candidate，不修改 Stable。 */
+export async function prepareUpdaterStableRecovery(options, storage, dependencies = {}) {
+  const version = validateUpdaterRecoveryApproval(options)
+  const prefix = normalizePrefix(options.prefix ?? 'dsh-desktop')
+  const broken = await readLegacyStable(storage, prefix, options.approvedBrokenStableVersion)
+  if (broken.digest !== options.approvedBrokenStableManifestSha256) throw new Error('approved broken Stable manifest digest does not match authoritative OSS Stable')
+  const prior = await readExactPriorBootstrapReceipt(storage, prefix, options)
+  await requireUpdaterRecoveryReceiptAbsent(storage, prefix)
+  const prepared = await (dependencies.prepareCandidate ?? prepareStableCandidate)({
+    tag: options.approvedTag,
+    releaseBody: options.releaseBody,
+    publishedAt: options.publishedAt,
+    candidateCommit: options.approvedCommit,
+    artifactsDirectory: options.artifactsDirectory,
+    downloadOrigin: options.downloadOrigin,
+    prefix,
+  }, storage, { verifySignature: dependencies.verifySignature })
+  if (
+    prepared.candidate_tag !== options.approvedTag || prepared.candidate_commit !== options.approvedCommit ||
+    prepared.manifest_sha256 !== options.approvedCandidateManifestSha256 ||
+    prepared.manifest?.version !== version || prepared.previous_stable_version !== broken.version ||
+    prepared.previous_stable_manifest_sha256 !== broken.digest
+  ) throw new Error('prepared recovery candidate does not match the approved predecessor and identity')
+  const finalBroken = await readLegacyStable(storage, prefix, broken.version)
+  if (!finalBroken.body.equals(broken.body)) throw new Error('broken Stable changed during recovery preparation')
+  const finalPrior = await readExactPriorBootstrapReceipt(storage, prefix, options)
+  if (!finalPrior.body.equals(prior.body)) throw new Error('prior bootstrap receipt changed during recovery preparation')
+  await requireUpdaterRecoveryReceiptAbsent(storage, prefix)
+  return {
+    schema_version: 1,
+    bootstrap_kind: 'broken-updater-stable-recovery',
+    candidate_tag: options.approvedTag,
+    candidate_version: version,
+    candidate_commit: options.approvedCommit,
+    broken_stable_version: broken.version,
+    broken_stable_manifest_sha256: broken.digest,
+    prior_bootstrap_receipt_key: prior.key,
+    prior_bootstrap_receipt_sha256: prior.digest,
+    failed_promotion_run_id: options.approvedFailedPromotionRunId,
+    manifest_url: prepared.manifest_url,
+    manifest_sha256: prepared.manifest_sha256,
+    manifest: prepared.manifest,
+  }
+}
+
+/** 复核 recovery evidence，先写不可变 recovery receipt，再最后替换 Stable。 */
+export async function finalizeUpdaterStableRecovery(candidate, storage, options, dependencies = {}) {
+  const prefix = normalizePrefix(options?.prefix ?? 'dsh-desktop')
+  if (!options?.evidenceDirectory) throw new Error('updater recovery evidence directory is required')
+  if (!Number.isFinite(options.maxAgeHours) || options.maxAgeHours <= 0) throw new Error('a positive updater recovery evidence max age is required')
+  const approval = {
+    approvedTag: candidate.candidate_tag,
+    approvedVersion: candidate.candidate_version,
+    approvedCommit: candidate.candidate_commit,
+    approvedCandidateManifestSha256: candidate.manifest_sha256,
+    approvedBrokenStableVersion: candidate.broken_stable_version,
+    approvedBrokenStableManifestSha256: candidate.broken_stable_manifest_sha256,
+    approvedPriorReceiptKey: candidate.prior_bootstrap_receipt_key,
+    approvedPriorReceiptSha256: candidate.prior_bootstrap_receipt_sha256,
+    approvedFailedPromotionRunId: candidate.failed_promotion_run_id,
+  }
+  validateUpdaterRecoveryApproval(approval)
+  const broken = await readLegacyStable(storage, prefix, candidate.broken_stable_version)
+  if (broken.digest !== candidate.broken_stable_manifest_sha256) throw new Error('broken Stable changed after recovery preparation')
+  const prior = await readExactPriorBootstrapReceipt(storage, prefix, approval)
+  await requireUpdaterRecoveryReceiptAbsent(storage, prefix)
+  const remoteCandidate = await readUpdaterRecoveryCandidateManifest(candidate, storage, prefix)
+  const verifyEvidence = dependencies.verifyEvidence ?? (await import('./verify-bootstrap-update-evidence.mjs')).verifyBootstrapUpdateEvidenceDirectory
+  const evidenceDigestBefore = await digestEvidenceDirectory(options.evidenceDirectory)
+  await verifyEvidence(options.evidenceDirectory, {
+    tag: candidate.candidate_tag,
+    version: candidate.candidate_version,
+    commit: candidate.candidate_commit,
+    manifest_sha256: candidate.manifest_sha256,
+    maxAgeHours: options.maxAgeHours,
+    now: options.now,
+    requireRealBootstrap: true,
+    requireMacosSigning: true,
+  })
+  const evidenceDigest = await digestEvidenceDirectory(options.evidenceDirectory)
+  if (evidenceDigest !== evidenceDigestBefore) throw new Error('updater recovery evidence changed during verification')
+  const receipt = {
+    schema_version: 1,
+    kind: 'broken-updater-stable-recovery',
+    candidate_tag: candidate.candidate_tag,
+    candidate_version: candidate.candidate_version,
+    candidate_commit: candidate.candidate_commit,
+    candidate_manifest_url: candidate.manifest_url,
+    candidate_manifest_sha256: candidate.manifest_sha256,
+    broken_stable_version: broken.version,
+    broken_stable_manifest_sha256: broken.digest,
+    prior_bootstrap_receipt_key: prior.key,
+    prior_bootstrap_receipt_sha256: prior.digest,
+    failed_promotion_run_id: candidate.failed_promotion_run_id,
+    failure_reason: 'downloaded-package-not-rewound-before-staging',
+    recovery_evidence_sha256: evidenceDigest,
+    evidence_kind: 'bootstrap-fresh-install',
+    claims_previous_stable_upgrade: false,
+  }
+  const receiptBody = Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`)
+  const receiptSha256 = createHash('sha256').update(receiptBody).digest('hex')
+  const receiptKey = `${prefix}/recovery/receipts/${receiptSha256}-broken-updater-stable.json`
+
+  requirePromotionLockStorage(storage)
+  const promotionLock = createPromotionLock(prefix, 'broken-updater-stable-recovery', candidate, broken.digest, options.lockOwner)
+  await storage.acquirePromotionLock(promotionLock.key, promotionLock.body)
+  const finalBroken = await readLegacyStable(storage, prefix, broken.version)
+  if (!finalBroken.body.equals(broken.body)) throw new Error('broken Stable changed before recovery receipt write')
+  const finalPrior = await readExactPriorBootstrapReceipt(storage, prefix, approval)
+  if (!finalPrior.body.equals(prior.body)) throw new Error('prior bootstrap receipt changed before recovery receipt write')
+  await requireUpdaterRecoveryReceiptAbsent(storage, prefix)
+  if (!(await readUpdaterRecoveryCandidateManifest(candidate, storage, prefix)).equals(remoteCandidate)) throw new Error('recovery candidate changed before receipt write')
+  if (await digestEvidenceDirectory(options.evidenceDirectory) !== evidenceDigest) throw new Error('updater recovery evidence changed before receipt write')
+  await storage.ensureObject(receiptKey, receiptBody, { cacheControl: 'public, max-age=31536000, immutable', contentType: 'application/json; charset=utf-8' })
+  if (!(await storage.readObject(receiptKey)).equals(receiptBody)) throw new Error('remote updater recovery receipt differs from expected bytes')
+  await requireExactUpdaterRecoveryReceipt(storage, prefix, receiptKey)
+
+  const stableBeforeWrite = await readLegacyStable(storage, prefix, broken.version)
+  if (!stableBeforeWrite.body.equals(broken.body)) throw new Error('broken Stable changed after recovery receipt write')
+  const priorBeforeWrite = await readExactPriorBootstrapReceipt(storage, prefix, approval)
+  if (!priorBeforeWrite.body.equals(prior.body)) throw new Error('prior bootstrap receipt changed after recovery receipt write')
+  if (!(await readUpdaterRecoveryCandidateManifest(candidate, storage, prefix)).equals(remoteCandidate)) throw new Error('recovery candidate changed after receipt write')
+  if (await digestEvidenceDirectory(options.evidenceDirectory) !== evidenceDigest) throw new Error('updater recovery evidence changed after receipt write')
+  if (!(await storage.readObject(receiptKey)).equals(receiptBody)) throw new Error('updater recovery receipt changed before Stable write')
+  await requireExactUpdaterRecoveryReceipt(storage, prefix, receiptKey)
+  await storage.replaceObject(broken.stableKey, remoteCandidate, { cacheControl: 'no-cache', contentType: 'application/json; charset=utf-8' })
+  if (!(await storage.readObject(broken.stableKey)).equals(remoteCandidate)) throw new Error('Stable manifest differs after updater recovery write')
+  await storage.releasePromotionLock(promotionLock.key, promotionLock.body)
+  return { manifest: candidate.manifest, receipt_key: receiptKey, receipt_sha256: receiptSha256 }
+}
+
 /** 从 production 环境创建限定应用前缀的短期 OSS storage。 */
 function createProductionStorage(environment, dependencies, prefix) {
   const credentials = {
@@ -876,6 +1088,71 @@ export async function runBootstrapFinalizationCli(environment = process.env, dep
   }, { verifyEvidence: dependencies.verifyEvidence })
 }
 
+/** 解析一次性损坏 updater Stable recovery preparation CLI。 */
+export async function runUpdaterRecoveryPreparationCli(environment = process.env, dependencies = {}, args = process.argv.slice(2)) {
+  const values = parseArguments(args)
+  const prefix = values.prefix ?? 'dsh-desktop'
+  if (!values.output) throw new Error('--output is required for updater recovery preparation')
+  if (!environment.TAURI_SIGNING_PUBLIC_KEY) throw new Error('TAURI_SIGNING_PUBLIC_KEY is required')
+  const storage = createProductionStorage(environment, dependencies, prefix)
+  const candidate = await (dependencies.prepareRecovery ?? prepareUpdaterStableRecovery)({
+    approvedTag: values['approved-tag'],
+    approvedVersion: values['approved-version'],
+    approvedCommit: values['approved-commit'],
+    approvedCandidateManifestSha256: values['approved-candidate-manifest-sha256'],
+    approvedBrokenStableVersion: values['approved-broken-stable-version'],
+    approvedBrokenStableManifestSha256: values['approved-broken-stable-manifest-sha256'],
+    approvedPriorReceiptKey: values['approved-prior-receipt-key'],
+    approvedPriorReceiptSha256: values['approved-prior-receipt-sha256'],
+    approvedFailedPromotionRunId: values['approved-failed-promotion-run-id'],
+    releaseBody: values.notes,
+    publishedAt: values['published-at'],
+    artifactsDirectory: values.assets ?? 'artifacts',
+    downloadOrigin: environment.UPDATE_BASE_URL,
+    prefix,
+  }, storage, {
+    prepareCandidate: dependencies.prepareCandidate,
+    verifySignature: dependencies.verifySignature
+      ?? ((artifactPath, signaturePath) => verifyTauriSignature(
+        artifactPath,
+        signaturePath,
+        environment.TAURI_SIGNING_PUBLIC_KEY,
+        dependencies.runMinisign,
+      )),
+  })
+  await writeFile(values.output, `${JSON.stringify(candidate, null, 2)}\n`, { mode: 0o600 })
+  return candidate
+}
+
+/** 解析一次性损坏 updater Stable recovery finalization CLI。 */
+export async function runUpdaterRecoveryFinalizationCli(environment = process.env, dependencies = {}, args = process.argv.slice(2)) {
+  const values = parseArguments(args)
+  const prefix = values.prefix ?? 'dsh-desktop'
+  if (!values.candidate) throw new Error('--candidate is required for updater recovery finalization')
+  if (!values.evidence) throw new Error('--evidence is required for updater recovery finalization')
+  if (!values['max-age-hours']) throw new Error('--max-age-hours is required for updater recovery finalization')
+  const candidate = JSON.parse(await readFile(values.candidate, 'utf8'))
+  const approval = {
+    approvedTag: values['approved-tag'],
+    approvedVersion: values['approved-version'],
+    approvedCommit: values['approved-commit'],
+    approvedCandidateManifestSha256: values['approved-candidate-manifest-sha256'],
+    approvedBrokenStableVersion: values['approved-broken-stable-version'],
+    approvedBrokenStableManifestSha256: values['approved-broken-stable-manifest-sha256'],
+    approvedPriorReceiptKey: values['approved-prior-receipt-key'],
+    approvedPriorReceiptSha256: values['approved-prior-receipt-sha256'],
+    approvedFailedPromotionRunId: values['approved-failed-promotion-run-id'],
+  }
+  requireUpdaterRecoveryCandidateApproval(candidate, approval)
+  const storage = createProductionStorage(environment, dependencies, prefix)
+  return (dependencies.finalizeRecovery ?? finalizeUpdaterStableRecovery)(candidate, storage, {
+    prefix,
+    evidenceDirectory: values.evidence,
+    maxAgeHours: Number(values['max-age-hours']),
+    lockOwner: `${environment.GITHUB_RUN_ID ?? 'local'}:${environment.GITHUB_RUN_ATTEMPT ?? '0'}:${candidate.candidate_commit}`,
+  }, { verifyEvidence: dependencies.verifyEvidence })
+}
+
 /** 运行发布器 CLI，日志仅包含公开版本信息。 */
 async function main() {
   const [mode, ...args] = process.argv.slice(2)
@@ -899,7 +1176,17 @@ async function main() {
     console.log(`Bootstrapped Desktop ${result.manifest.version} to Stable with receipt ${result.receipt_sha256}`)
     return
   }
-  throw new Error('an explicit candidate or bootstrap preparation/finalization mode is required')
+  if (mode === '--prepare-updater-recovery') {
+    const candidate = await runUpdaterRecoveryPreparationCli(process.env, {}, args)
+    console.log(`Prepared one-time Desktop ${candidate.candidate_tag} updater recovery candidate`)
+    return
+  }
+  if (mode === '--finalize-updater-recovery') {
+    const result = await runUpdaterRecoveryFinalizationCli(process.env, {}, args)
+    console.log(`Recovered Desktop ${result.manifest.version} to Stable with receipt ${result.receipt_sha256}`)
+    return
+  }
+  throw new Error('an explicit candidate, bootstrap, or updater recovery preparation/finalization mode is required')
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main()

@@ -102,6 +102,21 @@ describe('bootstrap update evidence verifier public seam', () => {
     expect(result).toEqual({ schemaVersion: 1, targets: REQUIRED_BOOTSTRAP_TARGETS, candidate })
   })
 
+  /** recovery 准入要求两份 macOS evidence 都确实完成签名与公证验证。 */
+  it('requires verified macOS signing and notarization when requested', () => {
+    const documents = REQUIRED_BOOTSTRAP_TARGETS.map(validEvidence)
+    documents[2]!.platform.signing_credentials_configured = false
+    documents[2]!.platform.code_signing = 'not-configured'
+    documents[2]!.platform.notarization = 'not-configured'
+    expect(() => verifyBootstrapUpdateEvidenceSet(documents, {
+      ...candidate,
+      now: new Date('2026-08-29T09:00:00.000Z'),
+      maxAgeHours: 24,
+      requireRealBootstrap: true,
+      requireMacosSigning: true
+    })).toThrow('verified macOS signing and notarization are required')
+  })
+
   /** 布尔结论缺少真实观察来源时不得进入 bootstrap admission。 */
   it('rejects evidence whose runtime observation sources are missing', () => {
     const documents = REQUIRED_BOOTSTRAP_TARGETS.map(validEvidence)
@@ -210,7 +225,8 @@ describe('bootstrap update evidence verifier public seam', () => {
       '--candidate-commit', candidate.commit,
       '--manifest-sha256', candidate.manifest_sha256,
       '--max-age-hours', '24',
-      '--require-real-bootstrap'
+      '--require-real-bootstrap',
+      '--require-macos-signing'
     ], new Date('2026-08-29T09:00:00.000Z'))).resolves.toMatchObject({ candidate })
   })
 })
