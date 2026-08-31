@@ -72,7 +72,7 @@ Before enabling promotion, confirm that Environment variables are not secrets an
 1. Create or select a bucket in `cn-shenzhen`. The bucket may serve multiple public applications, but reserve the complete `dsh-desktop/` namespace for this repository.
 2. Enable **OSS Versioning** before the first promotion. Do not configure lifecycle rules that delete or expire `dsh-desktop/releases/` objects or historical versions of `dsh-desktop/channels/stable/latest.json`.
 3. Do not configure an OSS prevent-overwrite rule or `x-oss-forbid-overwrite`. OSS ignores these protections when bucket Versioning is enabled or suspended, so they cannot enforce release immutability here. Versioning remains enabled because promotion and recovery intentionally create recoverable versions of `dsh-desktop/channels/stable/latest.json`; release immutability instead comes from the content-addressed object keys described below.
-4. Keep writes private. Grant anonymous users read-only access only to `dsh-desktop/releases/*` and `dsh-desktop/channels/stable/latest.json`; never grant public write. A bucket-level `public-read` ACL is broader than required, so prefer a prefix-scoped bucket policy.
+4. Keep writes private. Grant anonymous users read-only access only to `dsh-desktop/releases/*`, `dsh-desktop/candidates/*`, and `dsh-desktop/channels/stable/latest.json`; never grant public write. Candidate manifests are public because hosted native smoke runners fetch their isolated immutable URL without OSS credentials. A bucket-level `public-read` ACL is broader than required, so prefer a prefix-scoped bucket policy.
 5. Bind the ICP-filed domain `updates.cyunlab.com` to the bucket and add its DNS CNAME to the OSS public endpoint for `cn-shenzhen`. Upload and bind a valid TLS certificate in OSS. CDN is not required for the first release.
 6. Test anonymous HTTPS `GET` and `HEAD` for a disposable object under `dsh-desktop/releases/`, then remove only that disposable object. Confirm anonymous listing of the bucket is denied and anonymous writes are denied.
 7. CORS is not required by the native Tauri updater because it does not use browser cross-origin fetch. Leave the bucket CORS rules empty initially. If a future browser surface reads this origin directly, add a rule only for the exact approved web origin with `GET` and `HEAD`; do not use `*`, and do not enable write methods.
@@ -89,6 +89,7 @@ The public-read bucket policy should express this shape after placeholders are r
       "Action": ["oss:GetObject"],
       "Resource": [
         "acs:oss:*:*:<bucket-name>/dsh-desktop/releases/*",
+        "acs:oss:*:*:<bucket-name>/dsh-desktop/candidates/*",
         "acs:oss:*:*:<bucket-name>/dsh-desktop/channels/stable/latest.json"
       ]
     }
