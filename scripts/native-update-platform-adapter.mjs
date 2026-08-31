@@ -387,17 +387,28 @@ async function verifyDesktopProcess(target, pid, installation, environment, comm
   if (pids.length !== 1 || pids[0] !== pid) throw new Error('updater configuration PID is not the unique installed Desktop process')
 }
 
+/** 从有界 JSONL 日志中解析与本次启动配置严格匹配的身份记录。 */
+export function matchingConfigurationIdentityEvents(logBody, expected) {
+  if (!Buffer.isBuffer(logBody) || logBody.length > UPDATE_LOG_BOUND) throw new Error('updater configuration log exceeds byte bound')
+  return logBody.toString('utf8').trim().split(/\r?\n/).reverse().flatMap(line => {
+    try {
+      const event = JSON.parse(line)
+      verifyConfigurationIdentityEvent(event, expected)
+      return [event]
+    } catch {
+      return []
+    }
+  })
+}
+
 /** 从有界 JSONL 日志等待本次 app version 与 PID 的真实配置身份。 */
 async function waitForConfigurationIdentity(logFile, expected, installation, target, environment, command) {
   const deadline = Date.now() + 90_000
   while (Date.now() < deadline) {
     const body = await readFile(logFile).catch(() => null)
     if (body) {
-      if (body.length > OUTPUT_BOUND) throw new Error('updater configuration log exceeds byte bound')
-      for (const line of body.toString('utf8').trim().split(/\r?\n/).reverse()) {
+      for (const event of matchingConfigurationIdentityEvents(body, expected)) {
         try {
-          const event = JSON.parse(line)
-          verifyConfigurationIdentityEvent(event, expected)
           await verifyDesktopProcess(target, event.process_id, installation, environment, command)
           return event
         } catch {}
@@ -437,13 +448,18 @@ async function findFixedHostListenerProcess(target, environment, command) {
   return pids[0]
 }
 
-/** 从 wmctrl 快照中只选择属于 Desktop 进程树的唯一窗口。 */
-export function selectLinuxDesktopWindow(output, processPids) {
-  const allowedPids = new Set(processPids)
-  const windows = String(output).split(/\r?\n/).flatMap(line => {
+/** 从 wmctrl 快照中只解析后续绑定所需的窗口 ID 与 PID。 */
+export function parseLinuxDesktopWindows(output) {
+  return String(output).split(/\r?\n/).flatMap(line => {
     const match = /^(0x[0-9a-f]+)\s+\S+\s+(\d+)\s+/i.exec(line)
     return match ? [{ windowId: match[1], pid: Number(match[2]) }] : []
   })
+}
+
+/** 从 wmctrl 快照中只选择属于 Desktop 进程树的唯一窗口。 */
+export function selectLinuxDesktopWindow(output, processPids) {
+  const allowedPids = new Set(processPids)
+  const windows = parseLinuxDesktopWindows(output)
   const matches = windows.filter(window => allowedPids.has(window.pid))
   if (matches.length === 1) return matches[0].windowId
   if (matches.length > 1) throw new Error('Linux Desktop X11 window is ambiguous')
@@ -454,16 +470,25 @@ export function selectLinuxDesktopWindow(output, processPids) {
 /** 等待 Linux X11 中属于真实 Desktop 进程树的唯一主窗口。 */
 async function waitForLinuxWindow(pid, environment, command) {
   const deadline = Date.now() + 60_000
+  let lastOutput = ''
+  let lastProcessPids = []
   while (Date.now() < deadline) {
     const [output, processPids] = await Promise.all([
       command('wmctrl', ['-lp'], { environment }).catch(() => ''),
       findProcessTreePids('linux-x86_64', pid, environment, command),
     ])
+    lastOutput = output
+    lastProcessPids = processPids
     const windowId = selectLinuxDesktopWindow(output, processPids)
     if (windowId) return windowId
     await delay(500)
   }
-  throw new Error('Linux Desktop X11 window was not observed')
+  const snapshot = {
+    root_pid: pid,
+    process_tree_pids: lastProcessPids.slice(0, 64),
+    windows: parseLinuxDesktopWindows(lastOutput).slice(0, 64),
+  }
+  throw new Error(`[DEBUG-linux-window-9f3c] Linux Desktop X11 window was not observed: ${JSON.stringify(snapshot)}`)
 }
 
 /** 先等待固定 Host ready，再观察依赖页面加载的 Linux X11 主窗口。 */

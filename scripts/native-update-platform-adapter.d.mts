@@ -7,6 +7,24 @@ export function platformStatePaths(target: string, environment: Readonly<Record<
   readonly stagedPackage: string
 }
 
+/** 从有界 JSONL 日志中解析与本次启动配置严格匹配的身份记录。 */
+export function matchingConfigurationIdentityEvents(logBody: Buffer, expected: Readonly<{
+  endpoint: string
+  publicKeySha256: string
+  platform: string
+  version: string
+  launchedAt: number
+}>): ReadonlyArray<Readonly<{
+  event: string
+  app_version: string
+  endpoint: string
+  public_key_sha256: string
+  platform: string
+  correlation_id: string
+  recorded_at: string
+  process_id: number
+}>>
+
 /** 验证 staged metadata 与完整下载包同时绑定本次候选。 */
 export function verifyStagedCandidate(metadata: unknown, packageBytes: Buffer, expected: Readonly<Record<string, string>>): true
 
@@ -29,6 +47,9 @@ export function waitForLinuxDesktopReadiness<T>(waitForHost: () => Promise<unkno
 
 /** 从 wmctrl 快照中只选择属于 Desktop 进程树的唯一窗口。 */
 export function selectLinuxDesktopWindow(output: string, processPids: readonly number[]): string | undefined
+
+/** 从 wmctrl 快照中只解析后续绑定所需的窗口 ID 与 PID。 */
+export function parseLinuxDesktopWindows(output: string): ReadonlyArray<Readonly<{ windowId: string; pid: number }>>
 
 /** hosted Windows 无交互 WebView 会话时跳过 Host readiness。 */
 export function requiresDesktopHostReadiness(target: string): boolean
