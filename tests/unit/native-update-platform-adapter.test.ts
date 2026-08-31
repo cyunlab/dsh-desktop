@@ -4,9 +4,11 @@ import { describe, expect, it } from 'vitest'
 
 import {
   linuxX11LaunchPlan,
+  matchingConfigurationIdentityEvents,
   nativeCloseCommandPlan,
   nativeUpdaterFailureSummary,
   parseDesktopProcessRows,
+  parseLinuxDesktopWindows,
   platformStatePaths,
   processEnvironmentContainsAppImage,
   requiresDesktopHostReadiness,
@@ -17,6 +19,32 @@ import {
 } from '../../scripts/native-update-platform-adapter.mjs'
 
 describe('native update platform adapter pure contracts', () => {
+  /** 第二次启动必须能从已累积超过普通命令输出上限的安全 updater 日志中找到最新配置身份。 */
+  it('finds the candidate configuration identity in an accumulated updater log', () => {
+    const launchedAt = Date.now()
+    const expected = {
+      endpoint: 'https://updates.cyunlab.com/dsh-desktop/channels/stable/latest.json',
+      publicKeySha256: 'a'.repeat(64),
+      platform: 'macos-aarch64',
+      version: '2.1.11',
+      launchedAt,
+    }
+    const transition = `${JSON.stringify({ event: 'update-transition', version: '2.1.11', padding: 'x'.repeat(512) })}\n`
+    const identity = {
+      event: 'updater-configuration-identity',
+      app_version: '2.1.11',
+      endpoint: expected.endpoint,
+      public_key_sha256: expected.publicKeySha256,
+      platform: expected.platform,
+      correlation_id: 'updater-configuration',
+      recorded_at: new Date(launchedAt).toISOString(),
+      process_id: 4321,
+    }
+    const log = Buffer.from(`${transition.repeat(256)}${JSON.stringify(identity)}\n`)
+    expect(log.length).toBeGreaterThan(128 * 1024)
+    expect(matchingConfigurationIdentityEvents(log, expected)).toEqual([identity])
+  })
+
   /** staging 必须同时绑定候选版本、literal signature、Tauri target、安装类型与下载字节。 */
   it('accepts only the exact staged candidate identity', () => {
     const packageBytes = Buffer.from('candidate package')
@@ -98,6 +126,13 @@ describe('native update platform adapter pure contracts', () => {
     expect(selectLinuxDesktopWindow(rows, [123, 456])).toBe('0x04600007')
     expect(selectLinuxDesktopWindow('0x04600007  0 0 runner DeepSeek Harness Desktop', [123])).toBe('0x04600007')
     expect(selectLinuxDesktopWindow(rows, [123])).toBeUndefined()
+  })
+
+  /** Linux 窗口诊断只保留绑定所需的 ID/PID，不带窗口标题或 runner 文本。 */
+  it('parses bounded Linux window identity without retaining titles', () => {
+    expect(parseLinuxDesktopWindows('0x04600007  0 456 runner sensitive title')).toEqual([
+      { windowId: '0x04600007', pid: 456 },
+    ])
   })
 
   /** 多个进程树窗口或多个无 PID 窗口必须失败关闭，不能猜测主窗口。 */
