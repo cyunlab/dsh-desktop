@@ -45,6 +45,16 @@ Set these Environment variables exactly as shown:
 | `UPDATER_BOOTSTRAP_LEGACY_VERSION` | Exact semantic version of the approved pre-updater OSS Stable anchor |
 | `UPDATER_BOOTSTRAP_LEGACY_MANIFEST_SHA256` | Lowercase SHA-256 of the byte-exact approved pre-updater OSS Stable anchor |
 | `UPDATER_BOOTSTRAP_MACOS_SIGNING_CONFIGURED` | Literal `true` requires Apple trust checks; literal `false` explicitly approves unsigned macOS; missing or any other value fails closed |
+| `UPDATER_RECOVERY_TAG` | Exact one-time approved broken-updater recovery tag; for the known incident, `v2.1.10` |
+| `UPDATER_RECOVERY_VERSION` | Exact semantic version matching `UPDATER_RECOVERY_TAG` |
+| `UPDATER_RECOVERY_COMMIT` | Exact 40-character lowercase Git commit resolved by the recovery tag |
+| `UPDATER_RECOVERY_MANIFEST_SHA256` | Lowercase SHA-256 of the byte-exact immutable recovery candidate manifest |
+| `UPDATER_RECOVERY_BROKEN_STABLE_VERSION` | Exact semantic version of the broken current Stable anchor |
+| `UPDATER_RECOVERY_BROKEN_STABLE_MANIFEST_SHA256` | Lowercase SHA-256 of the byte-exact broken Stable manifest |
+| `UPDATER_RECOVERY_PRIOR_RECEIPT_KEY` | Exact sole first-updater bootstrap receipt object key; its digest-prefixed filename must match the approved raw digest |
+| `UPDATER_RECOVERY_PRIOR_RECEIPT_SHA256` | Lowercase SHA-256 of the raw first-updater bootstrap receipt bytes |
+| `UPDATER_RECOVERY_FAILED_PROMOTION_RUN_ID` | Numeric GitHub Actions run ID that demonstrated the broken updater path |
+| `UPDATER_RECOVERY_MACOS_SIGNING_CONFIGURED` | Must be the literal `true`; recovery accepts only verified macOS signing and notarization evidence |
 
 Set these Environment secrets exactly as shown:
 
@@ -188,7 +198,17 @@ Finalization downloaded and reverified the attested four-target evidence, then e
 
 Bootstrap finalization participates in the same global promotion lock as normal Stable promotion. It acquires the lock only after evidence admission and before receipt creation, then re-reads all admission inputs while holding it. Stable is the last release-content mutation; the owner verifies the resulting Stable bytes before releasing the lock.
 
-This workflow has been used exactly once and is permanently closed by its immutable receipt. All later releases use normal previous-Stable real-native validation. Never change the retained approval identity, manually edit Stable, delete the receipt, or reuse bootstrap for a later release.
+This workflow has been used exactly once and is permanently closed by its immutable receipt. Never change the retained approval identity, manually edit Stable, delete the receipt, or reuse bootstrap for a later release.
+
+### One-time broken-updater Stable recovery
+
+The first updater Stable, v2.1.5, downloads an update into a temporary file but stages it while the file cursor remains at EOF. The repaired v2.1.10 code cannot change the downloader already executing inside an installed v2.1.5 application. Existing v2.1.5 installations therefore require a manual v2.1.10-or-later installation; recovery cannot truthfully claim that they auto-upgraded.
+
+`recover-updater-stable.yml` is a separately reviewed, manual, one-time exception that establishes v2.1.10 as the healthy baseline for new and manually updated installations. Dispatch it only after setting every `UPDATER_RECOVERY_*` variable above to the reviewed incident identity. Preparation requires the protected candidate manifest digest and byte-exact v2.1.5 Stable/receipt anchors. Four GitHub-hosted runners must fresh-install the published v2.1.10 assets. Artifact attestations are restricted to the exact reusable workflow and workflow commit, and both macOS documents must record verified code signing and notarization.
+
+Recovery and normal promotion share the `stable-promotion` concurrency group and OSS promotion lock. Finalization rebinds the downloaded candidate artifact and protected variables before OIDC, then re-reads all admission inputs while holding the lock. It writes and byte-verifies one immutable `dsh-desktop/recovery/receipts/<sha256>-broken-updater-stable.json` object, re-reads the prior bootstrap receipt after that write, and replaces Stable last. Any existing recovery receipt, including a partial record, permanently blocks reuse.
+
+After recovery, publish a higher semantic version and require the ordinary four-target previous-Stable native update gate. A v2.1.10-to-successor run is the first production proof that automatic update is repaired. Only after that proof may the temporary bootstrap/recovery workflows and approval variables be removed; both immutable OSS receipts remain permanent audit records.
 
 Never manually edit Stable to point at a partly uploaded release. Never reuse a version path or overwrite an immutable package.
 
@@ -254,12 +274,12 @@ Disable the `production` Environment or publishing role first. Revoke or tighten
 - [ ] RAM permissions cannot read, write, list, delete, or administer outside the required `dsh-desktop/` scope.
 - [ ] The publishing RAM role has no object delete permission and immutable release objects are retained permanently.
 - [ ] Every package and signature basename starts with its deterministic SHA-256 prefix; same-key retries verify byte-for-byte identity before reuse.
-- [ ] All normal Environment variables, the six fixed `UPDATER_BOOTSTRAP_*` approval variables, and both Environment secrets use the exact names in this runbook.
+- [ ] All normal Environment variables, fixed one-time bootstrap/recovery approval variables, and both Environment secrets use the exact names in this runbook.
 - [ ] `TAURI_SIGNING_PUBLIC_KEY` matches both the protected private key and the public key embedded in Desktop; offline encrypted restore has been tested.
 - [ ] Promotion verifies all four updater packages with minisign before writing OSS.
 - [ ] Windows builds explicitly use NSIS `currentUser`; all four binaries embed the production Stable endpoint and the same updater public key used by promotion.
 - [ ] Candidate preparation binds the authoritative previous Stable URL/version/digest, uploads only immutable objects, and leaves Stable unchanged.
-- [ ] Both normal and bootstrap finalizers use the same OSS `AppendObject(position=0)` promotion lock; conflicts fail closed and successful owners verify Stable before releasing it.
+- [ ] Normal, bootstrap, and recovery finalizers use the same OSS `AppendObject(position=0)` promotion lock; conflicts fail closed and successful owners verify Stable before releasing it.
 - [ ] Aggregate and final admission both require exact fresh real-native evidence before final OIDC exchange.
 - [ ] Draft creation leaves Stable unchanged; every candidate, smoke, evidence, credential, or revalidation failure also leaves Stable unchanged.
 - [ ] A successful published-release smoke has passed on all four targets and its evidence is recorded.
@@ -267,6 +287,7 @@ Disable the `production` Environment or publishing role first. Revoke or tighten
 - [ ] Authoritative Stable still matches the byte-identical approved legacy version and digest, and the bootstrap receipt prefix is empty before dispatch.
 - [ ] All four attested `bootstrap-fresh-install` documents pass the dedicated verifier without claiming a previous-Stable upgrade.
 - [ ] The content-digested immutable bootstrap receipt is byte-verified before Stable is written last; any partial receipt is preserved and blocks reuse.
+- [ ] Recovery binds the exact candidate manifest, broken Stable, prior receipt, failed run, signer workflow, signer digest, and verified macOS trust evidence before writing its immutable receipt and Stable last.
 - [ ] The four evidence documents pass `verify-update-smoke-evidence.mjs --require-real-native`, and their GitHub artifact attestations verify against this repository and workflow run.
 - [ ] The evidence baseline is the exact OSS Stable manifest target, not a source rebuild, fixture, or GitHub latest-release guess.
 
