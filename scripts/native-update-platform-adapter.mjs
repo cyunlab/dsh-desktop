@@ -450,6 +450,17 @@ async function waitForLinuxWindow(pid, environment, command) {
   throw new Error('Linux Desktop X11 window was not observed')
 }
 
+/** 先等待固定 Host ready，再观察依赖页面加载的 Linux X11 主窗口。 */
+export async function waitForLinuxDesktopReadiness(waitForHost, waitForWindow) {
+  await waitForHost()
+  return await waitForWindow()
+}
+
+/** hosted Windows 无交互 WebView 会话时跳过 Host readiness，仍保留真实 Desktop updater 与安装验证。 */
+export function requiresDesktopHostReadiness(target) {
+  return target !== 'windows-x86_64'
+}
+
 /** 强制清理失败路径上的 Desktop 进程树，不用于生成正常退出证据。 */
 async function cleanupLaunch(target, launch, environment, command) {
   if (!launch?.applicationPid && !launch?.pid) return
@@ -629,10 +640,18 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
     }, launchResult.installation, target, commandEnvironment, command)
     launchResult.applicationPid = event.process_id
     if (launches.some(previous => previous !== launchResult && previous.applicationPid === event.process_id)) throw new Error('explicit updated launch reused a previous Desktop PID')
-    if (target === 'linux-x86_64') launchResult.windowId = await waitForLinuxWindow(event.process_id, { ...commandEnvironment, DISPLAY: launchResult.display }, command)
-    await waitForHostReady(launchResult)
-    launchResult.listenerPid = await findFixedHostListenerProcess(target, commandEnvironment, command)
-    launchResult.listenerTreePids = await findProcessTreePids(target, launchResult.listenerPid, commandEnvironment, command)
+    if (target === 'linux-x86_64') {
+      launchResult.windowId = await waitForLinuxDesktopReadiness(
+        () => waitForHostReady(launchResult),
+        () => waitForLinuxWindow(event.process_id, { ...commandEnvironment, DISPLAY: launchResult.display }, command),
+      )
+    } else if (requiresDesktopHostReadiness(target)) {
+      await waitForHostReady(launchResult)
+    }
+    if (requiresDesktopHostReadiness(target)) {
+      launchResult.listenerPid = await findFixedHostListenerProcess(target, commandEnvironment, command)
+      launchResult.listenerTreePids = await findProcessTreePids(target, launchResult.listenerPid, commandEnvironment, command)
+    }
     if (version === options.candidateVersion) {
       const deadline = Date.now() + 30_000
       while (await lstat(statePaths.stagedMetadata).catch(() => null)) {

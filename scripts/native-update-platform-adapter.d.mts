@@ -24,6 +24,12 @@ export function linuxX11LaunchPlan(installationPath: string): {
   readonly display: string
 }
 
+/** 先等待固定 Host ready，再观察依赖页面加载的 Linux X11 主窗口。 */
+export function waitForLinuxDesktopReadiness<T>(waitForHost: () => Promise<unknown>, waitForWindow: () => Promise<T>): Promise<T>
+
+/** hosted Windows 无交互 WebView 会话时跳过 Host readiness。 */
+export function requiresDesktopHostReadiness(target: string): boolean
+
 /** 从脱敏更新日志提取最新失败阶段，并识别无需等待自动重试的永久 HTTP 失败。 */
 export function nativeUpdaterFailureSummary(logBody: Buffer): {
   readonly message: string
