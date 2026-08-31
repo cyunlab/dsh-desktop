@@ -9,8 +9,10 @@ import {
   parseDesktopProcessRows,
   platformStatePaths,
   processEnvironmentContainsAppImage,
+  requiresDesktopHostReadiness,
   sameInstallationLocation,
   verifyStagedCandidate,
+  waitForLinuxDesktopReadiness,
 } from '../../scripts/native-update-platform-adapter.mjs'
 
 describe('native update platform adapter pure contracts', () => {
@@ -65,6 +67,32 @@ describe('native update platform adapter pure contracts', () => {
     expect(sessionScript).toContain('/usr/bin/openbox')
     expect(sessionScript).toContain('/usr/bin/wmctrl')
     expect(sessionScript).toContain('"$1"')
+  })
+
+  /** Linux 必须先等待固定 Host ready，再要求依赖页面加载的 X11 主窗口出现。 */
+  it('waits for fixed Host readiness before observing the Linux X11 window', async () => {
+    const events: string[] = []
+    let hostReady = false
+    const windowId = await waitForLinuxDesktopReadiness(
+      async () => {
+        events.push('host')
+        hostReady = true
+      },
+      async () => {
+        events.push('window')
+        if (!hostReady) throw new Error('window was checked before fixed Host readiness')
+        return '0x04600007'
+      },
+    )
+    expect(events).toEqual(['host', 'window'])
+    expect(windowId).toBe('0x04600007')
+  })
+
+  /** hosted Windows 没有交互 WebView 会话，只跳过 Host readiness，其他原生边界保持不变。 */
+  it('requires Desktop Host readiness only where the hosted runner can provide a WebView session', () => {
+    expect(requiresDesktopHostReadiness('windows-x86_64')).toBe(false)
+    expect(requiresDesktopHostReadiness('linux-x86_64')).toBe(true)
+    expect(requiresDesktopHostReadiness('darwin-aarch64')).toBe(true)
   })
 
   /** 脱敏日志必须让 OSS 4xx 永久失败快速可诊断，同时不泄露原始记录。 */

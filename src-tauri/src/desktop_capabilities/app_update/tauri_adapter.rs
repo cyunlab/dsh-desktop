@@ -1,5 +1,6 @@
 use super::staging::{
-    atomic_replace_file, InstallKind, StageCandidate, StagingRepository, UpdateVerifier,
+    atomic_replace_file, InstallKind, StageCandidate, StagedUpdate, StagingError,
+    StagingRepository, UpdateVerifier,
 };
 use super::{
     Clock, DownloadProgress, PreferenceError, PreferenceStore, StableRelease, UpdateController,
@@ -11,7 +12,7 @@ use minisign_verify::{PublicKey, Signature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -499,6 +500,19 @@ impl UpdateVerifier for TauriMinisignVerifier {
             .verify(&bytes, &signature, true)
             .map_err(|_| "update signature verification failed".to_string())
     }
+}
+
+/// 将下载临时文件归零后交给 staging，避免从 EOF 复制出空包。
+fn stage_downloaded_package<V: UpdateVerifier>(
+    repository: &mut StagingRepository<V>,
+    candidate: StageCandidate,
+    package: &mut tempfile::NamedTempFile,
+) -> Result<StagedUpdate, StagingError> {
+    package
+        .as_file_mut()
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| StagingError::StorageFailed)?;
+    repository.stage(candidate, package.as_file_mut())
 }
 
 /// 解码 Tauri updater 对 minisign 文本增加的外层 base64。
@@ -1073,7 +1087,7 @@ impl TauriUpdateRuntime {
         let staged = self.staging.lock().ok().and_then(|mut repository| {
             repository
                 .as_mut()
-                .map(|repository| repository.stage(candidate, temporary.as_file_mut()))
+                .map(|repository| stage_downloaded_package(repository, candidate, &mut temporary))
         });
         match staged {
             Some(Ok(_)) => self.dispatch(app, UpdateInput::DownloadSucceeded),
@@ -1732,6 +1746,40 @@ mod tests {
         package.as_file_mut().set_len(0).unwrap();
         package.write_all(b"Test").unwrap();
         assert!(verifier.verify(package.path(), &signature).is_err());
+    }
+
+    /// 下载完成后的临时文件即使游标位于 EOF，也必须从头复制并验签进入 staging。
+    #[test]
+    fn downloaded_package_is_rewound_before_staging() {
+        let cache = tempfile::tempdir().unwrap();
+        let public_key_text = "untrusted comment: minisign public key E7620F1842B4E81F\nRWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+        let signature_text = "untrusted comment: signature from minisign secret key\nRWQf6LRCGA9i59SLOFxz6NxvASXDJeRtuZykwQepbDEGt87ig1BNpWaVWuNrm73YiIiJbq71Wi+dP9eKL8OC351vwIasSSbXxwA=\ntrusted comment: timestamp:1555779966\tfile:test\nQtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfNQUaOAA==";
+        let key = base64::engine::general_purpose::STANDARD.encode(public_key_text);
+        let signature = base64::engine::general_purpose::STANDARD.encode(signature_text);
+        let mut repository =
+            StagingRepository::open(cache.path(), TauriMinisignVerifier::new(&key).unwrap())
+                .unwrap();
+        let mut package = tempfile::NamedTempFile::new().unwrap();
+        package.write_all(b"test").unwrap();
+
+        let staged = stage_downloaded_package(
+            &mut repository,
+            StageCandidate::with_install_plan(
+                "2.1.0",
+                &signature,
+                &tauri_plugin_updater::target().unwrap(),
+                InstallKind::current(),
+            )
+            .unwrap(),
+            &mut package,
+        )
+        .unwrap();
+
+        assert_eq!(staged.version(), "2.1.0");
+        assert_eq!(
+            fs::read(cache.path().join("desktop-update/package.bin")).unwrap(),
+            b"test"
+        );
     }
 
     /// HTTP 失败只在瞬时类别进入自动重试，元数据类 4xx 关闭信任。
