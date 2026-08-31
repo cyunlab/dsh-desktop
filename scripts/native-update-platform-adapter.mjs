@@ -139,8 +139,8 @@ export function nativeCloseCommandPlan(target, launch) {
     }
   }
   if (target === 'linux-x86_64') {
-    if (!/^0x[0-9a-f]+$/i.test(launch.windowId ?? '') || !/^:\d+$/.test(launch.display ?? '')) throw new Error('Linux native close requires an exact X11 window and display')
-    return { executable: 'wmctrl', args: ['-i', '-c', launch.windowId], environment: { DISPLAY: launch.display } }
+    if (!/^0x[0-9a-f]+$/i.test(launch.windowId ?? '') || !/^:\d+$/.test(launch.display ?? '') || !path.isAbsolute(launch.xauthority ?? '') || launch.xauthority.includes('\0')) throw new Error('Linux native close requires an exact X11 window, display, and authority file')
+    return { executable: 'wmctrl', args: ['-i', '-c', launch.windowId], environment: { DISPLAY: launch.display, XAUTHORITY: launch.xauthority } }
   }
   if (target?.startsWith('darwin-')) {
     if (!Number.isSafeInteger(launch.applicationPid) || launch.applicationPid <= 0) throw new Error('native close requires the Desktop application PID')
@@ -157,13 +157,15 @@ export function nativeCloseCommandPlan(target, launch) {
 /** 在固定 Xvfb 内先启动 EWMH window manager，再以位置参数启动 exact AppImage。 */
 export function linuxX11LaunchPlan(installationPath) {
   if (!path.isAbsolute(installationPath) || installationPath.includes('\0')) throw new Error('Linux X11 launch requires an absolute AppImage path')
+  const xauthority = path.join(path.dirname(installationPath), '.Xauthority')
   return {
     executable: 'dbus-run-session',
     args: [
-      '--', 'xvfb-run', '-n', '99', '-s', '-screen 0 1280x1024x24',
+      '--', 'xvfb-run', '-n', '99', '-f', xauthority, '-s', '-screen 0 1280x1024x24',
       '/usr/bin/bash', '-c', LINUX_X11_SESSION_SCRIPT, 'dsh-native-update-x11', installationPath,
     ],
     display: ':99',
+    xauthority,
   }
 }
 
@@ -488,7 +490,7 @@ async function waitForLinuxWindow(pid, environment, command) {
     process_tree_pids: lastProcessPids.slice(0, 64),
     windows: parseLinuxDesktopWindows(lastOutput).slice(0, 64),
   }
-  throw new Error(`[DEBUG-linux-window-9f3c] Linux Desktop X11 window was not observed: ${JSON.stringify(snapshot)}`)
+  throw new Error(`Linux Desktop X11 window was not observed: ${JSON.stringify(snapshot)}`)
 }
 
 /** 先等待固定 Host ready，再观察依赖页面加载的 Linux X11 主窗口。 */
@@ -652,19 +654,22 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
     let launchEnvironment = { ...installation.launchEnvironment }
     let launcherMayExit = false
     let display
+    let xauthority
     if (target === 'linux-x86_64') {
       const plan = linuxX11LaunchPlan(installation.installPath)
       display = plan.display
+      xauthority = plan.xauthority
       executable = plan.executable
       args = plan.args
       launchEnvironment.DISPLAY = display
+      launchEnvironment.XAUTHORITY = xauthority
     } else if (target.startsWith('darwin-')) {
       executable = '/usr/bin/open'
       args = ['-n', '-a', installation.application]
       launcherMayExit = true
     }
     const launchedAt = Date.now()
-    const result = { ...launchApplication(executable, args, launchEnvironment), installation, launchedAt, launcherMayExit, display, closeHelper: installation.closeHelper }
+    const result = { ...launchApplication(executable, args, launchEnvironment), installation, launchedAt, launcherMayExit, display, xauthority, closeHelper: installation.closeHelper }
     launches.push(result)
     return result
   }
@@ -684,7 +689,7 @@ export function createNativeUpdatePlatformAdapter(target, environment = process.
     if (target === 'linux-x86_64') {
       launchResult.windowId = await waitForLinuxDesktopReadiness(
         () => waitForHostReady(launchResult),
-        () => waitForLinuxWindow(event.process_id, { ...commandEnvironment, DISPLAY: launchResult.display }, command),
+        () => waitForLinuxWindow(event.process_id, { ...commandEnvironment, DISPLAY: launchResult.display, XAUTHORITY: launchResult.xauthority }, command),
       )
     } else if (requiresDesktopHostReadiness(target)) {
       await waitForHostReady(launchResult)

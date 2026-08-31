@@ -40,6 +40,7 @@ export function linuxX11LaunchPlan(installationPath: string): {
   readonly executable: string
   readonly args: readonly string[]
   readonly display: string
+  readonly xauthority: string
 }
 
 /** 先等待固定 Host ready，再观察依赖页面加载的 Linux X11 主窗口。 */
