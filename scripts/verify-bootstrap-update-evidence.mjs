@@ -125,6 +125,7 @@ function verifyDocument(document, expectations) {
     if (typeof document.platform.signing_credentials_configured !== 'boolean') throw new Error('macOS signing credential observation is required')
     const expected = document.platform.signing_credentials_configured ? 'verified' : 'not-configured'
     if (document.platform.code_signing !== expected || document.platform.notarization !== expected) throw new Error('platform contract mismatch for macOS signing/notarization')
+    if (expectations.requireMacosSigning && expected !== 'verified') throw new Error('verified macOS signing and notarization are required')
   }
 
   const candidate = requireObject(document.candidate, 'candidate')
@@ -214,6 +215,7 @@ function parseArguments(args) {
   for (let index = 0; index < args.length; index += 1) {
     const name = args[index]
     if (name === '--require-real-bootstrap') values.requireRealBootstrap = true
+    else if (name === '--require-macos-signing') values.requireMacosSigning = true
     else {
       const value = args[++index]
       if (!name?.startsWith('--') || value === undefined) throw new Error(`invalid bootstrap evidence argument: ${name ?? ''}`)
@@ -234,7 +236,8 @@ export async function runBootstrapUpdateEvidenceCli(args = process.argv.slice(2)
   const version = values['candidate-tag'].replace(/^v/, '')
   return verifyBootstrapUpdateEvidenceDirectory(values.evidence, {
     tag: values['candidate-tag'], version, commit: values['candidate-commit'], manifest_sha256: values['manifest-sha256'],
-    maxAgeHours: Number(values['max-age-hours']), requireRealBootstrap: values.requireRealBootstrap === true, now
+    maxAgeHours: Number(values['max-age-hours']), requireRealBootstrap: values.requireRealBootstrap === true,
+    requireMacosSigning: values.requireMacosSigning === true, now
   })
 }
 

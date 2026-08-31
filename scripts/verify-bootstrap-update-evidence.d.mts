@@ -35,6 +35,7 @@ export interface BootstrapUpdateExpectations {
   readonly manifest_sha256: string
   readonly maxAgeHours: number
   readonly requireRealBootstrap?: boolean
+  readonly requireMacosSigning?: boolean
   readonly now?: Date
 }
 
