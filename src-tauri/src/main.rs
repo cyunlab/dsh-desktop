@@ -586,9 +586,6 @@ fn mark_client_page_loaded(app: &AppHandle, state: &RuntimeState, loaded_url: &t
         *loading_url = None;
     }
     transition(app, state, LifecycleState::Ready, "Ready.");
-    if let Some(updater) = app.try_state::<Arc<TauriUpdateRuntime>>() {
-        updater.inner().dispatch(app, UpdateInput::Ready);
-    }
 }
 
 /// HTTP 响应在有界读取中的严格 framing 判定。
@@ -2024,7 +2021,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     app.manage(Arc::clone(&state));
     let update_runtime = TauriUpdateRuntime::new(app.handle())?;
     install_update_menu(app, &update_runtime)?;
-    app.manage(update_runtime);
+    app.manage(Arc::clone(&update_runtime));
+    update_runtime.dispatch(app.handle(), UpdateInput::Ready);
     let app_handle = app.handle().clone();
     #[cfg(all(debug_assertions, unix))]
     register_development_shutdown_signals(app_handle.clone(), Arc::clone(&state))?;
