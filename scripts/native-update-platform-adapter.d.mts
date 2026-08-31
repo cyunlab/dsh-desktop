@@ -27,6 +27,9 @@ export function linuxX11LaunchPlan(installationPath: string): {
 /** 先等待固定 Host ready，再观察依赖页面加载的 Linux X11 主窗口。 */
 export function waitForLinuxDesktopReadiness<T>(waitForHost: () => Promise<unknown>, waitForWindow: () => Promise<T>): Promise<T>
 
+/** 从 wmctrl 快照中只选择属于 Desktop 进程树的唯一窗口。 */
+export function selectLinuxDesktopWindow(output: string, processPids: readonly number[]): string | undefined
+
 /** hosted Windows 无交互 WebView 会话时跳过 Host readiness。 */
 export function requiresDesktopHostReadiness(target: string): boolean
 

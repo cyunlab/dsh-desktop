@@ -437,14 +437,30 @@ async function findFixedHostListenerProcess(target, environment, command) {
   return pids[0]
 }
 
-/** 等待 Linux X11 中属于真实 Desktop PID 的唯一主窗口。 */
+/** 从 wmctrl 快照中只选择属于 Desktop 进程树的唯一窗口。 */
+export function selectLinuxDesktopWindow(output, processPids) {
+  const allowedPids = new Set(processPids)
+  const windows = String(output).split(/\r?\n/).flatMap(line => {
+    const match = /^(0x[0-9a-f]+)\s+\S+\s+(\d+)\s+/i.exec(line)
+    return match ? [{ windowId: match[1], pid: Number(match[2]) }] : []
+  })
+  const matches = windows.filter(window => allowedPids.has(window.pid))
+  if (matches.length === 1) return matches[0].windowId
+  if (matches.length > 1) throw new Error('Linux Desktop X11 window is ambiguous')
+  if (windows.length === 1 && windows[0].pid === 0) return windows[0].windowId
+  return undefined
+}
+
+/** 等待 Linux X11 中属于真实 Desktop 进程树的唯一主窗口。 */
 async function waitForLinuxWindow(pid, environment, command) {
   const deadline = Date.now() + 60_000
   while (Date.now() < deadline) {
-    const output = await command('wmctrl', ['-lp'], { environment }).catch(() => '')
-    const matches = output.split(/\r?\n/).map(line => /^(0x[0-9a-f]+)\s+\S+\s+(\d+)\s+/i.exec(line)).filter(match => Number(match?.[2]) === pid)
-    if (matches.length === 1) return matches[0][1]
-    if (matches.length > 1) throw new Error('Linux Desktop X11 window is ambiguous')
+    const [output, processPids] = await Promise.all([
+      command('wmctrl', ['-lp'], { environment }).catch(() => ''),
+      findProcessTreePids('linux-x86_64', pid, environment, command),
+    ])
+    const windowId = selectLinuxDesktopWindow(output, processPids)
+    if (windowId) return windowId
     await delay(500)
   }
   throw new Error('Linux Desktop X11 window was not observed')

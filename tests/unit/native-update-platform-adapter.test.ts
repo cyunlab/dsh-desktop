@@ -11,6 +11,7 @@ import {
   processEnvironmentContainsAppImage,
   requiresDesktopHostReadiness,
   sameInstallationLocation,
+  selectLinuxDesktopWindow,
   verifyStagedCandidate,
   waitForLinuxDesktopReadiness,
 } from '../../scripts/native-update-platform-adapter.mjs'
@@ -86,6 +87,29 @@ describe('native update platform adapter pure contracts', () => {
     )
     expect(events).toEqual(['host', 'window'])
     expect(windowId).toBe('0x04600007')
+  })
+
+  /** Linux X11 的主窗口可以属于 WebView 子进程，也兼容隔离显示器上唯一的无 PID 窗口。 */
+  it('selects the unique Linux Desktop window from the process tree', () => {
+    const rows = [
+      '0x04600007  0 456 runner DeepSeek Harness Desktop',
+      '0x04800009  0 999 runner unrelated',
+    ].join('\n')
+    expect(selectLinuxDesktopWindow(rows, [123, 456])).toBe('0x04600007')
+    expect(selectLinuxDesktopWindow('0x04600007  0 0 runner DeepSeek Harness Desktop', [123])).toBe('0x04600007')
+    expect(selectLinuxDesktopWindow(rows, [123])).toBeUndefined()
+  })
+
+  /** 多个进程树窗口或多个无 PID 窗口必须失败关闭，不能猜测主窗口。 */
+  it('rejects ambiguous Linux Desktop windows', () => {
+    expect(() => selectLinuxDesktopWindow([
+      '0x04600007  0 456 runner first',
+      '0x04800009  0 456 runner second',
+    ].join('\n'), [123, 456])).toThrow('ambiguous')
+    expect(selectLinuxDesktopWindow([
+      '0x04600007  0 0 runner first',
+      '0x04800009  0 0 runner second',
+    ].join('\n'), [123])).toBeUndefined()
   })
 
   /** hosted Windows 没有交互 WebView 会话，只跳过 Host readiness，其他原生边界保持不变。 */
