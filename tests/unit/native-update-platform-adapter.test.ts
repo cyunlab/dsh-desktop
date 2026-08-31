@@ -78,8 +78,8 @@ describe('native update platform adapter pure contracts', () => {
   /** 正常退出只操作精确窗口；macOS helper 不能退化成 application Quit。 */
   it('builds no-shell native close plans', () => {
     expect(nativeCloseCommandPlan('windows-x86_64', { applicationPid: 123 })).toMatchObject({ executable: 'powershell.exe' })
-    expect(nativeCloseCommandPlan('linux-x86_64', { windowId: '0x04600007', display: ':99' })).toEqual({
-      executable: 'wmctrl', args: ['-i', '-c', '0x04600007'], environment: { DISPLAY: ':99' },
+    expect(nativeCloseCommandPlan('linux-x86_64', { windowId: '0x04600007', display: ':99', xauthority: '/tmp/install/.Xauthority' })).toEqual({
+      executable: 'wmctrl', args: ['-i', '-c', '0x04600007'], environment: { DISPLAY: ':99', XAUTHORITY: '/tmp/install/.Xauthority' },
     })
     expect(nativeCloseCommandPlan('darwin-aarch64', { applicationPid: 456, closeHelper: '/private/tmp/smoke/macos-close-window' })).toEqual({
       executable: '/private/tmp/smoke/macos-close-window', args: ['456'], environment: {},
@@ -90,7 +90,12 @@ describe('native update platform adapter pure contracts', () => {
   it('builds a managed X11 session around the exact AppImage path', () => {
     const installationPath = '/tmp/install/DeepSeek-Harness-Desktop.AppImage'
     const plan = linuxX11LaunchPlan(installationPath)
-    expect(plan).toMatchObject({ executable: 'dbus-run-session', display: ':99' })
+    expect(plan).toMatchObject({
+      executable: 'dbus-run-session',
+      display: ':99',
+      xauthority: '/tmp/install/.Xauthority',
+    })
+    expect(plan.args).toContain('/tmp/install/.Xauthority')
     expect(plan.args.slice(-2)).toEqual(['dsh-native-update-x11', installationPath])
     const sessionScript = plan.args.at(-3)
     expect(sessionScript).toContain('/usr/bin/openbox')
