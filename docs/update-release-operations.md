@@ -156,7 +156,7 @@ dsh-desktop/
 
 Every updater package and signature object uses a basename prefixed with the lowercase SHA-256 digest of that object's complete bytes. Different bytes therefore always produce a different OSS key under the same `releases/<semver>/<target>/` directory. The implementation may use the documented fixed-length `<sha256-prefix>` rather than the entire digest, but it must derive that prefix from the complete object bytes and use the same deterministic length for every object.
 
-Immutable release objects use a long immutable cache policy and are retained permanently. The publishing RAM role has no delete permission. The Stable manifest uses `Cache-Control: no-cache`. Every platform entry contains `url` for the updater package and `installer_url` for the human-facing installer. Windows and Linux reuse the same file for both fields; both macOS targets publish a separate notarized DMG. Entries also contain the literal contents of each updater `.sig` file, not a signature filename or URL.
+Immutable release objects use a long immutable cache policy and are retained permanently. The publishing RAM role has no delete permission. The Stable manifest uses `Cache-Control: no-cache`. Every platform entry contains `url` for the updater package and `installer_url` for the human-facing installer. Windows and Linux reuse the same file for both fields; both macOS targets publish a separate notarized DMG. Human-facing installer objects carry a safe ASCII `Content-Disposition` filename in the form `DSH-Desktop-<version>-<platform>.<extension>` so browsers do not expose the content-address prefix. Entries also contain the literal contents of each updater `.sig` file, not a signature filename or URL.
 
 Release procedure:
 

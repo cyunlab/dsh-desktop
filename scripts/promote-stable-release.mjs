@@ -311,6 +311,12 @@ export function createOssutilStorage(options) {
       await writeFile(source, body, { mode: 0o600 })
       const objectMetadata = [`Cache-Control:${metadata.cacheControl}`]
       if (metadata.contentType) objectMetadata.push(`Content-Type:${metadata.contentType}`)
+      if (metadata.downloadFilename) {
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(metadata.downloadFilename)) {
+          throw new Error('download filename must be a safe ASCII basename')
+        }
+        objectMetadata.push(`Content-Disposition:attachment; filename="${metadata.downloadFilename}"`)
+      }
       const args = ['cp', source, objectUri(key)]
       if (allowOverwrite) args.push('--force')
       args.push('--meta', objectMetadata.join('#'))
@@ -356,6 +362,19 @@ export function createOssutilStorage(options) {
   }
 }
 
+/** 返回浏览器保存人工安装包时使用的稳定、简洁文件名。 */
+function installerDownloadFilename(version, target) {
+  const suffixes = {
+    'windows-x86_64': 'Windows-x64.exe',
+    'linux-x86_64': 'Linux-x64.AppImage',
+    'darwin-aarch64': 'macOS-arm64.dmg',
+    'darwin-x86_64': 'macOS-x64.dmg'
+  }
+  const suffix = suffixes[target]
+  if (!suffix) throw new Error(`unsupported installer target: ${target}`)
+  return `DSH-Desktop-${version}-${suffix}`
+}
+
 /** 从命令行参数中读取显式的 release promotion 字段。 */
 function parseArguments(args) {
   const values = {}
@@ -388,13 +407,23 @@ async function buildReleaseBundle(options, dependencies) {
     const key = `${releasePrefix}/${contentAddressedName(artifact.filename, artifact.body)}`
     const signatureKey = `${releasePrefix}/${contentAddressedName(`${artifact.filename}.sig`, artifact.signatureBody)}`
     objects.push(
-      { key, body: artifact.body, contentType: 'application/octet-stream' },
+      {
+        key,
+        body: artifact.body,
+        contentType: 'application/octet-stream',
+        downloadFilename: artifact.installer ? undefined : installerDownloadFilename(version, target)
+      },
       { key: signatureKey, body: artifact.signatureBody, contentType: 'text/plain; charset=utf-8' }
     )
     let installerUrl = new URL(key, `${origin.href.replace(/\/$/, '')}/`).href
     if (artifact.installer) {
       const installerKey = `${releasePrefix}/${contentAddressedName(artifact.installer.filename, artifact.installer.body)}`
-      objects.push({ key: installerKey, body: artifact.installer.body, contentType: 'application/x-apple-diskimage' })
+      objects.push({
+        key: installerKey,
+        body: artifact.installer.body,
+        contentType: 'application/x-apple-diskimage',
+        downloadFilename: installerDownloadFilename(version, target)
+      })
       installerUrl = new URL(installerKey, `${origin.href.replace(/\/$/, '')}/`).href
     }
     platforms[target] = {
@@ -425,7 +454,8 @@ async function publishImmutableObjects(objects, storage) {
   for (const object of objects) {
     await storage.ensureObject(object.key, object.body, {
       cacheControl: 'public, max-age=31536000, immutable',
-      contentType: object.contentType
+      contentType: object.contentType,
+      downloadFilename: object.downloadFilename
     })
   }
   for (const object of objects) {

@@ -11,7 +11,11 @@ export interface PromotionStorage {
   releasePromotionLock?(key: string, ownerBody: Buffer): Promise<void>
 }
 
-export interface ObjectMetadata { readonly cacheControl: string; readonly contentType?: string }
+export interface ObjectMetadata {
+  readonly cacheControl: string
+  readonly contentType?: string
+  readonly downloadFilename?: string
+}
 
 export interface PromotionOptions {
   readonly tag: string
