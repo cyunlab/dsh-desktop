@@ -86,14 +86,14 @@ aliyun oss bucket-policy --method get \
 
 Do not run `set-acl public-read`. The intended public surface is only `dsh-desktop/releases/*` and `dsh-desktop/channels/stable/latest.json`. OSS bucket policies support granting a principal selected actions on selected resources. [OSS bucket policy](https://help.aliyun.com/zh/oss/developer-reference/bucket-policy)
 
-CORS should remain empty for the native updater. Confirm that no rules exist; do not add a wildcard rule:
+For direct downloads from the website, configure bucket CORS with the exact origin `https://cyunlab.com`, methods `GET` and `HEAD`, allowed header `Accept`, exposed header `ETag`, and a bounded max age. Do not use a wildcard origin. Apply the rule and read it back:
 
 ```bash
 aliyun oss cors --method get "oss://${DSH_OSS_BUCKET}" \
   --region "$DSH_OSS_REGION"
 ```
 
-A `NoSuchCORSConfiguration` response is the expected initial state. CORS is a browser-enforced cross-origin mechanism; add it later only if an approved browser origin directly fetches update objects. [OSS CORS](https://help.aliyun.com/zh/oss/user-guide/cors)
+The native updater does not depend on CORS, but the approved website reads the Stable manifest directly. No write method or additional origin belongs in this rule. [OSS CORS](https://help.aliyun.com/zh/oss/user-guide/cors)
 
 ## 4. Bind `updates.cyunlab.com` without CDN
 

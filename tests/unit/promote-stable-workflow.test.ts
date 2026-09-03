@@ -138,5 +138,6 @@ describe('Stable promotion workflow contract', () => {
     expect(workflow).toContain('for target in windows-x86_64 linux-x86_64 darwin-aarch64 darwin-x86_64; do')
     expect(workflow).toContain('artifacts/${target}')
     expect(workflow).toContain('dsh-desktop-${target}-updater.*')
+    expect(workflow).toContain('dsh-desktop-${target}-installer.*')
   })
 })

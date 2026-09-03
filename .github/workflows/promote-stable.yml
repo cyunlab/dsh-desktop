@@ -87,6 +87,12 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --dir "artifacts/${target}" \
               --pattern "dsh-desktop-${target}-updater.*"
+            if [[ "$target" == darwin-* ]]; then
+              gh release download "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --dir "artifacts/${target}" \
+                --pattern "dsh-desktop-${target}-installer.*"
+            fi
           done
       - name: Exchange candidate preparation OIDC identity
         id: candidate-credentials

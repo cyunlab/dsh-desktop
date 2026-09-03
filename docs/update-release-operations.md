@@ -59,7 +59,7 @@ Before enabling promotion, confirm that Environment variables are not secrets an
 4. Keep writes private. Grant anonymous users read-only access only to `dsh-desktop/releases/*`, `dsh-desktop/candidates/*`, and `dsh-desktop/channels/stable/latest.json`; never grant public write. Candidate manifests are public because hosted native smoke runners fetch their isolated immutable URL without OSS credentials. A bucket-level `public-read` ACL is broader than required, so prefer a prefix-scoped bucket policy.
 5. Bind the ICP-filed domain `updates.cyunlab.com` to the bucket and add its DNS CNAME to the OSS public endpoint for `cn-shenzhen`. Upload and bind a valid TLS certificate in OSS. CDN is not required for the first release.
 6. Test anonymous HTTPS `GET` and `HEAD` for a disposable object under `dsh-desktop/releases/`, then remove only that disposable object. Confirm anonymous listing of the bucket is denied and anonymous writes are denied.
-7. CORS is not required by the native Tauri updater because it does not use browser cross-origin fetch. Leave the bucket CORS rules empty initially. If a future browser surface reads this origin directly, add a rule only for the exact approved web origin with `GET` and `HEAD`; do not use `*`, and do not enable write methods.
+7. The native Tauri updater does not use browser CORS, but the CY Lab website reads this origin directly. Configure only exact origin `https://cyunlab.com` with `GET` and `HEAD`; do not use `*` or enable write methods.
 
 The public-read bucket policy should express this shape after placeholders are replaced in the Alibaba Cloud console:
 
@@ -156,7 +156,7 @@ dsh-desktop/
 
 Every updater package and signature object uses a basename prefixed with the lowercase SHA-256 digest of that object's complete bytes. Different bytes therefore always produce a different OSS key under the same `releases/<semver>/<target>/` directory. The implementation may use the documented fixed-length `<sha256-prefix>` rather than the entire digest, but it must derive that prefix from the complete object bytes and use the same deterministic length for every object.
 
-Immutable release objects use a long immutable cache policy and are retained permanently. The publishing RAM role has no delete permission. The Stable manifest uses `Cache-Control: no-cache`. Its platform entries contain public HTTPS URLs for the content-addressed packages and the literal contents of each `.sig` file, not a signature filename or URL.
+Immutable release objects use a long immutable cache policy and are retained permanently. The publishing RAM role has no delete permission. The Stable manifest uses `Cache-Control: no-cache`. Every platform entry contains `url` for the updater package and `installer_url` for the human-facing installer. Windows and Linux reuse the same file for both fields; both macOS targets publish a separate notarized DMG. Entries also contain the literal contents of each updater `.sig` file, not a signature filename or URL.
 
 Release procedure:
 
@@ -236,7 +236,7 @@ Disable the `production` Environment or publishing role first. Revoke or tighten
 - [ ] Bucket exists in `cn-shenzhen`; Versioning is enabled for Stable manifest recovery, no incompatible prevent-overwrite rule/header is configured, and no deletion lifecycle affects `dsh-desktop/`.
 - [ ] Anonymous `GET`/`HEAD` works only for public release objects; anonymous list/write fails.
 - [ ] `updates.cyunlab.com` CNAME and TLS certificate are valid; HTTP is not used by Desktop.
-- [ ] CORS is empty unless an exact browser origin has a documented need for read-only `GET`/`HEAD`.
+- [ ] CORS allows only `https://cyunlab.com` read-only `GET`/`HEAD`, with no wildcard or write methods.
 - [ ] RAM trust matches the observed `iss`, `aud`, and exact `production` Environment `sub` claim.
 - [ ] RAM permissions cannot read, write, list, delete, or administer outside the required `dsh-desktop/` scope.
 - [ ] The publishing RAM role has no object delete permission and immutable release objects are retained permanently.

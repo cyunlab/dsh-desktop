@@ -12,7 +12,7 @@ import {
   type PromotionStorage
 } from '../../scripts/promote-stable-release.mjs'
 
-/** 创建包含四目标更新包与字面签名的发布目录。 */
+/** 创建包含四目标更新包、字面签名与两个 macOS 安装镜像的发布目录。 */
 async function createReleaseDirectory(): Promise<string> {
   const directory = await mkdtemp(path.join(tmpdir(), 'dsh-promotion-'))
   const artifacts = [
@@ -26,6 +26,12 @@ async function createReleaseDirectory(): Promise<string> {
     await mkdir(targetDirectory, { recursive: true })
     await writeFile(path.join(targetDirectory, filename), body)
     await writeFile(path.join(targetDirectory, `${filename}.sig`), `literal-${target}-signature\n`)
+    if (target.startsWith('darwin-')) {
+      const installer = Buffer.alloc(516)
+      installer.write(target, 0)
+      installer.write('koly', 4)
+      await writeFile(path.join(targetDirectory, `dsh-desktop-${target}-installer.dmg`), installer)
+    }
   }
   return directory
 }
@@ -137,7 +143,7 @@ describe('Stable update promotion', () => {
         'darwin-x86_64'
       ])
       expect(storage.events.some(event => event.startsWith('replace:'))).toBe(false)
-      expect(storage.writes).toHaveLength(10)
+      expect(storage.writes).toHaveLength(12)
       expect(storage.writes.slice(1).every(write => write.cacheControl === 'public, max-age=31536000, immutable')).toBe(true)
     } finally {
       await rm(directory, { recursive: true, force: true })
@@ -304,24 +310,28 @@ describe('Stable update promotion', () => {
         platforms: {
           'windows-x86_64': {
             url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/windows-x86_64/b2a78f2057a9e54b7ca5c10ed45b35c26f0e0e9515e842092c6cb9976f117133-dsh-desktop-windows-x86_64-updater.exe',
+            installer_url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/windows-x86_64/b2a78f2057a9e54b7ca5c10ed45b35c26f0e0e9515e842092c6cb9976f117133-dsh-desktop-windows-x86_64-updater.exe',
             signature: 'literal-windows-x86_64-signature\n'
           },
           'linux-x86_64': {
             url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/linux-x86_64/be9f459beb8b4cc94d69639157449701c5e65491c7962806be9f991971991e19-dsh-desktop-linux-x86_64-updater.AppImage',
+            installer_url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/linux-x86_64/be9f459beb8b4cc94d69639157449701c5e65491c7962806be9f991971991e19-dsh-desktop-linux-x86_64-updater.AppImage',
             signature: 'literal-linux-x86_64-signature\n'
           },
           'darwin-aarch64': {
             url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/darwin-aarch64/fd72d30440b0bae1b1c6db6c8ad807f238ef3ca613aa7e8d5329e1e8ddf7da72-dsh-desktop-darwin-aarch64-updater.app.tar.gz',
+            installer_url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/darwin-aarch64/e591f948fd1fae09579a94e70856a1223594a954c0f115f75ae9c3317316c171-dsh-desktop-darwin-aarch64-installer.dmg',
             signature: 'literal-darwin-aarch64-signature\n'
           },
           'darwin-x86_64': {
             url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/darwin-x86_64/fd72d30440b0bae1b1c6db6c8ad807f238ef3ca613aa7e8d5329e1e8ddf7da72-dsh-desktop-darwin-x86_64-updater.app.tar.gz',
+            installer_url: 'https://updates.cyunlab.com/dsh-desktop/releases/2.1.0/darwin-x86_64/db4d232010ff7148eceb23fc2cdf1c2fce2456d7dd8fdbd0c30761990cc954f7-dsh-desktop-darwin-x86_64-installer.dmg',
             signature: 'literal-darwin-x86_64-signature\n'
           }
         }
       })
       const immutableWrites = storage.writes.filter(write => write.cacheControl === 'public, max-age=31536000, immutable')
-      expect(immutableWrites).toHaveLength(9)
+      expect(immutableWrites).toHaveLength(11)
       expect(immutableWrites[1].key).toBe('dsh-desktop/releases/2.1.0/windows-x86_64/6db7805715b93f0d6e447c59cb476199f37623ed8c49664de1c9045ba338316a-dsh-desktop-windows-x86_64-updater.exe.sig')
       expect(storage.writes.at(-1)).toMatchObject({
         key: 'dsh-desktop/channels/stable/latest.json',
@@ -329,6 +339,28 @@ describe('Stable update promotion', () => {
       })
       expect(JSON.parse(storage.writes.at(-1)!.body.toString('utf8'))).toEqual(manifest)
       expect(storage.events).toContain('replace:dsh-desktop/channels/stable/latest.json')
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  /** macOS 没有人工安装镜像时不得产生不完整 Stable candidate。 */
+  it('fails closed when a macOS installer image is missing', async () => {
+    const directory = await createReleaseDirectory()
+    const storage = createStorage()
+    seedPreviousStable(storage)
+    try {
+      await rm(path.join(directory, 'darwin-aarch64', 'dsh-desktop-darwin-aarch64-installer.dmg'))
+      await expect(prepareStableCandidate({
+        tag: 'v2.1.0',
+        releaseBody: 'Candidate release notes.',
+        publishedAt: '2026-08-28T02:30:00Z',
+        candidateCommit: '0123456789abcdef0123456789abcdef01234567',
+        artifactsDirectory: directory,
+        downloadOrigin: 'https://updates.cyunlab.com',
+        prefix: 'dsh-desktop'
+      }, storage, { verifySignature: async () => {} })).rejects.toThrow('expected exactly one installer package for darwin-aarch64')
+      expect(storage.events.some(event => event.startsWith('ensure:'))).toBe(false)
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
