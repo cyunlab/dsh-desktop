@@ -39,10 +39,10 @@ async function createReleaseDirectory(): Promise<string> {
 /** 创建记录发布行为的内存存储边界。 */
 function createStorage(): PromotionStorage & {
   events: string[]
-  writes: Array<{ key: string; cacheControl: string; body: Buffer }>
+  writes: Array<{ key: string; cacheControl: string; contentType?: string; downloadFilename?: string; body: Buffer }>
 } {
   const events: string[] = []
-  const writes: Array<{ key: string; cacheControl: string; body: Buffer }> = []
+  const writes: Array<{ key: string; cacheControl: string; contentType?: string; downloadFilename?: string; body: Buffer }> = []
   return {
     events,
     writes,
@@ -54,7 +54,7 @@ function createStorage(): PromotionStorage & {
         if (!existing.body.equals(body)) throw new Error(`immutable object changed: ${key}`)
         return 'reused' as const
       }
-      writes.push({ key, body, cacheControl: metadata.cacheControl })
+      writes.push({ key, body, cacheControl: metadata.cacheControl, contentType: metadata.contentType, downloadFilename: metadata.downloadFilename })
       return 'uploaded' as const
     },
     /** 记录允许覆盖的 Stable manifest 写入。 */
@@ -332,6 +332,12 @@ describe('Stable update promotion', () => {
       })
       const immutableWrites = storage.writes.filter(write => write.cacheControl === 'public, max-age=31536000, immutable')
       expect(immutableWrites).toHaveLength(11)
+      expect(immutableWrites.filter(write => write.downloadFilename).map(write => write.downloadFilename)).toEqual([
+        'DSH-Desktop-2.1.0-Windows-x64.exe',
+        'DSH-Desktop-2.1.0-Linux-x64.AppImage',
+        'DSH-Desktop-2.1.0-macOS-arm64.dmg',
+        'DSH-Desktop-2.1.0-macOS-x64.dmg'
+      ])
       expect(immutableWrites[1].key).toBe('dsh-desktop/releases/2.1.0/windows-x86_64/6db7805715b93f0d6e447c59cb476199f37623ed8c49664de1c9045ba338316a-dsh-desktop-windows-x86_64-updater.exe.sig')
       expect(storage.writes.at(-1)).toMatchObject({
         key: 'dsh-desktop/channels/stable/latest.json',
@@ -602,7 +608,8 @@ describe('Stable update promotion', () => {
       runOssutil
     })
     await storage.ensureObject('dsh-desktop/releases/2.1.0/linux-x86_64/package', Buffer.from('package bytes'), {
-      cacheControl: 'public, max-age=31536000, immutable'
+      cacheControl: 'public, max-age=31536000, immutable',
+      downloadFilename: 'DSH-Desktop-2.1.0-Linux-x64.AppImage'
     })
     await storage.readObject('dsh-desktop/releases/2.1.0/linux-x86_64/package')
     await storage.replaceObject('dsh-desktop/channels/stable/latest.json', Buffer.from('{}'), {
@@ -613,7 +620,7 @@ describe('Stable update promotion', () => {
     expect(calls[1].args).toContain('oss://cyunlab-public-releases/dsh-desktop/releases/2.1.0/linux-x86_64/package')
     expect(calls[1].args).toEqual(expect.arrayContaining([
       '--meta',
-      'Cache-Control:public, max-age=31536000, immutable'
+      'Cache-Control:public, max-age=31536000, immutable#Content-Disposition:attachment; filename="DSH-Desktop-2.1.0-Linux-x64.AppImage"'
     ]))
     expect(calls[1].args).not.toContain('--force')
     expect(calls[2].args).toEqual([
@@ -657,6 +664,29 @@ describe('Stable update promotion', () => {
       'process.stdout.write("Error: NoSuchKey: object does not exist\\n0.123(s) elapsed\\n"); process.exit(1)'
     ], { executable: process.execPath, env: { PATH: process.env.PATH } }))
       .rejects.toThrow('NoSuchKey: object does not exist')
+  })
+
+  it('rejects unsafe Content-Disposition download filenames before upload', async () => {
+    const storage = createOssutilStorage({
+      bucket: 'cyunlab-public-releases',
+      region: 'cn-shenzhen',
+      prefix: 'dsh-desktop',
+      credentials: {
+        accessKeyId: 'temporary-id',
+        accessKeySecret: 'temporary-secret',
+        securityToken: 'temporary-token'
+      },
+      runOssutil: async (args: string[]): Promise<OssutilResult> => {
+        if (args[1]?.startsWith('oss://')) throw new Error('NoSuchKey: object does not exist')
+        return { stdout: Buffer.alloc(0), stderr: '' }
+      }
+    })
+
+    await expect(storage.ensureObject(
+      'dsh-desktop/releases/2.1.0/linux-x86_64/package',
+      Buffer.from('package bytes'),
+      { cacheControl: 'no-cache', downloadFilename: 'unsafe.AppImage\r\nX-Test: injected' }
+    )).rejects.toThrow('safe ASCII basename')
   })
 
   /** 验证 immutable 对象仅可复用相同字节，绝不覆盖不同内容。 */
