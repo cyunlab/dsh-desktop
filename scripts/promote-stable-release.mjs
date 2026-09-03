@@ -33,7 +33,33 @@ function normalizePrefix(prefix) {
   return normalized
 }
 
-/** 定位某个目标唯一的更新包及其字面签名文件。 */
+/** 校验 Stable manifest 中每个平台的人工安装地址仍位于同一 OSS 发布边界。 */
+function assertInstallerUrls(manifest, prefix, stableUrl) {
+  for (const target of TARGETS) {
+    const entry = manifest.platforms[target]
+    let updaterUrl
+    let installerUrl
+    try {
+      updaterUrl = new URL(entry?.url)
+      installerUrl = new URL(entry?.installer_url)
+    } catch {
+      throw new Error(`candidate installer URL is invalid for ${target}`)
+    }
+    const expectedPrefix = `/${prefix}/releases/${manifest.version}/${target}/`
+    if (
+      updaterUrl.protocol !== 'https:' || installerUrl.protocol !== 'https:' ||
+      updaterUrl.origin !== stableUrl.origin || installerUrl.origin !== stableUrl.origin ||
+      !updaterUrl.pathname.startsWith(expectedPrefix) || !installerUrl.pathname.startsWith(expectedPrefix)
+    ) throw new Error(`candidate installer URL leaves the trusted release prefix for ${target}`)
+    if (target.startsWith('darwin-')) {
+      if (!installerUrl.pathname.endsWith('.dmg')) throw new Error(`candidate macOS installer must be a DMG for ${target}`)
+    } else if (installerUrl.href !== updaterUrl.href) {
+      throw new Error(`candidate installer must reuse the updater package for ${target}`)
+    }
+  }
+}
+
+/** 定位某个目标唯一的更新包、字面签名以及 macOS 安装镜像。 */
 async function readTargetArtifact(directory, target) {
   const targetDirectory = path.join(directory, target)
   const names = await readdir(targetDirectory)
@@ -63,13 +89,25 @@ async function readTargetArtifact(directory, target) {
   }
   const signature = signatureBody.toString('utf8')
   if (!signature) throw new Error(`updater signature is empty for ${target}`)
+  let installer
+  if (target.startsWith('darwin-')) {
+    const installerName = `dsh-desktop-${target}-installer.dmg`
+    const installers = names.filter(name => name === installerName)
+    if (installers.length !== 1) throw new Error(`expected exactly one installer package for ${target}`)
+    const installerBody = await readFile(path.join(targetDirectory, installerName))
+    if (installerBody.length < 512 || installerBody.subarray(-512, -508).toString('ascii') !== 'koly') {
+      throw new Error(`invalid macOS installer image for ${target}`)
+    }
+    installer = { filename: installerName, body: installerBody }
+  }
   return {
     filename,
     artifactPath: path.join(targetDirectory, filename),
     signaturePath: path.join(targetDirectory, signatureName),
     body,
     signature,
-    signatureBody
+    signatureBody,
+    installer
   }
 }
 
@@ -353,8 +391,15 @@ async function buildReleaseBundle(options, dependencies) {
       { key, body: artifact.body, contentType: 'application/octet-stream' },
       { key: signatureKey, body: artifact.signatureBody, contentType: 'text/plain; charset=utf-8' }
     )
+    let installerUrl = new URL(key, `${origin.href.replace(/\/$/, '')}/`).href
+    if (artifact.installer) {
+      const installerKey = `${releasePrefix}/${contentAddressedName(artifact.installer.filename, artifact.installer.body)}`
+      objects.push({ key: installerKey, body: artifact.installer.body, contentType: 'application/x-apple-diskimage' })
+      installerUrl = new URL(installerKey, `${origin.href.replace(/\/$/, '')}/`).href
+    }
     platforms[target] = {
       url: new URL(key, `${origin.href.replace(/\/$/, '')}/`).href,
+      installer_url: installerUrl,
       signature: artifact.signature
     }
   }
@@ -480,6 +525,7 @@ export async function finalizeStableCandidate(candidate, storage, options = {}) 
   if (stableUrl.protocol !== 'https:' || !stableUrl.pathname.endsWith(`/${stableKey}`)) {
     throw new Error('previous Stable URL does not match the authoritative pointer')
   }
+  assertInstallerUrls(candidate.manifest, prefix, stableUrl)
   const currentStable = await storage.readObject(stableKey)
   if (createHash('sha256').update(currentStable).digest('hex') !== candidate.previous_stable_manifest_sha256) {
     throw new Error('previous Stable manifest changed after candidate preparation')
